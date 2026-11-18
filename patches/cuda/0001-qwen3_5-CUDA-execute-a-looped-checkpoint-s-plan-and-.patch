@@ -1,8 +1,8 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Jay Leaton <58495321+jayleaton@users.noreply.github.com>
 Date: Wed, 18 Nov 2026 00:17:25 +0700
-Subject: [PATCH 1/9] qwen3_5 CUDA: execute a looped checkpoint's plan and its
- two-stream mHC
+Subject: [PATCH 01/19] qwen3_5 CUDA: execute a looped checkpoint's plan and
+ its two-stream mHC
 
 A Qwen3.5 tower can declare a shared-weight loop (layers [4,28) run twice: 56
 executions from 32 sets of weights) and manifold-constrained hyper-connections

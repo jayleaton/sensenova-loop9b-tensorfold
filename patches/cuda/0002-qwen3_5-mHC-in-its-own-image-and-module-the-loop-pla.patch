@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Jay Leaton <58495321+jayleaton@users.noreply.github.com>
 Date: Wed, 18 Nov 2026 01:34:35 +0700
-Subject: [PATCH 2/9] qwen3_5: mHC in its own image and module; the loop plan
+Subject: [PATCH 02/19] qwen3_5: mHC in its own image and module; the loop plan
  in its own
 
 The forward, geometry and engine were at or past the 600-line cap and the mHC

@@ -1,0 +1,68 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Jay Leaton <58495321+jayleaton@users.noreply.github.com>
+Date: Wed, 18 Nov 2026 13:10:17 +0700
+Subject: [PATCH 12/19] qwen3_5: a later stage's first norm folds the residual
+ again; the host suite builds
+
+The looped port keyed the first input norm (and mHC's enter) on i != 0, dropping
+#2579's g.first + i: on a stage after the first, layer 0 skipped the residual it
+receives. Single-stage serving is unchanged (g.first is 0 there).
+
+dense_serving_test's launch sequence is re-pinned: with no mHC every norm takes
+the same flags as 4dd870b84d's; inside an mHC window none folds the residual.
+
+The loop-plan test zeroes its geometry by bytes and sets the rope, since
+std.mem.zeroes refuses the tagged union and the CUDA host test did not compile.
+---
+ zig/dense_serving_test.zig                       | 4 ++--
+ zig/src/families/qwen3_5/cuda_forward.zig        | 4 ++--
+ zig/src/families/qwen3_5/cuda_loop_plan_test.zig | 4 +++-
+ 3 files changed, 7 insertions(+), 5 deletions(-)
+
+diff --git a/zig/dense_serving_test.zig b/zig/dense_serving_test.zig
+index 52ca01e70..9097ab250 100644
+--- a/zig/dense_serving_test.zig
++++ b/zig/dense_serving_test.zig
+@@ -43,6 +43,6 @@ test "dense serving: owned launches and projections retain their reviewed argume
+             try out.append(std.testing.allocator, c);
+         };
+     }
+-    // 4dd870b84d's sequence: the first input norm keys on g.first + i (#2579); BF16 norms take norm_shift (#2383)
+-    try std.testing.expectEqualStrings("7be514892c77ce544d809f73d5a7e2dec2fd33bcb40c68ab67ab6e409a1c02f8", &hash(out.items));
++    // 4dd870b84d's sequence (#2579, #2383), with mHC's windows folding no residual; no mHC: the same norms and flags
++    try std.testing.expectEqualStrings("2a3ddbb07a908e34ef183b63e682a0f9b243bc31b1be2eb495d3ea5fae82db1c", &hash(out.items));
+ }
+diff --git a/zig/src/families/qwen3_5/cuda_forward.zig b/zig/src/families/qwen3_5/cuda_forward.zig
+index f830977ed..b54f684c9 100644
+--- a/zig/src/families/qwen3_5/cuda_forward.zig
++++ b/zig/src/families/qwen3_5/cuda_forward.zig
+@@ -74,12 +74,12 @@ pub fn body(e: *E.Engine, shape: anytype) !void {
+             const m = mhc.?;
+             if (!entered) {
+                 // the previous layer's output is still pending: the norm that would have folded it runs here
+-                try hyper.enter(e, total, m, i != 0 and !prev_hc);
++                try hyper.enter(e, total, m, g.first + i != 0 and !prev_hc);
+                 entered = true;
+             }
+             try hyper.branch(e, l.mhc_attn, l.mhc_attn_b, total, m);
+             try e.norm(false, l.input_norm, total);
+-        } else try e.norm(i != 0 and !prev_hc, l.input_norm, total);
++        } else try e.norm(g.first + i != 0 and !prev_hc, l.input_norm, total);
+         if (e.learning) |k| try k.input(ph, e.h, total);
+         switch (l.mixer) {
+             .delta => |m| {
+diff --git a/zig/src/families/qwen3_5/cuda_loop_plan_test.zig b/zig/src/families/qwen3_5/cuda_loop_plan_test.zig
+index ea2bafbda..ee2586952 100644
+--- a/zig/src/families/qwen3_5/cuda_loop_plan_test.zig
++++ b/zig/src/families/qwen3_5/cuda_loop_plan_test.zig
+@@ -39,7 +39,9 @@ test "SenseNova-Loop-9B: [4,28) twice over 32 layers is 56 executions, 14 attent
+ 
+ test "a geometry without a valid loop executes its own layers once; the accessors never underflow" {
+     // field-by-field geometries hold garbage in loop_count: steps() must answer `layers`, never wrap.
+-    var g = std.mem.zeroes(geom.Geometry);
++    var g: geom.Geometry = undefined;
++    @memset(std.mem.asBytes(&g), 0); // std.mem.zeroes refuses the rope's tagged union
++    g.rope = .plain;
+     g.hidden = 256;
+     g.intermediate = 256;
+     g.layers = 8;

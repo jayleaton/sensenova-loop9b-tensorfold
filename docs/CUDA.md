@@ -1,14 +1,13 @@
 # CUDA: one DGX Spark, TP=1
 
-The `qwen3_5` CUDA family executes the loop plan and the two-stream mHC on one GB10. The checkpoint fits with room to
-spare (4-bit weights plus 256K of KV is about 19 GiB), so no tensor parallelism is needed.
+The `qwen3_5` CUDA family executes the loop plan and the two-stream mHC on one GB10. No tensor parallelism is needed.
 
 | | |
 | --- | --- |
 | Hardware | 1x NVIDIA DGX Spark (GB10, 128 GB unified), CUDA 13.0 |
-| Engine | upstream TensorFold `038e4a27872eaa018adc67b1b5ddffd16820c498` (on `main`, 2026-11-17) + [`patches/cuda/`](../patches/cuda/) `0001`-`0009` |
-| Engine tree | `31714680052c2be236d6162d450c96b1f61f3bb6`; its `zig/` source is the measured engine with `0009`'s formatting fixes |
-| Weights | MLX affine 4-bit g64 ([CONVERT](CONVERT.md)) |
+| Engine | upstream TensorFold `038e4a27872eaa018adc67b1b5ddffd16820c498` (on `main`, 2026-11-17) + [`patches/cuda/`](../patches/cuda/) `0001`-`0019` |
+| Engine tree | `0882211e9e246e25b23eee4cb573eb4d8290977b`: the serving engine (`0001`-`0019`, without `0008`, is the build behind the numbers below, byte for byte) plus the converter (`0008`) |
+| Weights served | MLX affine 8-bit g64 text weights ([CONVERT](CONVERT.md)) and the BF16 vision tower, YaRN factor 4 (1,048,576 positions) |
 
 ## Build
 
@@ -29,24 +28,94 @@ zig build qwen35-cuda -Dnvcc=/usr/local/cuda/bin/nvcc   # tf-qwen35-cuda, the pa
 Set `NVCC=` to use another `nvcc`. `NVCC=none` builds the host code without kernel images; use it only to check that the
 series compiles on a machine without CUDA.
 
+### Required and named tool calls
+
+`tool_choice: "required"`, a named function and `response_format` need `libtfgrammar` beside the server; without it
+the server answers those requests with HTTP 400 and serves everything else. Build it from xgrammar v0.2.8:
+
+```bash
+git clone --branch v0.2.8 --recurse-submodules https://github.com/mlc-ai/xgrammar.git xgrammar-src
+(cd engine-cuda && zig build grammar -Dxgrammar="$PWD/../xgrammar-src")   # zig-out/native/lib/libtfgrammar.so
+```
+
+Check it: a request with tools and `"tool_choice": "required"` returns `finish_reason: "tool_calls"`, not HTTP 400.
+
+```bash
+curl -s http://127.0.0.1:8090/v1/chat/completions -H 'Content-Type: application/json' -d '{"model": "loop9b",
+  "messages": [{"role": "user", "content": "Look up the population of Paris."}], "tool_choice": "required",
+  "tools": [{"type": "function", "function": {"name": "lookup", "parameters": {"type": "object",
+    "properties": {"q": {"type": "string"}}, "required": ["q"]}}}],
+  "chat_template_kwargs": {"enable_thinking": false}}' | python3 -c 'import json,sys; print(json.load(sys.stdin)["choices"][0]["finish_reason"])'
+```
+
+### Images
+
+PNG needs nothing. JPEG needs libjpeg-turbo 3.1.4.1 and WebP needs libwebp 1.6.0, found on `LD_LIBRARY_PATH`.
+
 ## Serve
 
-```bash
-python3 engine-cuda/tools/sensenova_loop_mlx.py --source SenseNova-Loop-9B --out loop9b-mlx4 --bits 4
-scripts/serve.sh cuda engine-cuda loop9b-mlx4
-```
-
-which runs, with the profile in [`config/cuda/serve.args`](../config/cuda/serve.args):
+The served tree is the converter's 8-bit text weights plus the checkpoint's BF16 vision tower as one more shard, with
+the config's YaRN stretched from factor 2 to factor 4 over the trained 262,144 positions (Qwen3.5's 1M recipe).
+`--rope-yarn 4` is refused because the checkpoint's config already names YaRN, so the stretch lives in the tree's
+config. `scripts/serve-tree.py` makes it without copying the text weights:
 
 ```bash
-engine-cuda/zig-out/native/bin/tensorfold-native serve loop9b-mlx4 --name loop9b --port 8090 \
-  --parallel 4 --context 32768
+python3 engine-cuda/tools/sensenova_loop_mlx.py --source SenseNova-Loop-9B --out loop9b-mlx8 --bits 8
+python3 scripts/serve-tree.py engine-cuda loop9b-mlx8 SenseNova-Loop-9B loop9b-q8-vis 4
+scripts/serve.sh cuda engine-cuda loop9b-q8-vis
 ```
 
-Sampling defaults come from the checkpoint's `generation_config.json` (temperature 1.0, top_p 0.95). The chat template
-turns thinking on unless the request sends `chat_template_kwargs {"enable_thinking": false}` or the server runs with
-`--no-thinking`. Raise `--context` for longer prompts: KV is 56 KiB a token and each stream adds about 90 MiB of
-recurrent state ([MODEL](MODEL.md#size-and-cache)).
+which runs, with [`config/cuda/serve.args`](../config/cuda/serve.args) and
+[`config/cuda/serve.env`](../config/cuda/serve.env):
+
+```bash
+TENSORFOLD_MEMORY_RESERVE_GIB=36 TF_QWEN_KV_PAGES=256 \
+engine-cuda/zig-out/native/bin/tensorfold-native serve loop9b-q8-vis --name loop9b --port 8090 \
+  --parallel 4 --context 1048576 --kv-cache fp8 --max-tokens 32768 --thinking-budget 4096 --decode-share 0.5 \
+  --prompt-cache-gib 24 --spill-gib 256 --learn-daily-gib 256 --checkpoint-slots 8 --vision
+```
+
+- **KV:** fp8, 28.4 KiB a token. The engine keeps one stream's full 1M window and the other three share the rest of
+  the page pool, so every chat can reach 1M and four chats fit at once with at least 256K each. A request whose prompt
+  and `max_tokens` do not fit waits in the queue rather than being cut short.
+- **Memory:** `TENSORFOLD_MEMORY_RESERVE_GIB=36` keeps the 24 GiB host prompt cache inside unified memory.
+- **Disk tier:** idle conversations spill to NVMe (`--spill-gib 256`, `--checkpoint-slots 8`) and are read back ahead
+  of admission; `--learn-daily-gib 256` bounds a day's writes.
+- **Thinking:** on by default (the checkpoint's chat template). `--thinking-budget 4096` closes a runaway reasoning
+  block at 4,096 tokens; a request may ask for its own `thinking_budget`. With `tool_choice` required or named, the
+  budget also leaves room for the call. Send `chat_template_kwargs {"enable_thinking": false}` to turn thinking off.
+
+**Thinking budget and answer room.** `--thinking-budget N` closes the thinking block after N reasoning tokens, but
+`max_tokens` counts reasoning and answer together: a budget at or above the request's `max_tokens` never closes
+before the reply runs out, so the reply ends with `finish_reason: "length"` and no answer. Keep the budget well under
+`max_tokens`, or add `--thinking-reserve N`, which keeps the request's `max_tokens` for the answer and lets reasoning
+take up to N tokens more (capped by the context window). The startup log says which of the two `max_tokens` means.
+
+- **Copy drafts** are on: a stream drafts from its own context when it repeats text, verified by the target, so the
+  tokens are the same with drafts on or off.
+- Sampling defaults come from the checkpoint's `generation_config.json` (temperature 1.0, top_p 0.95).
+
+### Serving results
+
+Measured on the build above, the tree above and these flags, on one DGX Spark:
+
+| check | result |
+| --- | --- |
+| decode, one chat | 18.0 tok/s |
+| decode, 4 chats at once | 13.2-14.6 tok/s each |
+| decode beside a 35,614-token prompt being read | 11.0 tok/s (that prompt's TTFT 32.5 s) |
+| prefix reuse, a 74K prompt's second turn | 73,728 of 74,255 tokens from cache, TTFT 0.66 s against 52.4 s cold |
+| drafts on vs off, 2 and 4 chats at once | token ids identical in all 6 replies (768 tokens each, 951-1,330 copied rows) |
+| strict tool gate (`required` and `auto`, text and images) | pass |
+| soak, 4 workers, 12 rotating conversations | 45 requests, 0 errors, 0 wrong answers; required tool turns 3/3 |
+| disk tier during the soak | 39 states saved, 19 read back, 0 refusals, 0 restore fallbacks |
+| thinking budget | a runaway-prone prompt stopped thinking at 4,097 tokens |
+
+8-bit is the served width because 4-bit loses too much on this model through the CUDA affine path: against the
+engine's own BF16, q8 keeps top-1 on 246 of 249 positions (cosine 0.9963 at worst), q4 on 220.
+
+The results below come from the earlier 4-bit, 32K profile on `0001`-`0009`, and have not been re-measured on the
+serving series.
 
 ## Results
 

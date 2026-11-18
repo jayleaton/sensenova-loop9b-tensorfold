@@ -1,0 +1,167 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Jay Leaton <58495321+jayleaton@users.noreply.github.com>
+Date: Wed, 18 Nov 2026 10:41:51 +0800
+Subject: [PATCH 11/19] qwen3_5 cuda: run an image prompt through the looped
+ decoder
+
+The tower and the loop each had a receipt on this branch and nothing joined
+them: vision checked the tower alone, and every prompt verb ran text. cuda.zig
+now publishes the image prompt's Media, and tf-qwen35-cuda gains:
+
+  tf-qwen35-cuda <model> image <ids file> <out> <tokens> <picture> [steps]
+
+It opens the engine and the tower the way --vision does (Vision.open against
+the model's own width), prepares the picture with core/qwen_vl, splices the
+tower's rows at the prompt's placeholders through the same src/pos tables
+cuda_prefill uses, and decodes greedily with the reply's rows rotated past the
+image's positions. The decoder is whatever the checkpoint's geometry says,
+including a looped range, so one run exercises image rows and the loop together.
+
+Writes <out> (tokens as u32) and <out>.logits.bf16 (the prompt's last row).
+Compiled and run on a GPU in the G-down window; nothing here is measured yet.
+---
+ zig/src/families/qwen3_5/cuda.zig |  1 +
+ zig/tests/qwen35_cuda_image.zig   | 75 +++++++++++++++++++++++++++++++
+ zig/tests/qwen35_cuda_main.zig    | 24 +++++++++-
+ 3 files changed, 99 insertions(+), 1 deletion(-)
+ create mode 100644 zig/tests/qwen35_cuda_image.zig
+
+diff --git a/zig/src/families/qwen3_5/cuda.zig b/zig/src/families/qwen3_5/cuda.zig
+index 87e8c715d..5d5a307c5 100644
+--- a/zig/src/families/qwen3_5/cuda.zig
++++ b/zig/src/families/qwen3_5/cuda.zig
+@@ -15,6 +15,7 @@ pub const mtp = @import("cuda_mtp.zig");
+ pub const mtp_check = @import("cuda_mtp_check.zig");
+ pub const draft = @import("cuda_draft.zig");
+ pub const vision = @import("cuda_vision.zig");
++pub const vision_prompt = @import("cuda_vision_prompt.zig");
+ pub const reuse = @import("cuda_reuse.zig");
+ pub const joint = @import("cuda_joint_readout.zig");
+ /// The joint schema head on the device (cuda/joint_schema), for the runners.
+diff --git a/zig/tests/qwen35_cuda_image.zig b/zig/tests/qwen35_cuda_image.zig
+new file mode 100644
+index 000000000..07e4cea70
+--- /dev/null
++++ b/zig/tests/qwen35_cuda_image.zig
+@@ -0,0 +1,75 @@
++//! An image prompt end to end on CUDA: the tower's rows spliced at the prompt's placeholders, then greedy steps.
++const std = @import("std");
++const cuda = @import("cuda");
++const core = @import("core");
++const q = @import("qwen35");
++const lanes = @import("lanes");
++const E = q.engine;
++const vl = core.qwen_vl;
++
++/// The picture spliced into the prompt at its placeholders, in chunks at its t, h, w, then `steps` greedy tokens.
++pub fn run(init: std.process.Init, a: std.mem.Allocator, model: []const u8, ids_path: []const u8, out: []const u8, p: vl.geometry.Prepared, tokens: u32, steps: usize) !u8 {
++    const io = init.io;
++    var ids: std.ArrayList(u32) = .empty;
++    var it = std.mem.tokenizeAny(u8, try std.Io.Dir.cwd().readFileAlloc(io, ids_path, a, .limited(64 << 20)), ", \n");
++    while (it.next()) |t| try ids.append(a, try std.fmt.parseInt(u32, t, 10));
++    var driver = try cuda.Driver.open();
++    defer driver.close();
++    var ctx = try cuda.Context.init(&driver, 0);
++    defer ctx.deinit();
++    var stream = try cuda.Stream.init(ctx.d, true);
++    defer stream.deinit();
++    const e = try E.Engine.init(init.gpa, io, &ctx, model, false, null, E.max_rows);
++    defer e.deinit();
++    // the tower beside the decoder, as --vision opens it: the merger's width must be the text's hidden
++    const v = try q.vision.Vision.open(init.gpa, io, ctx.d, stream, model, e.g.hidden, .{ .image_tokens = tokens, .max_images = 1 });
++    defer v.deinit();
++    const at = std.mem.indexOfScalar(u32, ids.items, v.ids().image) orelse return error.NoImagePlaceholders;
++    var images = [_]lanes.stream.Image{.{ .pixels = p.pixels, .gh = p.gh, .gw = p.gw, .at = @intCast(at), .tokens = p.tokens, .hash = p.hash }};
++    var m = try q.vision_prompt.Media.init(init.gpa, v, ids.items, &images);
++    defer m.deinit();
++    // the prompt in chunks, every one at the same image tables: src and pos are prompt-indexed, cut at cache.len
++    var cache = try E.Cache.init(init.gpa, e, ids.items.len + steps + 64);
++    defer cache.deinit(init.gpa);
++    const im: E.Images = .{ .features = m.features.ptr, .src = m.src, .pos = m.pos };
++    var row: usize = 0;
++    while (row < ids.items.len) {
++        const n = @min(E.max_rows, ids.items.len - row);
++        try e.forward(&.{.{ .cache = &cache, .rows = n, .images = &im }}, ids.items[row..][0..n], .last);
++        row += n;
++    }
++    // the reply's rows rotate past the image's positions, exactly as cuda_prefill sets it
++    cache.delta = m.delta;
++    const last = try a.alloc(u8, std.mem.sliceAsBytes(cache.logits).len);
++    @memcpy(last, std.mem.sliceAsBytes(cache.logits));
++    try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = try std.fmt.allocPrint(a, "{s}.logits.bf16", .{out}), .data = last });
++    var toks: std.ArrayList(u32) = .empty;
++    if (steps > 0) {
++        var next = top1(cache.logits);
++        try toks.append(a, next);
++        for (1..steps) |_| {
++            try e.forward(&.{.{ .cache = &cache, .rows = 1 }}, &.{next}, .logits);
++            next = top1(e.rowLogits(0));
++            try toks.append(a, next);
++        }
++    }
++    try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = out, .data = std.mem.sliceAsBytes(toks.items) });
++    std.debug.print("image: grid {d} x {d}, {d} rows at {d} of a {d}-row prompt, delta {d}, {d} tokens\n", .{ p.gh, p.gw, p.tokens, at, ids.items.len, m.delta, toks.items.len });
++    for (toks.items) |t| std.debug.print(" {d}", .{t});
++    std.debug.print("\n", .{});
++    return 0;
++}
++
++/// The argmax of a row of bf16 logits.
++fn top1(row: []const u16) u32 {
++    var best: usize = 0;
++    var top: f32 = -std.math.inf(f32);
++    for (row, 0..) |h, i| {
++        const x: f32 = @bitCast(@as(u32, h) << 16);
++        if (x > top) {
++            top = x;
++            best = i;
++        }
++    }
++    return @intCast(best);
++}
+diff --git a/zig/tests/qwen35_cuda_main.zig b/zig/tests/qwen35_cuda_main.zig
+index c30deb47d..39f8679ae 100644
+--- a/zig/tests/qwen35_cuda_main.zig
++++ b/zig/tests/qwen35_cuda_main.zig
+@@ -1,4 +1,4 @@
+-//! `tf-qwen35-cuda <model> <step|window|tree|prompt|state|mrope|probe|mtp|vision> ...`: rows to compare; usage below.
++//! `tf-qwen35-cuda <model> <verb> ...`: receipts compared with a reference; the verbs are in usage below.
+ const std = @import("std");
+ const cuda = @import("cuda");
+ const core = @import("core");
+@@ -14,6 +14,10 @@ const usage =
+     \\vision prepares each picture with core/qwen_vl under a <tokens> budget and runs the CUDA tower twice: <out dir>
+     \\gets NAME.pixels.f32, NAME.rows.f32 (bf16 widened) and meta.json; NAME.ref.f32 there (float32 reference rows) is
+     \\compared row by row (relative L2, worst and mean); --bound needs every reference and exits 1 past either bound.
++    \\       tf-qwen35-cuda <model dir> image <ids file> <out> <tokens> <picture> [steps]
++    \\image: an image prompt end to end -- the picture through the tower, its rows spliced at the placeholders, then
++    \\<steps> greedy tokens (0: the prompt's last-row logits only). <out> gets the tokens as u32, <out>.logits.bf16 the
++    \\prompt's last row; the reply's rows rotate past the image's positions as an image prompt does.
+     \\state: raw GDN/conv and active KV bytes; TF_Q35_STATE_STEPS=N settles N decode rows first.
+     \\fp8: the attention caches as e4m3 rows (--kv-cache fp8); TF_Q35_PREFILL, _BESIDE, _DELTA, _RESUME, _RESUME_TREE, _SHIFT: below.
+     \\TF_Q35_WINDOW=N fixes window/tree width (tree: at least 2); 0 keeps growing widths.
+@@ -37,6 +41,24 @@ const usage =
+ pub fn main(init: std.process.Init) !u8 {
+     const a = init.arena.allocator();
+     const args = try init.minimal.args.toSlice(a);
++    if (args.len >= 3 and std.mem.eql(u8, args[2], "image")) {
++        if (args.len < 7) {
++            std.debug.print("{s}", .{usage});
++            return 2;
++        }
++        const io = init.io;
++        const tokens = try std.fmt.parseInt(u32, args[5], 10);
++        const config = read(a, io, args[1], "config.json") orelse return error.NoConfig;
++        const vc = (try vl.Config.parse(a, config, read(a, io, args[1], "preprocessor_config.json"), read(a, io, args[1], "processor_config.json"))) orelse
++            return error.NoVisionTower;
++        const budget = @min(tokens, q.vision.max_patches / (q.vision.merge * q.vision.merge));
++        const p = prepared(a, io, args[6], vc, budget) catch |err| {
++            std.debug.print("{s}: {t}\n", .{ args[6], err });
++            return 1;
++        };
++        const steps = if (args.len > 7) try std.fmt.parseInt(usize, args[7], 10) else 0;
++        return @import("qwen35_cuda_image.zig").run(init, a, args[1], args[3], args[4], p, tokens, steps);
++    }
+     if (args.len >= 3 and std.mem.eql(u8, args[2], "vision")) {
+         const bounded = args.len > 5 and std.mem.eql(u8, args[5], "--bound");
+         const first: usize = if (bounded) 8 else 5;

@@ -1,0 +1,83 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Jay Leaton <58495321+jayleaton@users.noreply.github.com>
+Date: Wed, 18 Nov 2026 09:42:10 +0700
+Subject: [PATCH 10/19] tools: checkpoint_view, a probe tree that links its
+ source for reading and never writes through a link
+
+A probe that linked a reference tree's shards and then opened the same names for writing rewrote the
+reference (onet.py wrote packed q4 bytes over four BF16 shards). view() links the source into a fresh
+directory, writable() unlinks a link before handing out its path and refuses a path that resolves outside
+the view or into a protected tree, and protect/release make a verified tree read-only and back.
+---
+ tools/checkpoint_view.py | 62 ++++++++++++++++++++++++++++++++++++++++
+ 1 file changed, 62 insertions(+)
+ create mode 100644 tools/checkpoint_view.py
+
+diff --git a/tools/checkpoint_view.py b/tools/checkpoint_view.py
+new file mode 100644
+index 000000000..93fcdb00b
+--- /dev/null
++++ b/tools/checkpoint_view.py
+@@ -0,0 +1,62 @@
++"""A probe's derived checkpoint: the source's files linked for reading, every write a new file in the view."""
++import os
++import shutil
++import stat
++import sys
++
++
++class WriteThrough(Exception):
++    """A write that would land outside its view, or in a protected tree."""
++
++
++def _inside(path: str, root: str) -> bool:
++    return os.path.commonpath([path, root]) == root
++
++
++def view(src: str, dst: str, skip=("config.json", "model.safetensors.index.json")) -> str:
++    """`dst` made fresh with each of `src`'s files linked into it, except `skip`; links are for reading only."""
++    src, dst = os.path.realpath(src), os.path.abspath(dst)
++    if _inside(os.path.realpath(dst), src) or _inside(src, os.path.realpath(dst)):
++        raise WriteThrough(f"{dst} and {src} overlap")
++    if os.path.lexists(dst):
++        shutil.rmtree(dst)
++    os.makedirs(dst)
++    for name in os.listdir(src):
++        if name not in skip:
++            os.symlink(os.path.join(src, name), os.path.join(dst, name))
++    return dst
++
++
++def writable(dst: str, name: str, protected=()) -> str:
++    """A path for a new file `name` in `dst`: a link there is removed first, so a write never reaches its target."""
++    path = os.path.join(os.path.abspath(dst), name)
++    if os.path.islink(path):
++        os.unlink(path)
++    real = os.path.realpath(path)
++    if os.path.dirname(real) != os.path.realpath(dst):
++        raise WriteThrough(f"{path} resolves to {real}, outside {dst}")
++    for tree in protected:
++        if _inside(real, os.path.realpath(tree)):
++            raise WriteThrough(f"{path} resolves into the protected tree {tree}")
++    return path
++
++
++def protect(tree: str, on: bool = True) -> None:
++    """Every file and directory in `tree` read-only (`on`), or writable by its owner again."""
++    for root, _, files in os.walk(tree, topdown=False):
++        for p in [os.path.join(root, name) for name in files] + [root]:
++            if not os.path.islink(p):
++                mode = os.stat(p).st_mode
++                os.chmod(p, mode & ~0o222 if on else mode | stat.S_IWUSR)
++
++
++def main(argv: list[str]) -> int:
++    if len(argv) != 2 or argv[0] not in ("protect", "release"):
++        print("usage: checkpoint_view.py protect|release TREE", file=sys.stderr)
++        return 2
++    protect(argv[1], argv[0] == "protect")
++    return 0
++
++
++if __name__ == "__main__":
++    sys.exit(main(sys.argv[1:]))

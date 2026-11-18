@@ -1,0 +1,116 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Jay Leaton <58495321+jayleaton@users.noreply.github.com>
+Date: Wed, 18 Nov 2026 15:19:16 +0700
+Subject: [PATCH 16/19] cuda disk: size the staging permit for the longest kept
+ state
+
+The CUDA disk store passed no longest state, so its staging permit
+stayed at 1 GiB and every 0.6-2.5 GiB conversation state was refused
+StagingFull. It now passes the context window, as qwen27 does; the
+store caps the permit at its RAM budget.
+---
+ zig/src/native/cuda.zig      |  4 ++--
+ zig/src/native/cuda_disk.zig | 20 ++++++++++----------
+ 2 files changed, 12 insertions(+), 12 deletions(-)
+
+diff --git a/zig/src/native/cuda.zig b/zig/src/native/cuda.zig
+index 38a14fc67..a33a85c91 100644
+--- a/zig/src/native/cuda.zig
++++ b/zig/src/native/cuda.zig
+@@ -404,8 +404,8 @@ fn openWith(comptime F: type, a: Allocator, gpa: Allocator, io: std.Io, o: api.O
+         try kv_pages.store(F, store, loaded, kept); // its snapshot slots, before a disk probe takes one
+         h.store = store;
+         if (o.learn_conversations) if (o.learn) |root| {
+-            if (F == nemotron.native) try cuda_disk.attach(a, io, &g.ctx, o, root, kernels, loaded, store);
+-            if (comptime cuda_disk.keptDisk(F)) |K| try cuda_disk.attachKept(K, F.model_type, a, io, &g.ctx, o, root, kernels, loaded, store);
++            if (F == nemotron.native) try cuda_disk.attach(a, io, &g.ctx, o, root, kernels, loaded, store, @intCast(window));
++            if (comptime cuda_disk.keptDisk(F)) |K| try cuda_disk.attachKept(K, F.model_type, a, io, &g.ctx, o, root, kernels, loaded, store, @intCast(window));
+         };
+     }
+     errdefer if (h.store) |store| kv_pages.closeStore(gpa, store);
+diff --git a/zig/src/native/cuda_disk.zig b/zig/src/native/cuda_disk.zig
+index 0c6c03d82..d37c534c6 100644
+--- a/zig/src/native/cuda_disk.zig
++++ b/zig/src/native/cuda_disk.zig
+@@ -225,10 +225,10 @@ fn probe(a: Allocator, io: std.Io, backend: lanes.backend.Backend, t: *Target) !
+ }
+ 
+ /// --learn-conversations: the identity probed on this thread (its context current), the store opened and attached.
+-pub fn attach(a: Allocator, io: std.Io, ctx: *const cuda.Context, o: api.Open, root: []const u8, kernels: ?[]const u8, loaded: anytype, store: *api.prompt_cache.Store) !void {
++pub fn attach(a: Allocator, io: std.Io, ctx: *const cuda.Context, o: api.Open, root: []const u8, kernels: ?[]const u8, loaded: anytype, store: *api.prompt_cache.Store, longest: u32) !void {
+     loaded.target.ctx = ctx;
+     const id = try identity(a, io, ctx, o.dir, kernels, loaded.backend, loaded.target, o.model_type);
+-    try open(o, root, id.id, id.rate, store, "nemotron", null);
++    try open(o, root, id.id, id.rate, store, "nemotron", null, longest);
+ }
+ 
+ /// The disk module of a family's kept states (image, probe, facts), or null: Nemotron's is this file's own.
+@@ -237,13 +237,13 @@ pub fn keptDisk(comptime F: type) ?type {
+ }
+ 
+ /// Kept states through disk module `K` (keptDisk): the same store under the identity its probe and facts give.
+-pub fn attachKept(comptime K: type, name: []const u8, a: Allocator, io: std.Io, ctx: *const cuda.Context, o: api.Open, root: []const u8, kernels: ?[]const u8, loaded: anytype, store: *api.prompt_cache.Store) !void {
++pub fn attachKept(comptime K: type, name: []const u8, a: Allocator, io: std.Io, ctx: *const cuda.Context, o: api.Open, root: []const u8, kernels: ?[]const u8, loaded: anytype, store: *api.prompt_cache.Store, longest: u32) !void {
+     // a module that opens the store itself (several ranks' parts, say) declares attach, and takes identityOf from here
+     if (comptime @hasDecl(K, "attach")) return K.attach(a, io, ctx, o, root, kernels, loaded, store) else {
+         if (@hasDecl(K, "bind")) K.bind(loaded.target, ctx); // the context the store's copies make current
+         const p = try K.probe(a, io, loaded.backend, loaded.target);
+         const staging = stagingOf(K, loaded.target);
+-        try open(o, root, try keptKey(K, a, io, ctx, o.dir, kernels, loaded.target, p.hash, .{ .family = name, .backend = "cuda" }), p.rate, store, name, staging);
++        try open(o, root, try keptKey(K, a, io, ctx, o.dir, kernels, loaded.target, p.hash, .{ .family = name, .backend = "cuda" }), p.rate, store, name, staging, longest);
+     }
+ }
+ 
+@@ -252,14 +252,14 @@ fn stagingOf(comptime K: type, t: anytype) ?u64 {
+     return if (@hasDecl(K, "staging")) K.staging(t) else null;
+ }
+ 
+-fn open(o: api.Open, root: []const u8, id: u64, rate: f64, store: *api.prompt_cache.Store, name: []const u8, staging: ?u64) !void {
++fn open(o: api.Open, root: []const u8, id: u64, rate: f64, store: *api.prompt_cache.Store, name: []const u8, staging: ?u64, longest: u32) !void {
+     const gibs = struct {
+         fn bytes(g: f64) u64 {
+             return @intFromFloat(g * (1 << 30));
+         }
+     }.bytes;
+     // --spill-gib: evicted states only (or with --learn-conversations, both); --checkpoint-slots bounds RAM beside it
+-    var opts: rows.Options = .{ .root = root, .identity = id, .cap = gibs(o.learn_gib), .floor = gibs(o.learn_min_free_gib), .daily = gibs(o.learn_daily_gib), .lookahead = store.rules.lookahead, .planned = store.rules.planned, .grid = store.rules.grid, .spill = o.spill, .slots = @import("disk_spill.zig").slots(o) };
++    var opts: rows.Options = .{ .root = root, .identity = id, .cap = gibs(o.learn_gib), .floor = gibs(o.learn_min_free_gib), .daily = gibs(o.learn_daily_gib), .lookahead = store.rules.lookahead, .planned = store.rules.planned, .grid = store.rules.grid, .spill = o.spill, .slots = @import("disk_spill.zig").slots(o), .longest = longest };
+     if (staging) |bytes| opts.staging_bytes = bytes; // else the store's own default
+     const r = try rows.attach(store.gpa, store, opts);
+     r.prefill_rate = rate;
+@@ -279,7 +279,7 @@ test "a disk module that declares attach opens the store itself" {
+             try std.testing.expectEqualStrings("/r", root);
+         }
+     };
+-    try attachKept(K, "k", std.testing.allocator, std.testing.io, undefined, .{ .dir = "d", .model_type = "m" }, "/r", null, @as(u8, 0), undefined);
++    try attachKept(K, "k", std.testing.allocator, std.testing.io, undefined, .{ .dir = "d", .model_type = "m" }, "/r", null, @as(u8, 0), undefined, 0);
+     try std.testing.expectEqual(@as(usize, 1), K.calls);
+ }
+ 
+@@ -289,7 +289,7 @@ test "CUDA disk open: --spill-gib's mode and --checkpoint-slots reach the store"
+     // a disk module that opens the store itself, through this file's open, under a fixed identity and no device
+     const K = struct {
+         pub fn attach(_: Allocator, _: std.Io, _: *const cuda.Context, o: api.Open, root: []const u8, _: ?[]const u8, _: anytype, store: *api.prompt_cache.Store) !void {
+-            try open(o, root, 7, 1.0, store, "fake", 3 << 30);
++            try open(o, root, 7, 1.0, store, "fake", 3 << 30, 0);
+         }
+         fn bytes(_: *anyopaque, _: u32) u64 {
+             return 0;
+@@ -309,7 +309,7 @@ test "CUDA disk open: --spill-gib's mode and --checkpoint-slots reach the store"
+     for ([_]api.prompt_cache.rows.Spill{ .evicted, .finish }, [_]?i64{ 3, null }) |mode, keep| {
+         var store = api.prompt_cache.Store.init(gpa, .{ .ptr = &family, .vtable = &vt }, .{ .lookahead = 1 }, 1 << 20);
+         const o: api.Open = .{ .dir = "d", .model_type = "nemotron_h", .keep = keep, .learn = root, .learn_conversations = true, .spill = mode };
+-        attachKept(K, "k", gpa, io, undefined, o, root, null, @as(u8, 0), &store) catch |e| {
++        attachKept(K, "k", gpa, io, undefined, o, root, null, @as(u8, 0), &store, 0) catch |e| {
+             store.deinit();
+             return e;
+         };
+@@ -364,7 +364,7 @@ fn keptStaging(comptime K: type) !u64 {
+     const vt: api.prompt_cache.Snapshots.VTable = .{ .bytes = Fake.bytes, .save = Fake.save, .restore = Fake.restore, .drop = Fake.drop, .rows = &image };
+     var store = api.prompt_cache.Store.init(gpa, .{ .ptr = &family, .vtable = &vt }, .{ .lookahead = 1 }, 1 << 20);
+     const o: api.Open = .{ .dir = root, .model_type = "m", .learn = root, .learn_conversations = true };
+-    attachKept(K, "k", arena.allocator(), io, &gpu, o, root, null, struct { backend: u8 = 0, target: u8 = 0 }{}, &store) catch |e| {
++    attachKept(K, "k", arena.allocator(), io, &gpu, o, root, null, struct { backend: u8 = 0, target: u8 = 0 }{}, &store, 0) catch |e| {
+         store.deinit();
+         return e;
+     };

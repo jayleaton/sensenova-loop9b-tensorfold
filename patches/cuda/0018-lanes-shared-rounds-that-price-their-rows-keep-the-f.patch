@@ -1,0 +1,83 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Jay Leaton <58495321+jayleaton@users.noreply.github.com>
+Date: Wed, 18 Nov 2026 16:45:33 +0700
+Subject: [PATCH 18/19] lanes: shared rounds that price their rows keep the
+ fixed copy width
+
+Families with allocate_shared_drafts price shared head and copy rows
+together; a narrower copy freed rows the costed grants give to no one
+(Nemotron's sixteen-stream grant test). Only unpriced shared rounds,
+copy-only families such as qwen3_5 CUDA, start narrow and widen.
+---
+ zig/src/core/lanes/copy_width.zig        | 24 ++++++++++++++++++++----
+ zig/src/core/lanes/drafted_copy_test.zig |  7 ++++++-
+ 2 files changed, 26 insertions(+), 5 deletions(-)
+
+diff --git a/zig/src/core/lanes/copy_width.zig b/zig/src/core/lanes/copy_width.zig
+index 857a174fa..03db05d04 100644
+--- a/zig/src/core/lanes/copy_width.zig
++++ b/zig/src/core/lanes/copy_width.zig
+@@ -8,18 +8,34 @@ pub const Widths = struct { lone: ?u32 = null, shared: ?u32 = null };
+ /// A shared round's first copy rows at most, as the narrow families' first_copy_rows (4 rows: 3 copies).
+ const shared_first = 3;
+ 
+-/// The first width: a lone stream's cfg.first_copy; a shared stream's no wider than shared_first.
++/// Which width a round grows: none where allocate_shared_drafts prices shared rows (they keep cfg.first_copy).
++const Kind = enum { lone, shared, priced };
++
++fn kind(e: *const Engine) Kind {
++    return if (e.alone) .lone else if (e.cfg.allocate_shared_drafts) .priced else .shared;
++}
++
++/// The first width: a lone or priced stream's cfg.first_copy; an unpriced shared stream's no wider than shared_first.
+ pub fn first(e: *const Engine) u32 {
+-    return if (e.alone) e.cfg.first_copy else @min(e.cfg.first_copy, shared_first);
++    return if (kind(e) == .shared) @min(e.cfg.first_copy, shared_first) else e.cfg.first_copy;
+ }
+ 
+ /// The copies this round may propose.
+ pub fn current(e: *const Engine, s: *const Stream) u32 {
+-    return (if (e.alone) s.copy_width.lone else s.copy_width.shared) orelse first(e);
++    const width: ?u32 = switch (kind(e)) {
++        .lone => s.copy_width.lone,
++        .shared => s.copy_width.shared,
++        .priced => null,
++    };
++    return width orelse first(e);
+ }
+ 
+ /// After a copy window: widen it when all its own rows landed, else back to the first width.
+ pub fn observe(e: *const Engine, s: *Stream, whole: bool) void {
+     const next = if (whole) @min(e.cfg.max_copy, 2 * current(e, s) + 1) else first(e);
+-    if (e.alone) s.copy_width.lone = next else s.copy_width.shared = next;
++    switch (kind(e)) {
++        .lone => s.copy_width.lone = next,
++        .shared => s.copy_width.shared = next,
++        .priced => {},
++    }
+ }
+diff --git a/zig/src/core/lanes/drafted_copy_test.zig b/zig/src/core/lanes/drafted_copy_test.zig
+index f15197c66..841dee3ba 100644
+--- a/zig/src/core/lanes/drafted_copy_test.zig
++++ b/zig/src/core/lanes/drafted_copy_test.zig
+@@ -176,7 +176,7 @@ test "plain_streams: a family's row policy keeps copies below the switch, and no
+     }
+ }
+ 
+-test "copy width: a shared stream starts at three copies, grows to 2 w + 1 while they land, narrows on a miss" {
++test "copy width: an unpriced shared stream starts at three copies, grows to 2 w + 1 while they land, narrows on a miss" {
+     const cw = @import("copy_width.zig");
+     var cfg = try Config.init(gpa, .{ .exact_width = 16, .hidden_rows = true, .batch_rows = 32 }, 16, 15);
+     defer cfg.deinit(gpa);
+@@ -199,6 +199,11 @@ test "copy width: a shared stream starts at three copies, grows to 2 w + 1 while
+     // a lone round keeps its own width, from cfg.first_copy
+     e.alone = true;
+     try std.testing.expectEqual(cfg.first_copy, cw.current(&e, &s));
++    // where allocate_shared_drafts prices shared rows, a shared copy keeps cfg.first_copy and never grows
++    e.alone = false;
++    cfg.allocate_shared_drafts = true;
++    cw.observe(&e, &s, true);
++    try std.testing.expectEqual(cfg.first_copy, cw.current(&e, &s));
+ }
+ 
+ /// Copies the fake target's own continuation, as many tokens as the window allows, so every copy lands whole.
