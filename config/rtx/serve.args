@@ -1,0 +1,1 @@
+--parallel 1 --kv-cache fp8 --context 212992 --prompt-cache-gib 0

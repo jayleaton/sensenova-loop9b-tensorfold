@@ -10,6 +10,9 @@ patch series applied in order. The pin, the series length and the resulting tree
 | `tensorfold.patches` | `0019` | `0044` |
 | `tensorfold.tree` | `0882211e9e246e25b23eee4cb573eb4d8290977b` | `d33e2d93ea37f0b3ed1f208599a24ac00b3de16e` |
 
+RTX (`config/rtx/`) reuses the CUDA pin and series: `tensorfold.series` lists `cuda:0019 rtx:0002`, applied in that
+order, and the result is checked against `8b937545caec6714b0d33b853c2bd31c9f2ab65f`.
+
 Both pins are on upstream `main` (2026-11-17); `038e4a278` is 36 commits older than `6d0a128b0`.
 `scripts/fetch-engine.sh BACKEND DEST [SOURCE]` fetches the pin, applies `patches/BACKEND/0001`..`LAST` with `git am`
 (each patch keeps its author; the committer and dates are fixed, so every machine gets the same commits) and refuses
@@ -97,3 +100,13 @@ Each patch is one engine commit with its own message. TensorFold asks for one ch
 `SUMMARY` for each new GPU kernel, zero new lean-checker findings and an FP64 reference for any changed reduction
 order; the patch messages and [CUDA](CUDA.md#engine-checks) / [METAL](METAL.md) record which of those receipts
 exist. The series are this recipe's, not upstream pull requests.
+
+## RTX series, `patches/rtx/` (on top of the CUDA series)
+
+| patch | change |
+| --- | --- |
+| `0001` | the EXL3 loader reads SenseNova-Loop's loop and mHC (the loop's KV and recurrent state, the f32 mHC routers, `loop_gate`); the EXL3 capability list compiles and keeps Qwen's decisions; the quantize tools and one resumable chain at 4.0/5.0/6.0 bpw (Hessians from the real looped model, exllamav3 conversion, the extras attached) |
+| `0002` | `zig/src/native/cuda.zig` back to TensorFold's 600-line rule: a family's own model_type and its aliases in one registry pass |
+
+`0001` squashes the archive's `sensenova/loop9b-exl3` engine commits (`bb2c8e4f8`, `863dbb692`, `42e0a733d`); one test
+conflict against the CUDA series (`cuda_loop_plan_test.zig`) keeps both tests.

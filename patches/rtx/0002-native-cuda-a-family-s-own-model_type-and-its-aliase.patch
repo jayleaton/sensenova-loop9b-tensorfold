@@ -1,0 +1,27 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Jay Leaton <58495321+jayleaton@users.noreply.github.com>
+Date: Wed, 18 Nov 2026 22:27:47 +0700
+Subject: [PATCH 2/2] native cuda: a family's own model_type and its aliases in
+ one registry pass
+
+The serving series and the EXL3 loader each left zig/src/native/cuda.zig at 600
+lines; together they made 601. One loop over (own name, alias) keeps the same
+order, every family's own model_type before any alias, at 600 lines.
+---
+ zig/src/native/cuda.zig | 3 +--
+ 1 file changed, 1 insertion(+), 2 deletions(-)
+
+diff --git a/zig/src/native/cuda.zig b/zig/src/native/cuda.zig
+index 4358a33b7..7e3b5b8d0 100644
+--- a/zig/src/native/cuda.zig
++++ b/zig/src/native/cuda.zig
+@@ -165,8 +165,7 @@ pub fn open(a: Allocator, gpa: Allocator, io: std.Io, o: api.Open, problem: *[]c
+     if (std.mem.eql(u8, o.model_type, "fish_omni")) return openDrama(a, gpa, io, o, problem);
+     if (std.mem.eql(u8, o.model_type, "qwen4") or std.mem.eql(u8, o.model_type, "qwen4_text")) return @import("qwen4_cuda.zig").open(a, gpa, io, o, problem);
+     if (std.mem.eql(u8, o.model_type, "qwen3")) return @import("cuda_qwen3.zig").open(a, gpa, io, o, problem, budget, windows);
+-    inline for (registry) |F| if (std.mem.eql(u8, o.model_type, F.model_type)) return openWith(F, a, gpa, io, o, problem);
+-    inline for (registry) |F| if (@import("cuda_alias.zig").only(F, o.model_type)) return openWith(F, a, gpa, io, o, problem);
++    inline for (.{ false, true }) |alias| inline for (registry) |F| if (if (alias) @import("cuda_alias.zig").only(F, o.model_type) else std.mem.eql(u8, o.model_type, F.model_type)) return openWith(F, a, gpa, io, o, problem);
+     if (std.mem.eql(u8, o.model_type, lfm2.family.model_type)) {
+         if (refusals.lfm2(o)) |why| {
+             problem.* = why;

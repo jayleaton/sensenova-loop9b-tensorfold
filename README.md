@@ -5,8 +5,8 @@ Support me here: https://buymeacoffee.com/jayleaton
 # SenseNova-Loop-9B on TensorFold: DGX Spark and Mac Studio
 
 A recipe for serving [SenseNova-Loop-9B](https://huggingface.co/sensenova/SenseNova-Loop-9B) with
-[TensorFold](https://github.com/ashhart/TensorFold) on two backends: CUDA on one NVIDIA DGX Spark (TP=1), and Metal on
-Apple Silicon. It ships an exact upstream TensorFold pin and a patch series for each backend, a converter from the
+[TensorFold](https://github.com/ashhart/TensorFold) on two backends: CUDA on one NVIDIA DGX Spark (TP=1) or a 16 GB RTX
+card, and Metal on Apple Silicon. It ships an exact upstream TensorFold pin and a patch series for each backend, a converter from the
 published BF16 checkpoint to the engine's MLX affine format, serving profiles, and the measurements behind them.
 No weights are included or published: you download the checkpoint from SenseNova and convert it yourself.
 
@@ -36,6 +36,7 @@ More in [CREDITS](docs/CREDITS.md); license terms in [LICENSING](docs/LICENSING.
 | Architecture | Qwen3.5 dense hybrid attention; physical layers `[4, 28)` run twice (56 executions from 32 weight sets), wrapped in a two-stream mHC ([MODEL](docs/MODEL.md)) |
 | Weights served | MLX affine g64, converted with [`tools/sensenova_loop_mlx.py`](docs/CONVERT.md) from the patch series: 8-bit on CUDA, 4-bit on Metal |
 | CUDA | 1x DGX Spark (GB10), TP=1: upstream TensorFold [`038e4a278`](config/cuda/tensorfold.rev) + [`patches/cuda/`](patches/cuda/) `0001`-`0019` |
+| RTX | 16 GB RTX cards (tested on an RTX 5070 Ti, WSL2): the CUDA pin and series + [`patches/rtx/`](patches/rtx/) `0001`-`0002`, EXL3 packs |
 | Metal | Apple Silicon (measured on M5 Ultra and M4 Pro): upstream TensorFold [`6d0a128b0`](config/metal/tensorfold.rev) + [`patches/metal/`](patches/metal/) `0001`-`0044` |
 | Input | text and images on both ([CUDA](docs/CUDA.md#serve), [METAL](docs/METAL.md#images)) |
 | Drafts | copy drafts on by default on both: drafts from a stream's own context, verified, so tokens are unchanged |
@@ -67,6 +68,11 @@ GiB prompt cache and an NVMe disk tier.
 **Metal: 4-bit with copy drafts.** M5 Ultra 59.5-60.0 tok/s without drafts; with copy drafts a repeated paragraph
 runs at 362 tok/s, a code edit at 87 and prose at 94, all 16 reply pairs token-identical to drafts off. An M4 Pro
 MacBook Pro (24 GB) decodes at 26.7 tok/s ([METAL](docs/METAL.md#copy-drafts)).
+
+**RTX 16 GB: EXL3 packs.** Tested on an RTX 5070 Ti 16 GB in WSL2 with the CUDA series plus `patches/rtx/`
+([RTX](docs/RTX.md)): the 6.0-bit pack decodes at 46.6 tok/s at 4k and 43.9 at 32k with drafts off, prefills at 2,232
+tok/s, passes 36/36 tool calls and a 30-minute soak, and its gate logits equal the DGX Spark's run of the same pack.
+The 4.0-bit pack decodes at 59.1 tok/s. No packs are published; you quantize them yourself.
 
 **Tool calls need `libtfgrammar`.** `tool_choice: "required"`, a named function and `response_format` need
 `libtfgrammar` (`.so` on Linux, `.dylib` on macOS) beside the server, built from xgrammar v0.2.8 with
@@ -156,13 +162,12 @@ curl -s http://127.0.0.1:8090/v1/chat/completions -H 'Content-Type: application/
 Thinking is on by default (the checkpoint's chat template); send `"chat_template_kwargs": {"enable_thinking": false}`
 to turn it off. A `--thinking-budget` at or above `max_tokens` never closes the thinking block (the reply ends with
 `length`); keep it under `max_tokens` or add `--thinking-reserve N`. Build `libtfgrammar` for required and named tool
-calls (see above). To check the patch series without building, run `scripts/fetch-engine.sh cuda|metal DIR`: it fetches
+calls (see above). To check the patch series without building, run `scripts/fetch-engine.sh cuda|metal|rtx DIR`: it fetches
 the pin, applies the series and checks the resulting tree.
 
 ## Not yet
 
 - **DFlash2 drafter:** waiting on SenseNova's published drafter weights.
-- **EXL3 on 16 GB RTX cards:** not yet tested on a real card.
 - **Benchmarks:** coming.
 
 ## Documentation
@@ -173,6 +178,7 @@ the pin, applies the series and checks the resulting tree.
 | [CONVERT](docs/CONVERT.md) | BF16 to MLX affine: commands and the mappings that matter |
 | [CUDA](docs/CUDA.md) | DGX Spark: build, the served 1M profile, parity, speed |
 | [METAL](docs/METAL.md) | Apple Silicon: build, serve, copy drafts, fidelity, speed |
+| [RTX](docs/RTX.md) | EXL3 packs on a 16 GB RTX card: results on an RTX 5070 Ti, pack choice, WSL2 steps |
 | [ENGINE](docs/ENGINE.md) | the pins and both patch series, patch by patch |
 | [KNOWN-ISSUES](docs/KNOWN-ISSUES.md) | what is not solved |
 | [CREDITS](docs/CREDITS.md) / [LICENSING](docs/LICENSING.md) | who built what, and under which terms |

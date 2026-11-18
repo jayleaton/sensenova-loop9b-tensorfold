@@ -1,0 +1,140 @@
+# RTX 16 GB: EXL3 packs on the CUDA engine
+
+> **Tested on an RTX 5070 Ti 16 GB (WSL2).** The packs were sized on a DGX Spark under a 16 GB memory cap, then run on
+> the card: the gate's logits equal the Spark's run of the same pack, and the card's own windows, speed, tool calls
+> and a 30-minute soak are below. Other 16 GB cards and native Windows are untested.
+
+| | |
+| --- | --- |
+| Engine | upstream TensorFold `038e4a278` + [`patches/cuda/`](../patches/cuda/) `0001`-`0019` + [`patches/rtx/`](../patches/rtx/) `0001`-`0002` |
+| Engine tree | [`config/rtx/tensorfold.tree`](../config/rtx/tensorfold.tree) |
+| Card tested | RTX 5070 Ti 16 GB (Blackwell, `sm_120`), WSL2 Ubuntu 24.04, the Windows desktop on the same card |
+| Weights | EXL3 packs quantized from the BF16 checkpoint with exllamav3 ([quantize](#quantize)) |
+
+`patches/rtx/`:
+
+| patch | change |
+| --- | --- |
+| `0001` | the EXL3 loader reads SenseNova-Loop's loop and mHC; the capability list keeps Qwen's decisions; the quantize chain: Hessians from the real looped model, exllamav3 conversion at 4.0/5.0/6.0 bpw, the extras attached |
+| `0002` | `zig/src/native/cuda.zig` back to 600 lines: a family's own model_type and its aliases in one registry pass |
+
+## Results on the RTX 5070 Ti
+
+| pack | largest fp8-KV window on the card | gate cos / top-1 (298 positions) | decode, drafts off | prefill | tool calls | other |
+| --- | ---: | --- | --- | --- | --- | --- |
+| **`sn-6.0`** | 245,760 | 0.99931 / 290, logits equal to the Spark's run of the pack | 46.6 tok/s at 4k, 43.9 at 32k | 2,232 tok/s; first token 1.8 s at 4k, 16.3 s at 32k | 36/36 | greedy repeats 10/10; a 30-minute soak, 241 requests, 0 failures, no memory growth |
+| `sn-4.0` | 319,488 | 0.99486 / 279 | 59.1 tok/s at 4k | 2,364 tok/s | 36/36 | |
+| `sn-5.0` | 286,720 | 0.99779 / 290, equal to the Spark | | | | |
+
+Served at the flags below, `sn-6.0` peaked at 12.49 GiB in the engine and 15.76 of the card's 15.92 GiB with the
+Windows desktop's share. At a 32k bf16-KV window the engine's peak equals the Spark's (10.36 GiB): the BF16 embedding
+rows (1.89 GiB) stay on the card there and move to host memory only when a long window needs the room.
+
+The card ran the EXL3 commits on the CUDA series through `0009` (the prefill build). This recipe's RTX tree puts the
+same EXL3 code on the full served series `0001`-`0019`, which adds the image path, tool-call and decode-share fixes and
+the copy-window rules; that tree is built for `sm_120` and smoke-tested with `sn-6.0` on the Spark (an `sm_121` build of
+the same tree), not yet re-run on the card.
+
+**Pick: `sn-6.0` at 16 GB**, next to q8 on quality. **`sn-4.0` for speed** or the longest window.
+
+## Quality and size, measured on the Spark
+
+| pack | size | cosine / top-1 vs BF16 (249 positions) | device peak, 32k, bf16 KV | largest fp8-KV window, 15.0 / 14.5 GiB cap |
+| --- | ---: | --- | ---: | --- |
+| `sn-4.0` | 6.31 GB | 0.99393 / 236 | 8.51 GiB | 294,912 / 278,528 |
+| `sn-5.0` | 7.17 GB | 0.99807 / 244 | 9.31 GiB | 270,336 / 253,952 |
+| `sn-6.0` | 8.29 GB | 0.99937 / 244 | 10.35 GiB | 229,376 / 212,992 |
+| MLX q8 (for scale) | | 0.99975 / 246 | | |
+
+15.0 GiB is what a 16 GB card leaves after the driver context; 14.5 GiB is a Windows desktop whose display also holds
+part of the card. The card itself admitted larger windows than the 14.5 GiB cap (the table above), since what the
+desktop holds varies; the serve flags keep the 14.5 GiB window so they fit with a busier desktop.
+
+## Build
+
+On Linux or WSL2 with the CUDA 13 toolkit and Zig 0.17.0:
+
+```bash
+scripts/build-engine.sh rtx engine-rtx        # SM=120 by default (RTX 50); set SM= for another card
+```
+
+Without root, point the build at a user-level toolkit with `NVCC=$CUDA_DIR/bin/nvcc` ([WSL2 steps](#windows-wsl2-steps)).
+Structured output and `tool_choice` required or named need `libtfgrammar` beside the server
+([CUDA](CUDA.md#required-and-named-tool-calls)).
+
+## Serve
+
+```bash
+scripts/serve.sh rtx engine-rtx sn-6.0        # --parallel 1 --kv-cache fp8 --context 212992 --prompt-cache-gib 0
+```
+
+The other two fits, run directly:
+
+```bash
+engine-rtx/zig-out/native/bin/tensorfold-native serve sn-4.0 --parallel 1 --kv-cache fp8 --context 278528 --prompt-cache-gib 0
+engine-rtx/zig-out/native/bin/tensorfold-native serve sn-6.0 --parallel 1 --context 32768 --prompt-cache-gib 0   # bf16 KV
+```
+
+If the desktop needs more of the card, cap the engine's budget with `TENSORFOLD_CUDA_MEMORY_LIMIT_GB=14.5`.
+
+## Windows: WSL2 steps
+
+Run the engine in WSL2 Ubuntu 24.04. A native Windows build exists upstream (`docs/WINDOWS.md`), but these packs were
+only run on Linux and WSL2, which is that same path with the Windows driver serving the GPU.
+
+1. **Driver and WSL.** On Windows, the current NVIDIA display driver (`nvidia-smi` reports CUDA 13.x); no CUDA toolkit
+   on the Windows side. Then `wsl --install -d Ubuntu-24.04`, reboot if asked, `wsl --update`, and inside Ubuntu
+   `sudo apt update && sudo apt install -y build-essential git curl`. Install only the toolkit in WSL, never a Linux
+   display driver or the `cuda`/`cuda-drivers` metapackages:
+
+   ```bash
+   wget https://developer.download.nvidia.com/compute/cuda/repos/wsl-ubuntu/x86_64/cuda-keyring_1.1-1_all.deb
+   sudo dpkg -i cuda-keyring_1.1-1_all.deb && sudo apt update
+   sudo apt install -y cuda-toolkit-13-0
+   echo 'export PATH=/usr/local/cuda/bin:$PATH' >> ~/.bashrc && . ~/.bashrc
+   nvidia-smi --query-gpu=name,memory.total,driver_version --format=csv,noheader
+   nvcc --version
+   ```
+
+   **Without sudo**, take the same toolkit's parts from NVIDIA's redist tarballs (`redistrib_13.0.3.json` lists each
+   one's path and sha256): `cuda_nvcc`, `cuda_crt`, `cuda_cudart`, `cuda_cccl`, `libnvvm`, `cuda_cuobjdump`,
+   `cuda_nvdisasm`, `cuda_profiler_api` and `libnvptxcompiler`, each extracted with `--strip-components=1` into one
+   directory, `$CUDA_DIR` (for example `cuda-13.0` under your home directory); then build with
+   `NVCC=$CUDA_DIR/bin/nvcc`. The card was tested this way.
+
+   If the build is killed for memory, set `memory=24GB` (or half the machine's RAM) in `%USERPROFILE%\.wslconfig`.
+2. **Zig 0.17.0:**
+
+   ```bash
+   mkdir -p ~/.local/bin && cd ~/.local
+   curl -LO https://ziglang.org/download/0.17.0/zig-x86_64-linux-0.17.0.tar.xz
+   tar -xJf zig-x86_64-linux-0.17.0.tar.xz && ln -sf ~/.local/zig-x86_64-linux-0.17.0/zig ~/.local/bin/zig
+   ```
+
+3. **Build** with this recipe: `scripts/build-engine.sh rtx engine-rtx` (several minutes of nvcc, no GPU needed). It
+   fetches the pinned upstream commit, applies both series and checks the tree.
+4. **The pack** goes on ext4 under your home directory, never under `/mnt/c`, where the checkpoint reader's `O_DIRECT`
+   does not reach. Check every file against the pack's `sha256` list (13 entries).
+5. **Serve** as above. It listens on `http://127.0.0.1:8090/v1`; add `--host 0.0.0.0` to reach it from Windows. Close
+   other GPU work first: a busy desktop halved decode on the first run.
+6. **Check:** one greedy chat, and the card's peak while it runs:
+
+   ```bash
+   curl -s http://127.0.0.1:8090/v1/chat/completions -H 'Content-Type: application/json' -d '{"model": "loop9b",
+     "messages": [{"role": "user", "content": "Write a Python function fib(n) that returns the n-th Fibonacci number."}],
+     "max_tokens": 200, "temperature": 0}'
+   ```
+
+   Read the card's memory from Windows (Task Manager's dedicated GPU memory, or `nvidia-smi` in a Windows terminal).
+   **WSL's `nvidia-smi` prints a garbage used figure near 2^44 MiB once the card is nearly full**; the engine admits
+   from the driver's free memory, so a startup refusal naming the budget while the desktop is busy means the card is
+   full, not that the flags are wrong. The engine's own peak is on `/metrics` with `--metrics-open`. Scoring the
+   teacher-forced gate yourself needs `numpy` (`sudo apt install -y python3-numpy`).
+
+## Quantize
+
+exllamav3 cannot trace this model (`sensenova_loop` is not a registered architecture, and its `qwen3_5` forward has no
+loop or mHC), so the chain captures Hessians from the real looped model with transformers, one per unique weight summed
+over both visits, and lets exllamav3 quantize from them. The steps, pinned versions and recipes are in the patched
+engine: `docs/exl3-sensenova-quantize.md`, `docs/exl3-recipes/` and `tools/exl3_sensenova_chain.sh`. No packs are
+published.

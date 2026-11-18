@@ -1,0 +1,1421 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Jay Leaton <58495321+jayleaton@users.noreply.github.com>
+Date: Wed, 18 Nov 2026 22:36:04 +0700
+Subject: [PATCH 1/2] qwen3_5: SenseNova-Loop's EXL3 packs: the loader, the
+ capability list and the quantize chain
+
+SenseNova-Loop-9B is Qwen3.5-9B with a shared-weight loop over layers [4, 28) and
+manifold-constrained streams inside it. Its EXL3 pack is exllamav3's dense layout under
+HF names, with the router tensors kept f32 and the small attention tensors in the dtypes
+the reference stores them.
+
+- The loader: the loop and mHC parse before the format branch; mhc_attn/mhc_ffn load
+  through plain(); cuda_exl3_dtype.zig converts the small tensors both packs carry
+  (A_log f32 or bf16, linear_attn.norm and dt_bias f32 rounded to bf16, in_proj_a/b bf16
+  or f16).
+- cuda_families builds its alias entries as one comptime constant, and an alias carries its
+  family's decision formats.
+- The quantize tools: the shim presents the text tower as Qwen3_5ForCausalLM; the Hessian
+  capture sums each shared weight's inputs over both loop visits, sizes each group by its own
+  input width and keeps a shared capture's module path; the extras shard is 0644.
+- tools/exl3_sensenova_chain.sh runs shims, Hessians, task-gate references and one convert and
+  attach per recipe as one resumable chain, with a per-step GPU lock, done markers and a
+  MemAvailable floor. Recipes are the 4.0, 5.0 and 6.0 tiers.
+
+EXL3 is exllamav3's format and quantizer (turboderp); its trellis codebooks are QTIP's.
+---
+ docs/exl3-recipes/4.0.json                    |  10 +
+ docs/exl3-recipes/5.0.json                    |  10 +
+ docs/exl3-recipes/6.0.json                    |  10 +
+ docs/exl3-recipes/README.md                   |  26 ++
+ docs/exl3-sensenova-quantize.md               | 124 ++++++++
+ docs/recipes/exl3.md                          |   4 +
+ tools/exl3_attach_sensenova.py                | 186 ++++++++++++
+ tools/exl3_gate_ref.py                        |  35 +++
+ tools/exl3_hessians.py                        | 267 ++++++++++++++++++
+ tools/exl3_sensenova_chain.sh                 |  64 +++++
+ zig/build/cuda_family_host.zig                |   4 +-
+ zig/src/core/bf16_round.zig                   |   8 +
+ zig/src/families/qwen3_5/cuda_exl3_dtype.zig  |  92 ++++++
+ .../qwen3_5/cuda_exl3_loader_test.zig         |  59 ++++
+ .../families/qwen3_5/cuda_exl3_weights.zig    |  76 +++--
+ .../families/qwen3_5/cuda_loop_plan_test.zig  |  46 ++-
+ zig/src/families/qwen3_5/cuda_native.zig      |   2 +
+ zig/src/families/qwen3_5/cuda_weights.zig     |   5 +-
+ zig/src/native/cuda.zig                       |   1 +
+ zig/src/native/cuda_alias.zig                 |   6 +
+ zig/src/native/cuda_families.zig              |  66 ++++-
+ zig/src/native/cuda_refusal.zig               |   2 +-
+ 22 files changed, 1045 insertions(+), 58 deletions(-)
+ create mode 100644 docs/exl3-recipes/4.0.json
+ create mode 100644 docs/exl3-recipes/5.0.json
+ create mode 100644 docs/exl3-recipes/6.0.json
+ create mode 100644 docs/exl3-recipes/README.md
+ create mode 100644 docs/exl3-sensenova-quantize.md
+ create mode 100644 tools/exl3_attach_sensenova.py
+ create mode 100755 tools/exl3_gate_ref.py
+ create mode 100644 tools/exl3_hessians.py
+ create mode 100755 tools/exl3_sensenova_chain.sh
+ create mode 100644 zig/src/families/qwen3_5/cuda_exl3_dtype.zig
+
+diff --git a/docs/exl3-recipes/4.0.json b/docs/exl3-recipes/4.0.json
+new file mode 100644
+index 000000000..da02052c7
+--- /dev/null
++++ b/docs/exl3-recipes/4.0.json
+@@ -0,0 +1,10 @@
++{
++  "name": "4.0",
++  "tier": "Mac default, RTX 16 GB small",
++  "bits": 4.0,
++  "head_bits": 6,
++  "embed_bits": 16,
++  "codebook": "mul1",
++  "out_scales": "always",
++  "note": "4.0 bpw body, 6 bpw head: the Mac default and the 16 GB card's smallest tier"
++}
+diff --git a/docs/exl3-recipes/5.0.json b/docs/exl3-recipes/5.0.json
+new file mode 100644
+index 000000000..cccff5740
+--- /dev/null
++++ b/docs/exl3-recipes/5.0.json
+@@ -0,0 +1,10 @@
++{
++  "name": "5.0",
++  "tier": "Mac quality, RTX 16 GB default",
++  "bits": 5.0,
++  "head_bits": 6,
++  "embed_bits": 16,
++  "codebook": "mul1",
++  "out_scales": "always",
++  "note": "5.0 bpw body, 6 bpw head: the Mac quality option and the 16 GB card's default tier"
++}
+diff --git a/docs/exl3-recipes/6.0.json b/docs/exl3-recipes/6.0.json
+new file mode 100644
+index 000000000..32087a477
+--- /dev/null
++++ b/docs/exl3-recipes/6.0.json
+@@ -0,0 +1,10 @@
++{
++  "name": "6.0",
++  "tier": "RTX 16 GB quality",
++  "bits": 6.0,
++  "head_bits": 8,
++  "embed_bits": 16,
++  "codebook": "mul1",
++  "out_scales": "always",
++  "note": "6.0 bpw body, 8 bpw head: the 16 GB card's quality tier"
++}
+diff --git a/docs/exl3-recipes/README.md b/docs/exl3-recipes/README.md
+new file mode 100644
+index 000000000..19d67c853
+--- /dev/null
++++ b/docs/exl3-recipes/README.md
+@@ -0,0 +1,26 @@
++# EXL3 recipes for SenseNova-Loop-9B
++
++One file per tier. Each names the three widths `exllamav3`'s `convert_model.py` takes for that run; the
++layout is the same in every one (see [../exl3-sensenova-quantize.md](../exl3-sensenova-quantize.md)):
++
++| key | flag | meaning |
++| --- | --- | --- |
++| `bits` | `-b` | body (every quantized linear but the head) |
++| `head_bits` | `-hb` | `lm_head` |
++| `embed_bits` | `-eb` | `embed_tokens`; 16 keeps it BF16, which the Mac reads from the mapped file |
++| `codebook` | `-cb` | `mul1`: CUDA admits only this, and it carries the half-bit widths |
++| `out_scales` | `--out_scales` | `always`: a Hessian-only run collects no output statistics for `auto` to decide with |
++
++| recipe | tier | body | head | note |
++| --- | --- | --- | --- | --- |
++| `4.0` | Mac default, RTX 16 GB small | 4.0 | 6 | about 6.3 GB with the BF16 embedding |
++| `5.0` | Mac quality, RTX 16 GB default | 5.0 | 6 | about 7.0 GB with the BF16 embedding |
++| `6.0` | RTX 16 GB quality | 6.0 | 8 | about 8.1 GB with the BF16 embedding |
++
++One pack per recipe serves both runners. The Mac reads the embedding from the mapped file, so its GPU-resident
++weights are the body and head alone; the RTX tiers keep the embedding on the card. The Mac numbers and their
++gate are in the Metal plan (`docs/exl3-quant-plan.md`); the RTX caps are in the EXL3 spec.
++[`tools/exl3_sensenova_chain.sh`](../../tools/exl3_sensenova_chain.sh) converts every file here, in name order.
++
++Credit: EXL3 is [exllamav3](https://github.com/turboderp-org/exllamav3)'s format and quantizer (turboderp);
++its trellis codebooks are QTIP's (Tseng, Chee, Sun, Kuleshov, De Sa, [arXiv:2406.11235](https://arxiv.org/abs/2406.11235)).
+diff --git a/docs/exl3-sensenova-quantize.md b/docs/exl3-sensenova-quantize.md
+new file mode 100644
+index 000000000..adbf94024
+--- /dev/null
++++ b/docs/exl3-sensenova-quantize.md
+@@ -0,0 +1,124 @@
++# Quantizing SenseNova-Loop-9B to EXL3
++
++One EXL3 checkpoint that the CUDA `qwen3_5` engine (RTX 16 GB) and the Metal runner both
++read: one pack per recipe, Mac and RTX alike. SenseNova-Loop-9B is Qwen3.5-9B with a shared-weight loop over layers [4, 28) and manifold-constrained
++hyper-connection (mHC) streams; the EXL3 layout is [exllamav3](https://github.com/turboderp-org/exllamav3)'s
++own, so its tooling reads the pack unchanged.
++
++Credit: EXL3 is exllamav3's format, quantizer and calibration set (turboderp); its trellis codebooks are
++QTIP's (Tseng, Chee, Sun, Kuleshov, De Sa, [arXiv:2406.11235](https://arxiv.org/abs/2406.11235)).
++
++## The layout
++
++- Stock exllamav3 output under HF tensor names, with `mul1` everywhere. Every quantized linear is
++  `<prefix>.trellis` i16 `[K/16, N/16, 16*bits]`, `<prefix>.suh` f16 `[K]`, `<prefix>.svh` f16 `[N]` and a
++  zero-size `<prefix>.mul1` marker: `self_attn.{q,k,v,o}_proj`, `linear_attn.{in_proj_qkv,in_proj_z,out_proj}`,
++  `mlp.{gate,up,down}_proj` and `lm_head`.
++- `embed_tokens.weight` stays BF16 (`-eb 16`). The Mac reads it from the mapped file, so it costs no GPU
++  residency there.
++- Copied from the source, never quantized: every norm (zero-centred as HF ships it, no `w + 1`),
++  `linear_attn.{conv1d.weight, A_log, dt_bias, in_proj_a.weight, in_proj_b.weight}`, the mHC routers
++  (`mhc_attn.{weight,bias}`, `mhc_ffn.{weight,bias}`, f32) and `loop_gate.*`. `model.visual.*` and `mtp.*`
++  are not in the pack.
++- `config.json` keeps SenseNova's `model_type: sensenova_loop`, `architectures`, `loop_settings` and `mhc`,
++  with the converter's `quantization_config` merged in.
++
++The CUDA loader accepts both stored dtypes for the small tensors: f32 `A_log`, `dt_bias` and
++`linear_attn.norm`, bf16 `in_proj_a`/`in_proj_b`, and today's bf16/f16 forms for stock packs.
++
++## Quantize
++
++exllamav3 at `turboderp-org/exllamav3@8c593e4e5c88da76a4aaf8f1b1838bb7c1fce4e0` in its own venv, with
++`TORCH_CUDA_ARCH_LIST=12.1`. Source: `sensenova/SenseNova-Loop-9B@329a65f701ba8c48b73c30d0cbaa6f0449733673`
++(BF16), and `Qwen/Qwen3.5-9B` for the control. Run it niced (`nice -n 19 ionice -c3`) on a machine with one
++large GPU; the measured run used a DGX Spark.
++
++[`tools/exl3_sensenova_chain.sh`](../tools/exl3_sensenova_chain.sh) runs steps 1 to 4 for SenseNova, then for the
++stock control when `EXL3_STOCK` is set, plus the task-gate references (`tools/exl3_gate_ref.py`: BF16 greedy, 64
++tokens on a prose, a code and a reasoning prompt). It resumes after the last finished step, holds
++`EXL3_GPU_LOCK` for one GPU step at a time and refuses a step below 40 GiB of MemAvailable. The steps by hand (`$WORK` is any working directory):
++
++exllamav3 cannot trace SenseNova: `sensenova_loop` is not one of its architectures and its `qwen3_5` forward
++has no loop and no mHC, so a calibration forward there would feed every layer the wrong activations. Instead
++capture the Hessians from the real transformers model and hand them to exllamav3's converter, which trusts a
++tensor's `hin` instead of tracing it.
++
++### 1. Present the text tower to exllamav3
++
++```bash
++python3 tools/exl3_attach_sensenova.py shim --source $WORK/bf16 \
++  --out $WORK/shim
++python3 tools/exl3_attach_sensenova.py shim --source $WORK/stock-qwen35-9b-bf16 \
++  --out $WORK/shim-stock
++```
++
++The shim is a directory of symlinks: the source's shards, tokenizer and generation config, with the text tower's
++config at the root, `architectures` `["Qwen3_5ForCausalLM"]` and `model_type` `qwen3_5_text`. exllamav3's
++`Qwen3_5ForConditionalGeneration` config requires a `vision_config`; the CausalLM one reads the same
++`model.language_model.*` keys without it. Shards are shared, not rewritten; the mHC, vision and MTP tensors sit
++inside them and are never asked for. The stock control takes the same shim, so both packs have one layout.
++
++### 2. Hessians, once per model
++
++```bash
++python3 -I tools/exl3_hessians.py --source $WORK/bf16 --shim $WORK/shim \
++  --out $WORK/hess/sensenova --device cuda:0
++python3 -I tools/exl3_hessians.py --source $WORK/stock-qwen35-9b-bf16 \
++  --shim $WORK/shim-stock --out $WORK/hess/stock --device cuda:0
++```
++
++The script loads the BF16 model with transformers and `trust_remote_code`, takes exllamav3's default
++calibration rows (`cal_rows=250`, `cal_cols=2048`) through exllamav3's own tokenizer of the shim, and registers a
++forward pre-hook on every linear the layout quantizes. Each hook accumulates `H += xᵀx` in f32 over the
++batch's tokens, drops non-finite rows, and divides by the token count at the end.
++
++- **The loop needs no special case.** Layers [4, 28) execute twice and the hook fires on both visits, so
++  their Hessian is the sum over both input distributions, which is the objective for one shared weight.
++- **mHC needs none either.** The hooks see the branch output each linear really receives (pre-weighted
++  stream mix, then norm); the routers stay f32 and are not quantized.
++- Linears that share an input share one accumulator and one file per key: q/k/v, `in_proj_qkv`/`z`,
++  `mlp.gate`/`up`. `o_proj`, `out_proj` and `down_proj` have their own.
++- `lm_head`'s input is the final norm's output, captured through a hook on the backbone's norm, so the
++  forward never builds the `[rows, vocab]` logits.
++- Memory is about 20 GB of f32 Hessians, dominated by `down_proj` at K=12288 (302 MB packed, x32).
++
++Each file is `{out}/{key}.safetensors` with `hin`, f32, as the packed upper triangle
++(`n(n+1)/2` values), the shape `--hessians` reads. `--plan-only` prints the keys and their captures without
++loading a model.
++
++### 3. Convert, one run per recipe
++
++```bash
++python convert.py -i $WORK/shim -o $WORK/exl3/sn-5.0 \
++  -w $WORK/work-sn-5.0 -b 5.0 -hb 6 -eb 16 -cb mul1 \
++  --hessians $WORK/hess/sensenova --out_scales always -d 0 --no_swap
++```
++
++The recipe files in [`exl3-recipes/`](exl3-recipes/) map to the flags: `bits` to `-b`, `head_bits` to `-hb`,
++`embed_bits` to `-eb`, `codebook` to `-cb`, `out_scales` to `--out_scales`. The same Hessians serve every
++width, so one capture pass feeds all three runs. `--out_scales always` because `auto` decides gate/up from
++calibration statistics a Hessian-only run does not collect.
++
++Watch the log for `No precomputed Hessian for <key>`: every quantized key must have a file, or the tensor is
++quantized uncalibrated. Repeat for `4.0` and `6.0`, then for the stock control at all three, each into its own
++output directory.
++
++### 4. Attach the extras and report
++
++```bash
++python3 tools/exl3_attach_sensenova.py attach --source $WORK/bf16 \
++  --converted $WORK/exl3/sn-5.0 --recipe sn-5.0
++```
++
++This copies the mHC and `loop_gate` tensors into `model-sensenova-extras.safetensors`, adds them to
++`model.safetensors.index.json`, restores SenseNova's `config.json` with the converter's
++`quantization_config` (plus the recipe name and calibration shape), copies the tokenizer and chat template,
++and prints every shard's size and sha256 for the hand-off. Without the extras (the stock control) it still
++restores the config and prints the report.
++
++## Gates
++
++The Mac tier's footprint gate and teacher-forced top-1 numbers are in the Metal plan; the RTX cells
++(`6.0`/`5.0`/`4.0`, bf16 and fp8 KV at 8k/32k/128k under `TENSORFOLD_CUDA_MEMORY_LIMIT_GB=15.0`) and the
++quality gates are in the EXL3 spec. The stock Qwen3.5-9B at the same recipe is the control: SenseNova's loss
++against BF16 must be no worse than the control's plus noise.
+diff --git a/docs/recipes/exl3.md b/docs/recipes/exl3.md
+index eb4a98f15..7b88d53ff 100644
+--- a/docs/recipes/exl3.md
++++ b/docs/recipes/exl3.md
+@@ -102,6 +102,10 @@ the checkpoint's plain tensors (`checkpoint.plain`: embeddings, norms, routers,
+ weights of the family's engine. `python -m tensorfold.cuda.exl3.inspect MODEL_DIR` prints exactly that split,
+ the bits per category, and every group that does not parse.
+ 
++TensorFold has no quantizer: every pack it serves came from exllamav3's own converter. Quantizing
++SenseNova-Loop-9B (or stock Qwen3.5-9B as the control) from a BF16 source, with the Hessian capture and the
++mHC/loop extras, is in [exl3-sensenova-quantize.md](../exl3-sensenova-quantize.md).
++
+ ## The layer's arithmetic
+ 
+ ```
+diff --git a/tools/exl3_attach_sensenova.py b/tools/exl3_attach_sensenova.py
+new file mode 100644
+index 000000000..7b6bd768a
+--- /dev/null
++++ b/tools/exl3_attach_sensenova.py
+@@ -0,0 +1,186 @@
++#!/usr/bin/env python3
++"""Present a SenseNova-Loop-9B or stock Qwen3.5-9B BF16 checkpoint as exllamav3's `qwen3_5`, and attach its extras.
++
++Two steps around exllamav3's convert_model.py:
++
++  shim    a temp directory of symlinks: the source's shards, tokenizer and generation config, with the
++          text tower's config so `Qwen3_5ForCausalLM` traces it (no loop_settings, no mHC,
++          no vision_config, no quantization table)
++  attach  after conversion: the mHC and loop_gate tensors the traced model never sees, copied into their
++          own shard; SenseNova's config.json restored with the converter's quantization_config; the
++          tokenizer and chat template copied; every shard's size and sha256 reported
++
++Credit: EXL3 is exllamav3's format, quantizer and layout (turboderp,
++https://github.com/turboderp-org/exllamav3); the trellis codebooks are QTIP's (Tseng, Chee, Sun, Kuleshov,
++De Sa).
++"""
++
++from __future__ import annotations
++
++import argparse
++import hashlib
++import json
++import os
++import re
++import shutil
++import sys
++
++TEXT_ARCH = "Qwen3_5ForCausalLM"
++EXTRA_SHARD = "model-sensenova-extras.safetensors"
++TOKENIZER_FILES = (
++    "tokenizer.json",
++    "tokenizer_config.json",
++    "added_tokens.json",
++    "special_tokens_map.json",
++    "chat_template.jinja",
++    "chat_template.json",
++    "generation_config.json",
++)
++# SenseNova's own tensors: mHC's routers (f32 as shipped) and the loop gate, which Metal skips today.
++EXTRA = re.compile(r"\.(mhc_attn|mhc_ffn)\.(weight|bias)$|(^|\.)loop_gate\.")
++
++
++def read_json(path: str) -> dict:
++    with open(path, encoding="utf8") as f:
++        return json.load(f)
++
++
++def write_json(path: str, value: dict):
++    with open(path, "w", encoding="utf8") as f:
++        json.dump(value, f, indent=2)
++        f.write("\n")
++
++
++def shim(source: str, out: str, force: bool):
++    """A directory exllamav3 reads as a stock Qwen3.5: the text config and symlinks to every source file."""
++    if os.path.exists(out) and os.listdir(out):
++        if not force:
++            raise SystemExit(f"{out} is not empty; pass --force to replace its shim files")
++        shutil.rmtree(out)
++    os.makedirs(out, exist_ok=True)
++    source_config = read_json(os.path.join(source, "config.json"))
++    if "text_config" not in source_config:
++        raise SystemExit(f"{source}: no text_config; this is not a Qwen3.5-9B checkpoint")
++    # exllamav3's ConditionalGeneration config requires a vision_config; the CausalLM one reads the text keys at the
++    # root under the same model.language_model prefix, so the tower is traced without its vision or loop blocks
++    config = dict(source_config["text_config"])
++    for key in ("tie_word_embeddings", "bos_token_id", "eos_token_id", "pad_token_id", "image_token_id"):
++        if key in source_config and key not in config:
++            config[key] = source_config[key]
++    config["architectures"] = [TEXT_ARCH]
++    config["model_type"] = "qwen3_5_text"
++    write_json(os.path.join(out, "config.json"), config)
++    linked = 0
++    for name in sorted(os.listdir(source)):
++        if name == "config.json":
++            continue
++        src = os.path.join(source, name)
++        if not os.path.isfile(src) or name.startswith(("preprocessor_config", "video_preprocessor")):
++            continue
++        os.symlink(os.path.abspath(src), os.path.join(out, name))
++        linked += 1
++    print(f"shim: {out} ({linked} files linked, {len(config['architectures'])} architecture)")
++    print(f"      convert with: -i {out} -b BITS -hb HEAD -eb 16 -cb mul1 --hessians HESS --out_scales always")
++
++
++def source_tensors(source: str):
++    """{tensor name: (shard path, tensor)} for the extras, read through safe_open and left on disk."""
++    from safetensors import safe_open
++
++    found = {}
++    for name in sorted(os.listdir(source)):
++        if not name.endswith(".safetensors"):
++            continue
++        path = os.path.join(source, name)
++        with safe_open(path, framework="pt", device="cpu") as f:
++            for key in f.keys():
++                if EXTRA.search(key):
++                    found[key] = (path, f.get_tensor(key))
++    return found
++
++
++def attach(source: str, converted: str, recipe: str | None, cal_rows: int, cal_cols: int):
++    """SenseNova's config, extras shard, tokenizer and an index that names the extras; then the report."""
++    extras = source_tensors(source)
++    if extras:
++        from safetensors.torch import save_file
++
++        shard = os.path.join(converted, EXTRA_SHARD)
++        save_file({key: tensor for key, (_, tensor) in extras.items()}, shard)
++        os.chmod(shard, 0o644)  # safetensors creates it 0600; the pack is copied out by other users
++    converted_config = read_json(os.path.join(converted, "config.json"))
++    if "quantization_config" not in converted_config:
++        raise SystemExit(f"{converted}: no quantization_config; did convert_model.py finish?")
++    qa = dict(converted_config["quantization_config"])
++    qa["calibration"] = {"rows": cal_rows, "cols": cal_cols, "method": "sensenova-loop-hessian"}
++    config = read_json(os.path.join(source, "config.json"))
++    config["quantization_config"] = qa
++    if recipe:
++        config["tensorfold_recipe"] = recipe
++    write_json(os.path.join(converted, "config.json"), config)
++    for name in TOKENIZER_FILES:
++        src = os.path.join(source, name)
++        if os.path.isfile(src):
++            shutil.copyfile(src, os.path.join(converted, name))
++    if extras:
++        write_index(converted)
++    report(converted, extras)
++
++
++def write_index(converted: str):
++    """A complete `model.safetensors.index.json`: the converted shards' tensors and the extras, by file."""
++    from safetensors import safe_open
++
++    weight_map = {}
++    for name in sorted(os.listdir(converted)):
++        if not name.endswith(".safetensors"):
++            continue
++        with safe_open(os.path.join(converted, name), framework="pt", device="cpu") as f:
++            for key in f.keys():
++                weight_map[key] = name
++    total = sum(os.path.getsize(os.path.join(converted, name)) for name in set(weight_map.values()))
++    write_json(os.path.join(converted, "model.safetensors.index.json"), {"metadata": {"total_size": total}, "weight_map": weight_map})
++
++
++def report(converted: str, extras: dict):
++    """The shard list the Mac and CUDA gates check: file, bytes and sha256, plus the extras' names."""
++    shards = sorted(name for name in os.listdir(converted) if name.endswith(".safetensors"))
++    total = 0
++    print(f"attach: {converted}")
++    for name in shards:
++        path = os.path.join(converted, name)
++        size = os.path.getsize(path)
++        total += size
++        digest = hashlib.sha256()
++        with open(path, "rb") as f:
++            for chunk in iter(lambda: f.read(1 << 24), b""):
++                digest.update(chunk)
++        print(f"  {name}  {size} bytes  sha256 {digest.hexdigest()}")
++    print(f"  {total / 1e9:.2f} GB across {len(shards)} shards")
++    for key in sorted(extras):
++        print(f"  extra: {key}")
++
++
++def main() -> int:
++    parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
++    sub = parser.add_subparsers(dest="command", required=True)
++    make = sub.add_parser("shim", help="present the source as exllamav3's qwen3_5 in a temp directory")
++    make.add_argument("--source", required=True)
++    make.add_argument("--out", required=True)
++    make.add_argument("--force", action="store_true")
++    done = sub.add_parser("attach", help="add the mHC/loop tensors, config, tokenizer and report")
++    done.add_argument("--source", required=True, help="the BF16 checkpoint the extras come from")
++    done.add_argument("--converted", required=True, help="exllamav3's output directory")
++    done.add_argument("--recipe", default=None, help="the recipe name to record in config.json (sn-5.0, st-4.0, ...)")
++    done.add_argument("--cal-rows", type=int, default=250)
++    done.add_argument("--cal-cols", type=int, default=2048)
++    args = parser.parse_args()
++    if args.command == "shim":
++        shim(args.source, args.out, args.force)
++    else:
++        attach(args.source, args.converted, args.recipe, args.cal_rows, args.cal_cols)
++    return 0
++
++
++if __name__ == "__main__":
++    raise SystemExit(main())
+diff --git a/tools/exl3_gate_ref.py b/tools/exl3_gate_ref.py
+new file mode 100755
+index 000000000..832d7e57e
+--- /dev/null
++++ b/tools/exl3_gate_ref.py
+@@ -0,0 +1,35 @@
++#!/usr/bin/env python3
++"""exl3_gate_ref.py SOURCE OUT: the EXL3 task gate's BF16 references. Greedy, 64 new tokens each, on a prose, a code
++and a reasoning prompt, written to OUT/meta.json (prompt, ids, greedy, text) for teacher-forced top-1 against a pack."""
++import json
++import os
++import sys
++import time
++
++import torch
++from transformers import AutoModelForCausalLM, AutoTokenizer
++
++PROMPTS = [
++    ("prose", "Write a short paragraph describing a quiet morning in a mountain village."),
++    ("code", "Write a Python function fib(n) that returns the n-th Fibonacci number, then show an iterative version."),
++    ("reason", "A train leaves at 3:15 pm and travels 180 km at 72 km/h. At what time does it arrive? Think step by step."),
++]
++src, out = sys.argv[1], sys.argv[2]
++os.makedirs(out, exist_ok=True)
++tok = AutoTokenizer.from_pretrained(src)
++t0 = time.time()
++m = AutoModelForCausalLM.from_pretrained(src, dtype=torch.bfloat16, device_map={"": "cuda:0"}, trust_remote_code=True,
++                                         attn_implementation="sdpa").eval()
++res = {"source": src, "class": type(m).__name__, "load_s": time.time() - t0, "new_tokens": 64, "prompts": []}
++for name, p in PROMPTS:
++    text = tok.apply_chat_template([{"role": "user", "content": p}], tokenize=False, add_generation_prompt=True,
++                                   enable_thinking=False)
++    ids = tok(text, return_tensors="pt").input_ids.to("cuda")
++    with torch.no_grad():
++        g = m.generate(input_ids=ids, max_new_tokens=64, min_new_tokens=64, do_sample=False, use_cache=True)
++    new = g[0, ids.shape[1]:].tolist()
++    res["prompts"].append({"name": name, "prompt": p, "ids": ids[0].tolist(), "greedy": new,
++                           "text": tok.decode(new, skip_special_tokens=False)})
++    print(name, len(ids[0]), len(new), res["prompts"][-1]["text"][:80].replace("\n", " "), flush=True)
++json.dump(res, open(f"{out}/meta.json", "w"), indent=1)
++print("wrote", out)
+diff --git a/tools/exl3_hessians.py b/tools/exl3_hessians.py
+new file mode 100644
+index 000000000..a8ee583af
+--- /dev/null
++++ b/tools/exl3_hessians.py
+@@ -0,0 +1,267 @@
++#!/usr/bin/env python3
++"""Capture exllamav3's per-tensor input Hessians from a BF16 reference model.
++
++Writes `{out}/{hf_tensor_name}.safetensors` holding `hin`, f32, as a packed upper triangle, which is
++`conversion/convert_model.py --hessians`' format (`unpack_sym`). Run it once per model: SenseNova-Loop-9B
++(looped layers [4, 28) and mHC streams) and stock Qwen3.5-9B (the control). Then convert each with
++exllamav3's own convert_model.py, which trusts these Hessians instead of tracing its own forward.
++
++The loop needs no special case: layers [4, 28) execute twice and the hook fires twice, so their Hessian is
++the sum over both visits. mHC needs none either: the hooks see each linear's real branch input, and the
++routers stay f32 and unquantized. Linears that share an input (q/k/v, in_proj_qkv/z, gate/up) share one
++capture and one conversion, written once per key.
++
++Credit: EXL3 is exllamav3's format and quantizer (turboderp, https://github.com/turboderp-org/exllamav3);
++the trellis codebooks are QTIP's (Tseng, Chee, Sun, Kuleshov, De Sa).
++"""
++
++from __future__ import annotations
++
++import argparse
++import json
++import os
++import re
++import sys
++
++import torch
++
++
++# The linears a SenseNova/exllamav3 pack quantizes, by their HF tensor name (suffix of the module path).
++LAYOUT = re.compile(
++    r"\.(self_attn\.(q|k|v|o)_proj"
++    r"|linear_attn\.(in_proj_qkv|in_proj_z|out_proj)"
++    r"|mlp\.(gate|up|down)_proj)$"
++)
++HEAD = "lm_head"
++
++# Members sharing one input and one Hessian: (member pattern, group suffix, anchor member).
++SHARED = (
++    (re.compile(r"\.self_attn\.(q|k|v)_proj$"), ".self_attn", "q_proj"),
++    (re.compile(r"\.linear_attn\.(in_proj_qkv|in_proj_z)$"), ".linear_attn", "in_proj_qkv"),
++    (re.compile(r"\.mlp\.(gate|up)_proj$"), ".mlp", "gate_proj"),
++)
++
++# The names exllamav3's qwen3_5 architecture never asks for; convert only needs the text tower.
++DROP = re.compile(r"^(model\.visual\.|model\.language_model\.visual\.|model\.mtp\.|mtp\.)")
++
++
++def linear_keys(source: str) -> list[str]:
++    """Every tensor name in `source` that ends this model's layout, without `.weight`; reads headers only."""
++    names: list[str] = []
++    index = os.path.join(source, "model.safetensors.index.json")
++    if os.path.exists(index):
++        with open(index, encoding="utf8") as f:
++            names = list(json.load(f)["weight_map"].keys())
++    else:
++        from safetensors import safe_open
++
++        for name in sorted(os.listdir(source)):
++            if not name.endswith(".safetensors"):
++                continue
++            with safe_open(os.path.join(source, name), framework="pt", device="cpu") as f:
++                names += list(f.keys())
++    keys = []
++    for name in names:
++        if DROP.match(name) or not name.endswith(".weight"):
++            continue
++        key = name[: -len(".weight")]
++        if key == HEAD or LAYOUT.search(key):
++            keys.append(key)
++    return sorted(set(keys))
++
++
++def group_of(key: str) -> tuple[str, str]:
++    """The capture a key belongs to, and the member whose output the capture replaces (the anchor)."""
++    for pattern, suffix, anchor in SHARED:
++        if pattern.search(key):
++            base = key[: pattern.search(key).start()]
++            return base + suffix, base + suffix + "." + anchor
++    return key, key
++
++
++def key_of(module_name: str, keys: set[str]) -> str | None:
++    """The checkpoint key a module path names, tolerating a wrapper prefix on either side."""
++    if module_name in keys:
++        return module_name
++    hits = [k for k in keys if k.endswith("." + module_name) or module_name.endswith("." + k)]
++    return hits[0] if len(hits) == 1 else None
++
++
++def calibration_rows(shim: str, rows: int, cols: int, extra: str | None) -> list[torch.Tensor]:
++    """exllamav3's default corpus through its own config and tokenizer of the shim, as convert_model.py builds them."""
++    if extra:
++        sys.path.insert(0, extra)
++    try:
++        from exllamav3 import Config, Tokenizer
++        from exllamav3.conversion.calibration_data import get_default_calibration
++    except ImportError as err:
++        raise SystemExit(f"exllamav3 is not importable ({err}); pass --exllamav3 DIR or use its venv") from err
++    tokenizer = Tokenizer.from_config(Config.from_directory(shim))
++    return get_default_calibration({"cal_rows": rows, "cal_cols": cols}, tokenizer)
++
++
++def load_model(source: str, device: str):
++    """The BF16 reference as its config names it, refusing any load that leaves a weight uninitialised."""
++    import transformers
++
++    with open(os.path.join(source, "config.json"), encoding="utf8") as f:
++        config = json.load(f)
++    if "AutoModelForCausalLM" in config.get("auto_map", {}):
++        cls = transformers.AutoModelForCausalLM  # SenseNova's own modeling file, through trust_remote_code
++    else:
++        cls = getattr(transformers, config["architectures"][0])
++    model, info = cls.from_pretrained(source, trust_remote_code=True, dtype=torch.bfloat16, device_map={"": device},
++                                      output_loading_info=True)
++    missing = [k for k in info.get("missing_keys", []) if "visual" not in k and "mtp" not in k]
++    if missing:
++        raise SystemExit(f"{len(missing)} weights were not in the checkpoint (first: {missing[0]}); refusing random ones")
++    model.eval()
++    return model
++
++
++def backbone_of(model):
++    """The text tower: the module holding embed_tokens, the layer list and the final norm (no LM head)."""
++    for _, module in model.named_modules():
++        if hasattr(module, "embed_tokens") and hasattr(module, "layers") and hasattr(module, "norm"):
++            return module
++    raise SystemExit("no text backbone found (embed_tokens + layers + norm): is this a Qwen3.5 checkpoint?")
++
++
++class Capture:
++    """One Hessian accumulator per group, fed by pre-hooks on the group's anchor and by the final norm."""
++
++    def __init__(self, groups: dict[str, list[tuple[str, str]]], widths: dict[str, int]):
++        self.groups = groups
++        self.widths = widths
++        self.H = {}
++        self.count = {}
++
++    def add(self, group: str, x: torch.Tensor):
++        x = x.reshape(-1, x.shape[-1])
++        if x.shape[-1] != self.widths[group]:
++            raise SystemExit(f"{group}: {x.shape[-1]} inputs, expected {self.widths[group]}")
++        x = x.float()
++        finite = torch.isfinite(x).all(dim=1)
++        if not finite.all():
++            x = x[finite]
++        if group not in self.H:
++            n = x.shape[-1]
++            self.H[group] = torch.zeros(n, n, dtype=torch.float32, device=x.device)
++            self.count[group] = 0
++        self.H[group].addmm_(x.T, x)
++        self.count[group] += x.shape[0]
++
++
++def capture(model, keys: list[str], batches: list[torch.Tensor], device: str) -> Capture:
++    modules = dict(model.named_modules())
++    groups: dict[str, list[tuple[str, str]]] = {}
++    anchors: dict[str, tuple[object, str]] = {}
++    widths: dict[str, int] = {}
++    for key in keys:
++        group, anchor_key = group_of(key)
++        groups.setdefault(group, []).append((key, anchor_key))
++    for group, members in groups.items():
++        anchor_key = members[0][1]
++        anchor_name = next((n for n in modules if key_of(n, {anchor_key})), None)
++        if anchor_name is None:
++            raise SystemExit(f"{anchor_key}: no module names this capture's anchor")
++        widths[group] = modules[anchor_name].in_features
++        if group == HEAD:
++            continue
++        anchors[group] = (modules[anchor_name], anchor_key)
++    backbone = backbone_of(model)
++    cap = Capture(groups, widths)
++
++    def pre_hook(group):
++        def hook(_module, args, kwargs):
++            x = args[0] if args else kwargs.get("hidden_states")
++            if x is None:
++                raise SystemExit(f"{group}: the hook saw no input")
++            cap.add(group, x)
++
++        return hook
++
++    def head_hook(_module, _args, output):
++        x = output[0] if isinstance(output, (tuple, list)) else output
++        cap.add(HEAD, x)
++
++    handles = [module.register_forward_pre_hook(pre_hook(group), with_kwargs=True) for group, (module, _) in anchors.items()]
++    if HEAD in groups:
++        handles.append(backbone.norm.register_forward_hook(head_hook))
++    try:
++        with torch.no_grad():
++            for i, ids in enumerate(batches):
++                backbone(input_ids=ids.to(device), use_cache=False)
++                print(f"  calibration batch {i + 1}/{len(batches)}", flush=True)
++    finally:
++        for handle in handles:
++            handle.remove()
++    return cap
++
++
++def write(cap: Capture, keys: list[str], out: str):
++    """`{out}/{key}.safetensors` for every key, the packed mean Hessian of its capture."""
++    from safetensors.torch import save_file
++
++    os.makedirs(out, exist_ok=True)
++    written: dict[str, str] = {}
++    total = 0
++    for key in keys:
++        group, _ = group_of(key)
++        if group not in cap.H:
++            raise SystemExit(f"{key}: no calibration reached {group}")
++        H, count = cap.H[group], cap.count[group]
++        if count == 0:
++            raise SystemExit(f"{key}: no finite activations")
++        path = os.path.join(out, key + ".safetensors")
++        if group not in written:
++            n = H.shape[0]
++            mask = torch.ones(n, n, dtype=torch.bool, device=H.device).triu()
++            packed = (H / count)[mask].to(torch.float32).cpu().contiguous()
++            save_file({"hin": packed}, path, metadata={"tokens": str(count), "calibration": "sensenova-loop-hessian"})
++            total += packed.numel() * 4
++            written[group] = path
++        else:
++            with open(written[group], "rb") as f:
++                data = f.read()
++            with open(path, "wb") as f:
++                f.write(data)
++        print(f"  {key}: {H.shape[0]}x{H.shape[0]}, {count} tokens")
++    return total
++
++
++def main() -> int:
++    parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
++    parser.add_argument("--source", required=True, help="the BF16 model directory (SenseNova or stock Qwen3.5-9B)")
++    parser.add_argument("--shim", required=True, help="exl3_attach_sensenova.py's shim of --source (tokenizer, config)")
++    parser.add_argument("--out", required=True, help="the Hessian directory convert_model.py --hessians reads")
++    parser.add_argument("--device", default="cuda:0")
++    parser.add_argument("--cal-rows", type=int, default=250, help="exllamav3's default calibration rows")
++    parser.add_argument("--cal-cols", type=int, default=2048, help="exllamav3's default calibration columns")
++    parser.add_argument("--batch-rows", type=int, default=8, help="calibration rows per forward (memory)")
++    parser.add_argument("--exllamav3", default=None, help="an exllamav3 checkout to import (else the venv's)")
++    parser.add_argument("--plan-only", action="store_true", help="print the capture plan and exit without a model")
++    args = parser.parse_args()
++
++    keys = linear_keys(args.source)
++    if not keys:
++        raise SystemExit(f"no EXL3 linears in {args.source}'s tensors: is this a Qwen3.5 checkpoint?")
++    if args.plan_only:
++        for key in keys:
++            group, _ = group_of(key)
++            print(f"{key} <- {group}")
++        return 0
++
++    rows = calibration_rows(args.shim, args.cal_rows, args.cal_cols, args.exllamav3)
++    batches = [torch.cat(rows[i : i + args.batch_rows], dim=0) for i in range(0, len(rows), args.batch_rows)]
++    print(f"{len(keys)} tensors, {len(rows)} calibration rows of {args.cal_cols} tokens", flush=True)
++
++    model = load_model(args.source, args.device)
++    cap = capture(model, keys, batches, args.device)
++    total = write(cap, keys, args.out)
++    print(f"wrote {args.out}: {total / 1e9:.1f} GB of packed Hessians")
++    return 0
++
++
++if __name__ == "__main__":
++    raise SystemExit(main())
+diff --git a/tools/exl3_sensenova_chain.sh b/tools/exl3_sensenova_chain.sh
+new file mode 100755
+index 000000000..abe197a5f
+--- /dev/null
++++ b/tools/exl3_sensenova_chain.sh
+@@ -0,0 +1,64 @@
++#!/usr/bin/env bash
++# exl3_sensenova_chain.sh: the whole SenseNova-Loop-9B EXL3 run (docs/exl3-sensenova-quantize.md) as one resumable chain:
++# shims, Hessians, task-gate references, one exllamav3 convert and attach per recipe in docs/exl3-recipes/, then the
++# stock Qwen3.5-9B control at the same recipes when EXL3_STOCK is set. SenseNova's packs come first.
++#
++#   EXL3_WORK=$WORK/exl3 EXL3_SOURCE=$WORK/bf16 EXLLAMAV3=$SRC/exllamav3 \
++#   EXL3_PY=$VENV/bin/python [EXL3_STOCK=$WORK/stock-qwen35-9b-bf16] [EXL3_GPU_LOCK=/tmp/gpu.lock] \
++#   tools/exl3_sensenova_chain.sh
++#
++# Each finished step leaves $EXL3_WORK/done/<step>, so a rerun resumes after the last one. A GPU step holds
++# EXL3_GPU_LOCK (flock) for itself alone and releases it between steps, so other GPU jobs on the node can slip in.
++# Every step refuses to start below EXL3_MIN_FREE_GIB of MemAvailable (default 40).
++set -uo pipefail
++w=${EXL3_WORK:?EXL3_WORK: the work directory for the chain}
++sn=${EXL3_SOURCE:?EXL3_SOURCE: SenseNova-Loop-9B BF16}
++x3=${EXLLAMAV3:?EXLLAMAV3: an exllamav3 checkout at the pinned commit, its extension built}
++st=${EXL3_STOCK:-}
++py=${EXL3_PY:-python3}
++lock=${EXL3_GPU_LOCK:-}
++min_free=${EXL3_MIN_FREE_GIB:-40}
++repo=$(cd "$(dirname "$0")/.." && pwd)
++mkdir -p "$w/done" "$w/logs" "$w/hess" "$w/packs" "$w/work" "$w/gate"
++log() { echo "$(date -u +%FT%TZ) $*" | tee -a "$w/logs/chain.log"; }
++fail() { echo "rc=$1 at $2" > "$w/CHAIN-END"; log "stop: rc=$1 at $2"; exit "$1"; }
++guard() {
++  local a; a=$(awk '/MemAvailable/{print int($2/1048576)}' /proc/meminfo)
++  [ "$a" -ge "$min_free" ] || { log "refuse $1: MemAvailable $a GiB < $min_free"; fail 4 "$1"; }
++}
++step() {  # step gpu|cpu NAME CMD...: niced and logged; skipped when done; the chain stops on the first failure
++  local kind=$1 name=$2; shift 2
++  [ -e "$w/done/$name" ] && { log "skip $name (done)"; return; }
++  if [ "$kind" = gpu ] && [ -n "$lock" ]; then
++    [ -e "$lock" ] || : > "$lock"
++    exec 8<"$lock"  # read-only: in a sticky /tmp, protected_regular refuses opening another user's file for writing
++    log "wait lock $name"; flock -w 7200 8 || fail 3 "$name (lock)"
++  fi
++  guard "$name"; log "start $name"
++  nice -n 19 ionice -c3 "$@" 8>&- > "$w/logs/$name.log" 2>&1; local rc=$?
++  [ "$kind" = gpu ] && [ -n "$lock" ] && { flock -u 8; exec 8>&-; }
++  log "end $name rc=$rc"; [ $rc -eq 0 ] || fail "$rc" "$name"
++  touch "$w/done/$name"
++}
++recipe() { "$py" -I -c 'import json,sys; r=json.load(open(sys.argv[1])); print(r["bits"], r["head_bits"], r["embed_bits"], r["codebook"], r["out_scales"])' "$1"; }
++model() {  # model TAG SOURCE: shim, Hessians, gate references, then a pack per recipe
++  local m=$1 src=$2 r bits head embed cb scales name
++  step cpu "shim-$m" "$py" -I "$repo/tools/exl3_attach_sensenova.py" shim --source "$src" --out "$w/shim-$m"
++  step gpu "hess-$m" "$py" -I "$repo/tools/exl3_hessians.py" --source "$src" --shim "$w/shim-$m" --out "$w/hess/$m" \
++    --exllamav3 "$x3"
++  step gpu "gate-$m" "$py" -I "$repo/tools/exl3_gate_ref.py" "$src" "$w/gate/$m"
++  for r in "$repo"/docs/exl3-recipes/*.json; do
++    read -r bits head embed cb scales < <(recipe "$r") || fail 2 "recipe $r"
++    name=$m-$(basename "$r" .json)
++    step gpu "conv-$name" "$py" -I "$x3/convert.py" -i "$w/shim-$m" -o "$w/packs/$name" -w "$w/work/$name" -b "$bits" \
++      -hb "$head" -eb "$embed" -cb "$cb" --hessians "$w/hess/$m" --out_scales "$scales" -d 0 --no_swap
++    log "uncalibrated tensors in $name: $(grep -c "No precomputed Hessian" "$w/logs/conv-$name.log")"
++    step cpu "attach-$name" "$py" -I "$repo/tools/exl3_attach_sensenova.py" attach --source "$src" \
++      --converted "$w/packs/$name" --recipe "$name"
++  done
++}
++export TORCH_CUDA_ARCH_LIST=${TORCH_CUDA_ARCH_LIST:-12.1}
++model sn "$sn"
++[ -n "$st" ] && model st "$st"
++echo "rc=0 $(date -u +%FT%TZ)" > "$w/CHAIN-END"
++log "chain done"
+diff --git a/zig/build/cuda_family_host.zig b/zig/build/cuda_family_host.zig
+index acf3a1474..5f9645142 100644
+--- a/zig/build/cuda_family_host.zig
++++ b/zig/build/cuda_family_host.zig
+@@ -53,8 +53,8 @@ pub fn steps(b: *std.Build, cuda: *std.Build.Module, mods: anytype, step: *std.B
+     const share_faults = b.addRunArtifact(b.addTest(.{ .root_module = mods.qwen35, .filters = &.{"Qwen share faults:"} }));
+     b.step("test-qwen35-share-faults-host", "TF_QWEN_KV_SHARE's pages through failed allocations, lanes, promises, uploads and copies without devices").dependOn(&share_faults.step);
+     const admission = b.createModule(.{ .root_source_file = b.path("zig/src/families/qwen3_5/cuda_exl3_loader_test.zig"), .target = host, .optimize = .debug, .link_libc = true, .imports = &.{ .{ .name = "cuda", .module = cuda }, .{ .name = "core", .module = mods.core } } });
+-    const admission_run = b.addRunArtifact(b.addTest(.{ .root_module = admission, .filters = &.{"EXL3 admission:"} }));
+-    b.step("test-qwen35-exl3-admission-host", "Synthetic EXL3 tensors and dry-run refusals before upload").dependOn(&admission_run.step);
++    const admission_run = b.addRunArtifact(b.addTest(.{ .root_module = admission, .filters = &.{ "EXL3 admission:", "EXL3 dtypes:" } }));
++    b.step("test-qwen35-exl3-admission-host", "Synthetic EXL3 tensors, dtypes and dry-run refusals before upload").dependOn(&admission_run.step);
+     step.dependOn(&admission_run.step);
+     step.dependOn(@import("mesh.zig").qwenCudaDeclTest(b)); // the dense Qwen3.5 shares against the mesh declarations
+     const late = b.createModule(.{ .root_source_file = b.path("zig/src/families/qwen3_5/cuda_engine_tail_test.zig"), .target = host, .optimize = .debug, .link_libc = true, .imports = &.{ .{ .name = "cuda", .module = cuda }, .{ .name = "core", .module = mods.core }, .{ .name = "lanes", .module = mods.lanes } } });
+diff --git a/zig/src/core/bf16_round.zig b/zig/src/core/bf16_round.zig
+index 18f34e0da..51e413c9d 100644
+--- a/zig/src/core/bf16_round.zig
++++ b/zig/src/core/bf16_round.zig
+@@ -31,6 +31,14 @@ pub fn round32(v: f32) f32 {
+     return value(bits(v));
+ }
+ 
++/// fp32 words to bf16 with the load path's spelling: a plain `+`, which matches `bits` off NaN and keeps NaN.
++pub fn words(out: []u16, src: []const u8) void {
++    for (out, std.mem.bytesAsSlice(f32, src)) |*o, f| {
++        const u: u32 = @bitCast(f);
++        o.* = @truncate((u +% 0x7fff +% ((u >> 16) & 1)) >> 16);
++    }
++}
++
+ test "ties to even, the subnormal step, overflow, and fp32 values rounded once as the fp32 path rounds them" {
+     try std.testing.expectEqual(@as(f64, 1), bf16(1 + 0x1p-8)); // a tie, to the even 1
+     try std.testing.expectEqual(@as(f64, 1 + 0x1p-6), bf16(1 + 3 * 0x1p-8)); // a tie, to the even 1 + 2^-6
+diff --git a/zig/src/families/qwen3_5/cuda_exl3_dtype.zig b/zig/src/families/qwen3_5/cuda_exl3_dtype.zig
+new file mode 100644
+index 000000000..11a71159e
+--- /dev/null
++++ b/zig/src/families/qwen3_5/cuda_exl3_dtype.zig
+@@ -0,0 +1,92 @@
++//! The dtypes an EXL3 checkpoint keeps beside its trellis: what each vector's kernels read, and the one conversion.
++const std = @import("std");
++const core = @import("core");
++
++const Tensor = core.checkpoint.Tensor;
++
++/// What the kernels read a vector as: f32 words (A_log) or bf16 (norms, dt_bias, in_proj_a/b).
++pub const Want = enum { f32, bf16 };
++
++/// Where a tensor's elements come from: bf16 widened to f32 words, f32 or f16 rounded to bf16, or as stored.
++pub const From = enum { stored, bf16, f32, f16 };
++
++/// How `t`, holding `shape`'s elements, serves `want`; `error.UnexpectedTensor` for any other dtype or shape.
++pub fn accept(t: Tensor, want: Want, shape: []const usize) !From {
++    return switch (want) {
++        .f32 => if (t.is(.f32, shape)) .stored else if (t.is(.bf16, shape)) .bf16 else error.UnexpectedTensor,
++        .bf16 => if (t.is(.bf16, shape)) .stored else if (t.is(.f32, shape)) .f32 else if (t.is(.f16, shape)) .f16 else error.UnexpectedTensor,
++    };
++}
++
++/// bf16 words as the f32 words the kernels read: a bit shift, exact.
++pub fn widen(out: []u32, bytes: []const u8) void {
++    for (out, std.mem.bytesAsSlice(u16, bytes)) |*w, h| w.* = @as(u32, h) << 16;
++}
++
++/// bf16 of `from`'s words: f32 through the load's rounding (bf16vec's), f16 through the cast's (bits()).
++pub fn round(out: []u16, bytes: []const u8, from: From) void {
++    switch (from) {
++        .f32 => core.bf16_round.words(out, bytes),
++        .f16 => for (out, std.mem.bytesAsSlice(u16, bytes)) |*o, h| {
++            o.* = core.bf16_round.bits(@floatCast(@as(f16, @bitCast(h))));
++        },
++        else => unreachable,
++    }
++}
++
++fn tensor(comptime dtype: core.checkpoint.DType, shape: []const usize, bytes: []const u8) Tensor {
++    var t: Tensor = std.mem.zeroes(Tensor);
++    t.dtype = dtype;
++    t.rank = @intCast(shape.len);
++    @memcpy(t.shape[0..shape.len], shape);
++    t.bytes = bytes;
++    return t;
++}
++
++test "EXL3 dtypes: accepted ones and the refusal of every other" {
++    var bytes: [8]u8 = @splat(0);
++    const shape: []const usize = &.{4};
++    try std.testing.expectEqual(From.stored, try accept(tensor(.f32, shape, &bytes), .f32, shape));
++    try std.testing.expectEqual(From.bf16, try accept(tensor(.bf16, shape, &bytes), .f32, shape));
++    try std.testing.expectError(error.UnexpectedTensor, accept(tensor(.f16, shape, &bytes), .f32, shape));
++    try std.testing.expectEqual(From.stored, try accept(tensor(.bf16, shape, &bytes), .bf16, shape));
++    try std.testing.expectEqual(From.f32, try accept(tensor(.f32, shape, &bytes), .bf16, shape));
++    try std.testing.expectEqual(From.f16, try accept(tensor(.f16, shape, &bytes), .bf16, shape));
++    // the shape and rank are part of the acceptance, not only the dtype
++    try std.testing.expectError(error.UnexpectedTensor, accept(tensor(.f32, shape, &bytes), .bf16, &.{ 2, 2 }));
++}
++
++test "EXL3 dtypes: the conversions equal the earlier spellings byte for byte" {
++    var prng = std.Random.DefaultPrng.init(1210);
++    const old = struct {
++        fn f32ToBf16(f: f32) u16 {
++            const b: u32 = @bitCast(f);
++            return @truncate((b +% 0x7fff +% ((b >> 16) & 1)) >> 16);
++        }
++        fn f16ToBf16(h: u16) u16 {
++            return core.bf16_round.bits(@floatCast(@as(f16, @bitCast(h))));
++        }
++    };
++    var wide: [256]f32 = undefined;
++    var half: [256]u16 = undefined;
++    var out: [256]u16 = undefined;
++    var words: [256]u32 = undefined;
++    for (0..4) |_| {
++        for (&wide, &half) |*w, *h| {
++            const u = prng.random().int(u32);
++            w.* = @bitCast(u);
++            h.* = @truncate(u);
++        }
++        round(&out, std.mem.sliceAsBytes(&wide), .f32);
++        for (out, wide) |o, f| try std.testing.expectEqual(old.f32ToBf16(f), o);
++        round(&out, std.mem.sliceAsBytes(&half), .f16);
++        for (out, half) |o, h| try std.testing.expectEqual(old.f16ToBf16(h), o);
++    }
++    // A_log's widening keeps the stored bits: bf16 -> f32 -> bf16 is the identity
++    widen(&words, std.mem.sliceAsBytes(&half));
++    for (half, words) |h, w| try std.testing.expectEqual(@as(u32, h) << 16, w);
++    // a negative NaN word stays NaN through the f16 cast, as bits() does
++    var one: [1]u16 = undefined;
++    round(&one, std.mem.sliceAsBytes(&[_]u16{0xfe00}), .f16);
++    try std.testing.expect(std.math.isNan(core.bf16_round.value(one[0])));
++}
+diff --git a/zig/src/families/qwen3_5/cuda_exl3_loader_test.zig b/zig/src/families/qwen3_5/cuda_exl3_loader_test.zig
+index 73c9a5940..1d8c77721 100644
+--- a/zig/src/families/qwen3_5/cuda_exl3_loader_test.zig
++++ b/zig/src/families/qwen3_5/cuda_exl3_loader_test.zig
+@@ -82,3 +82,62 @@ test "EXL3 admission: mixed supported widths and allocator failures stay host ow
+     try write(tmp.dir, .{ .scale = "F32" });
+     try t.expectError(error.UnexpectedTensor, read(t.allocator, path));
+ }
++
++/// A checkpoint of three eight-element vectors, one of each dtype SenseNova's and exllamav3's packs store.
++fn writeVectors(dir: std.Io.Dir) !void {
++    const at: [3]usize = .{ 0, 32, 48 };
++    const header = try std.fmt.allocPrint(t.allocator, "{{\"v.f32\":{{\"dtype\":\"F32\",\"shape\":[8],\"data_offsets\":[{d},{d}]}}," ++
++        "\"v.bf16\":{{\"dtype\":\"BF16\",\"shape\":[8],\"data_offsets\":[{d},{d}]}}," ++
++        "\"v.f16\":{{\"dtype\":\"F16\",\"shape\":[8],\"data_offsets\":[{d},{d}]}}}}", .{ at[0], at[1], at[1], at[2], at[2], 64 });
++    defer t.allocator.free(header);
++    const data = try t.allocator.alloc(u8, 8 + header.len + 64);
++    defer t.allocator.free(data);
++    @memset(data, 0);
++    std.mem.writeInt(u64, data[0..8], header.len, .little);
++    @memcpy(data[8..][0..header.len], header);
++    const body = data[8 + header.len ..];
++    const f32s = [_]f32{ 1.0, -2.5, 0.0, 3.25, -0.0, std.math.inf(f32), -std.math.nan(f32), 1e-30 };
++    for (f32s, 0..) |v, i| std.mem.writeInt(u32, body[4 * i ..][0..4], @bitCast(v), .little);
++    const bf16s: [8]u16 = .{ 0x3f80, 0xc020, 0x0000, 0x4050, 0x8000, 0x7f80, 0x7fc0, 0x0001 };
++    for (bf16s, 0..) |v, i| std.mem.writeInt(u16, body[32 + 2 * i ..][0..2], v, .little);
++    const f16s: [8]u16 = .{ 0x3c00, 0xc100, 0x0000, 0x4280, 0x8000, 0x7c00, 0x7e00, 0x0001 };
++    for (f16s, 0..) |v, i| std.mem.writeInt(u16, body[48 + 2 * i ..][0..2], v, .little);
++    try dir.writeFile(t.io, .{ .sub_path = "model.safetensors", .data = data });
++}
++
++test "EXL3 dtypes: f32, bf16 and f16 vectors pass admission with the old dtypes' bytes" {
++    const d = @import("cuda_exl3_dtype.zig");
++    var tmp = t.tmpDir(.{});
++    defer tmp.cleanup();
++    try writeVectors(tmp.dir);
++    const path = try pathOf(tmp);
++    defer t.allocator.free(path);
++    var ck = try core.Checkpoint.openModel(t.allocator, t.io, path);
++    defer ck.close();
++    const shape: []const usize = &.{8};
++    const f32t = try ck.get("v.f32");
++    const bf16t = try ck.get("v.bf16");
++    const f16t = try ck.get("v.f16");
++    try t.expectEqual(d.From.stored, try d.accept(f32t, .f32, shape));
++    try t.expectEqual(d.From.bf16, try d.accept(bf16t, .f32, shape));
++    try t.expectError(error.UnexpectedTensor, d.accept(f16t, .f32, shape));
++    try t.expectEqual(d.From.f32, try d.accept(f32t, .bf16, shape));
++    try t.expectEqual(d.From.stored, try d.accept(bf16t, .bf16, shape));
++    try t.expectEqual(d.From.f16, try d.accept(f16t, .bf16, shape));
++
++    // A_log as the loader widens it: the stored bf16 bits above each f32 word
++    var words: [8]u32 = undefined;
++    d.widen(&words, bf16t.bytes);
++    for (words, std.mem.bytesAsSlice(u16, bf16t.bytes)) |w, h| try t.expectEqual(@as(u32, h) << 16, w);
++    // dt_bias and the gated norm as the loader rounds them: f32 through bf16vec's spelling, f16 through bits()
++    var rows: [8]u16 = undefined;
++    d.round(&rows, f32t.bytes, .f32);
++    for (rows, std.mem.bytesAsSlice(f32, f32t.bytes)) |o, f| {
++        const b: u32 = @bitCast(f);
++        try t.expectEqual(@as(u16, @truncate((b +% 0x7fff +% ((b >> 16) & 1)) >> 16)), o);
++    }
++    d.round(&rows, f16t.bytes, .f16);
++    for (rows, std.mem.bytesAsSlice(u16, f16t.bytes)) |o, h| {
++        try t.expectEqual(core.bf16_round.bits(@floatCast(@as(f16, @bitCast(h)))), o);
++    }
++}
+diff --git a/zig/src/families/qwen3_5/cuda_exl3_weights.zig b/zig/src/families/qwen3_5/cuda_exl3_weights.zig
+index 8e001a8dd..7eb4c5f18 100644
+--- a/zig/src/families/qwen3_5/cuda_exl3_weights.zig
++++ b/zig/src/families/qwen3_5/cuda_exl3_weights.zig
+@@ -5,6 +5,7 @@ const core = @import("core");
+ const geometry = @import("cuda_geometry.zig");
+ const engine = @import("cuda_engine.zig");
+ const b16 = @import("cuda_bf16_rows.zig");
++const dtype = @import("cuda_exl3_dtype.zig");
+ 
+ const Engine = engine.Engine;
+ const Proj = engine.Proj;
+@@ -78,16 +79,6 @@ fn name(buf: []u8, comptime fmt: []const u8, args: anytype) ![]const u8 {
+ 
+ const bf16Of = core.bf16_round.bits;
+ 
+-/// f16 values (as stored) to bf16, round to nearest even.
+-fn f16Rows(gpa: std.mem.Allocator, bytes: []const u8) ![]u16 {
+-    const out = try gpa.alloc(u16, bytes.len / 2);
+-    for (out, 0..) |*o, i| {
+-        const h: f16 = @bitCast(std.mem.readInt(u16, bytes[2 * i ..][0..2], .little));
+-        o.* = bf16Of(@floatCast(h));
+-    }
+-    return out;
+-}
+-
+ /// Zero-centred RMSNorm weights (HF: y = x * (1 + w)) as the engine's norm kernels take them (y = x * w): bf16(1 + w).
+ fn shifted(gpa: std.mem.Allocator, bytes: []const u8) ![]u16 {
+     const out = try gpa.alloc(u16, bytes.len / 2);
+@@ -98,9 +89,32 @@ fn shifted(gpa: std.mem.Allocator, bytes: []const u8) ![]u16 {
+     return out;
+ }
+ 
+-fn plain(s: *Sink, ck: *core.Checkpoint, comptime fmt: []const u8, args: anytype, dtype: core.checkpoint.DType, shape: []const usize) !u64 {
++fn plain(s: *Sink, ck: *core.Checkpoint, comptime fmt: []const u8, args: anytype, dt: core.checkpoint.DType, shape: []const usize) !u64 {
+     var buf: [200]u8 = undefined;
+-    return s.put((try ck.expect(try name(&buf, fmt, args), dtype, shape)).bytes);
++    return s.put((try ck.expect(try name(&buf, fmt, args), dt, shape)).bytes);
++}
++
++/// A vector the kernels read as `want`: as stored, or through the one conversion both packs' dtypes take.
++fn vec(s: *Sink, ck: *core.Checkpoint, comptime fmt: []const u8, args: anytype, shape: []const usize, want: dtype.Want) !u64 {
++    var buf: [200]u8 = undefined;
++    const t = try ck.get(try name(&buf, fmt, args));
++    const from = try dtype.accept(t, want, shape);
++    if (from == .stored) return s.put(t.bytes);
++    const n = t.numel();
++    return switch (want) {
++        .f32 => blk: {
++            const w = try s.e.gpa.alloc(u32, n);
++            defer s.e.gpa.free(w);
++            dtype.widen(w, t.bytes);
++            break :blk s.put(std.mem.sliceAsBytes(w));
++        },
++        .bf16 => blk: {
++            const w = try s.e.gpa.alloc(u16, n);
++            defer s.e.gpa.free(w);
++            dtype.round(w, t.bytes, from);
++            break :blk s.put(std.mem.sliceAsBytes(w));
++        },
++    };
+ }
+ 
+ /// A norm weight, shifted by one (see `shifted`).
+@@ -112,15 +126,14 @@ fn norm1(s: *Sink, ck: *core.Checkpoint, comptime fmt: []const u8, args: anytype
+     return s.put(std.mem.sliceAsBytes(w));
+ }
+ 
+-/// A vector the kernels read as f32, stored as bf16 (A_log).
++/// A vector the kernels read as f32 words (A_log): stored f32, or widened from bf16.
+ fn f32vec(s: *Sink, ck: *core.Checkpoint, comptime fmt: []const u8, args: anytype, n: usize) !u64 {
+-    var buf: [200]u8 = undefined;
+-    const t = try ck.get(try name(&buf, fmt, args));
+-    if (!t.is(.bf16, &.{n})) return error.UnexpectedTensor;
+-    const words = try s.e.gpa.alloc(u32, n);
+-    defer s.e.gpa.free(words);
+-    for (words, 0..) |*w, i| w.* = @as(u32, std.mem.readInt(u16, t.bytes[2 * i ..][0..2], .little)) << 16;
+-    return s.put(std.mem.sliceAsBytes(words));
++    return vec(s, ck, fmt, args, &.{n}, .f32);
++}
++
++/// A vector the kernels read as bf16 (a norm or dt_bias): bf16 as stored, or rounded from f32.
++fn bf16vec(s: *Sink, ck: *core.Checkpoint, comptime fmt: []const u8, args: anytype, n: usize) !u64 {
++    return vec(s, ck, fmt, args, &.{n}, .bf16);
+ }
+ 
+ const admit = @import("cuda_exl3_admit.zig");
+@@ -147,13 +160,19 @@ fn dense(s: *Sink, kit: ?*Kit, ck: *core.Checkpoint, prefix: []const u8, mod: []
+     return .{ .x3 = w };
+ }
+ 
+-/// A small f16 matrix [n][k] (in_proj_a / in_proj_b) as bf16 for denseRows.
++/// A small f16 or bf16 matrix [n][k] (in_proj_a / in_proj_b) as bf16 for denseRows.
+ fn smallBf16(s: *Sink, ck: *core.Checkpoint, prefix: []const u8, mod: []const u8, n: usize, k: usize) !Proj {
+-    var buf: [200]u8 = undefined;
+-    const t = try ck.expect(try name(&buf, "{s}{s}.weight", .{ prefix, mod }), .f16, &.{ n, k });
+-    const rows = try f16Rows(s.e.gpa, t.bytes);
+-    defer s.e.gpa.free(rows);
+-    return .{ .bf = .{ .w = try s.put(std.mem.sliceAsBytes(rows)), .n = n, .k = k } };
++    return .{ .bf = .{ .w = try vec(s, ck, "{s}{s}.weight", .{ prefix, mod }, &.{ n, k }, .bf16), .n = n, .k = k } };
++}
++
++/// A layer's mHC routers as shipped (f32): each [2S + S*S][S*hidden] over every stream, and its bias.
++fn mhc(s: *Sink, ck: *core.Checkpoint, p: []const u8, l: *engine.Layer) !void {
++    const m = s.e.g.mhc orelse return;
++    const k = m.streams * s.e.g.hidden;
++    l.mhc_attn = try plain(s, ck, "{s}mhc_attn.weight", .{p}, .f32, &.{ m.outputs(), k });
++    l.mhc_attn_b = try plain(s, ck, "{s}mhc_attn.bias", .{p}, .f32, &.{m.outputs()});
++    l.mhc_ffn = try plain(s, ck, "{s}mhc_ffn.weight", .{p}, .f32, &.{ m.outputs(), k });
++    l.mhc_ffn_b = try plain(s, ck, "{s}mhc_ffn.bias", .{p}, .f32, &.{m.outputs()});
+ }
+ 
+ /// The router as bf16 [experts + 1][hidden]: the gate's rows, then shared_expert_gate's (both stored f16).
+@@ -263,9 +282,9 @@ fn all(s: *Sink, ck: *core.Checkpoint) !void {
+                     .out = try dense(s, kit, ck, p, "linear_attn.out_proj", g.hidden, g.valueWidth()),
+                     // HF's conv1d is [channels][1][taps]: the same bytes as the engine's [channels][taps]
+                     .conv = try plain(s, ck, "{s}linear_attn.conv1d.weight", .{p}, .bf16, &.{ conv, 1, geometry.taps }),
+-                    .norm = try plain(s, ck, "{s}linear_attn.norm.weight", .{p}, .bf16, &.{geometry.dk}), // gated norm: unshifted
++                    .norm = try bf16vec(s, ck, "{s}linear_attn.norm.weight", .{p}, geometry.dk), // gated norm: unshifted
+                     .a_log = try f32vec(s, ck, "{s}linear_attn.A_log", .{p}, g.v_heads),
+-                    .dt_bias = try plain(s, ck, "{s}linear_attn.dt_bias", .{p}, .bf16, &.{g.v_heads}),
++                    .dt_bias = try bf16vec(s, ck, "{s}linear_attn.dt_bias", .{p}, g.v_heads),
+                 },
+             };
+         } else {
+@@ -283,6 +302,7 @@ fn all(s: *Sink, ck: *core.Checkpoint) !void {
+             .up = try dense(s, kit, ck, p, "mlp.up_proj", g.intermediate, g.hidden),
+             .down = try dense(s, kit, ck, p, "mlp.down_proj", g.hidden, g.intermediate),
+         } };
++        if (g.mhc) |mh| if (mh.holds(i)) try mhc(s, ck, p, l);
+         if (kit) |k| try reserveGroups(k, s.e.stream, l.*);
+     }
+ }
+diff --git a/zig/src/families/qwen3_5/cuda_loop_plan_test.zig b/zig/src/families/qwen3_5/cuda_loop_plan_test.zig
+index ee2586952..1b78c0476 100644
+--- a/zig/src/families/qwen3_5/cuda_loop_plan_test.zig
++++ b/zig/src/families/qwen3_5/cuda_loop_plan_test.zig
+@@ -5,15 +5,9 @@ const parse = geom.parse;
+ 
+ test "SenseNova-Loop-9B: [4,28) twice over 32 layers is 56 executions, 14 attention slots and 42 delta slots" {
+     const a = std.testing.allocator;
+-    var json: std.ArrayList(u8) = .empty;
+-    defer json.deinit(a);
+-    try json.appendSlice(a, "{\"model_type\":\"sensenova_loop\",\"quantization\":{\"group_size\":64,\"bits\":8,\"mode\":\"affine\"},\"tie_word_embeddings\":false,\"loop_settings\":{\"counts\":[2],\"end\":28,\"eval_count\":2,\"start\":4},\"mhc\":{\"end\":28,\"fixed_identity\":false,\"iterations\":20,\"pre_scale\":1.0,\"start\":4,\"streams\":2},\"text_config\":{\"model_type\":\"qwen3_5_text\",\"attention_bias\":false,\"attn_output_gate\":true,\"hidden_act\":\"silu\",\"head_dim\":256,\"linear_key_head_dim\":128,\"linear_value_head_dim\":128,\"linear_conv_kernel_dim\":4,\"hidden_size\":4096,\"intermediate_size\":12288,\"num_hidden_layers\":32,\"vocab_size\":248320,\"linear_num_key_heads\":16,\"linear_num_value_heads\":32,\"num_attention_heads\":16,\"num_key_value_heads\":4,\"rms_norm_eps\":1e-06,\"max_position_embeddings\":524288,\"layer_types\":[");
+-    for (0..32) |i| {
+-        if (i != 0) try json.append(a, ',');
+-        try json.appendSlice(a, if ((i + 1) % 4 == 0) "\"full_attention\"" else "\"linear_attention\"");
+-    }
+-    try json.appendSlice(a, "],\"rope_parameters\":{\"rope_type\":\"yarn\",\"rope_theta\":10000000,\"partial_rotary_factor\":0.25,\"factor\":2.0,\"original_max_position_embeddings\":262144}}}");
+-    const g = try parse(a, json.items);
++    const json = try sensenova(a, "\"quantization\":{\"group_size\":64,\"bits\":8,\"mode\":\"affine\"}");
++    defer a.free(json);
++    const g = try parse(a, json);
+     try std.testing.expectEqual(@as(usize, 56), g.steps());
+     try std.testing.expectEqual(@as(usize, 14), g.attentions());
+     try std.testing.expectEqual(@as(usize, 42), g.deltas());
+@@ -32,11 +26,43 @@ test "SenseNova-Loop-9B: [4,28) twice over 32 layers is 56 executions, 14 attent
+     try std.testing.expect(m.holds(4) and m.holds(27) and !m.holds(3) and !m.holds(28));
+     // a looped model has no physical stage slice, and a learned identity map is not what the kernels run
+     try std.testing.expectError(error.BadStageRange, g.stage(0, 16, false));
+-    const fixed = try std.mem.replaceOwned(u8, a, json.items, "\"fixed_identity\":false", "\"fixed_identity\":true");
++    const fixed = try std.mem.replaceOwned(u8, a, json, "\"fixed_identity\":false", "\"fixed_identity\":true");
+     defer a.free(fixed);
+     try std.testing.expectError(error.UnsupportedQwenGeometry, parse(a, fixed));
+ }
+ 
++/// SenseNova-Loop-9B's config, `quant` naming its own table or exllamav3's quantization_config, 32 layers of four.
++fn sensenova(a: std.mem.Allocator, quant: []const u8) ![]u8 {
++    var json: std.ArrayList(u8) = .empty;
++    errdefer json.deinit(a);
++    try json.appendSlice(a, "{\"model_type\":\"sensenova_loop\",");
++    try json.appendSlice(a, quant);
++    try json.appendSlice(a, ",\"tie_word_embeddings\":false,\"loop_settings\":{\"counts\":[2],\"end\":28,\"eval_count\":2,\"start\":4},\"mhc\":{\"end\":28,\"fixed_identity\":false,\"iterations\":20,\"pre_scale\":1.0,\"start\":4,\"streams\":2},\"text_config\":{\"model_type\":\"qwen3_5_text\",\"attention_bias\":false,\"attn_output_gate\":true,\"hidden_act\":\"silu\",\"head_dim\":256,\"linear_key_head_dim\":128,\"linear_value_head_dim\":128,\"linear_conv_kernel_dim\":4,\"hidden_size\":4096,\"intermediate_size\":12288,\"num_hidden_layers\":32,\"vocab_size\":248320,\"linear_num_key_heads\":16,\"linear_num_value_heads\":32,\"num_attention_heads\":16,\"num_key_value_heads\":4,\"rms_norm_eps\":1e-06,\"max_position_embeddings\":524288,\"layer_types\":[");
++    for (0..32) |i| {
++        if (i != 0) try json.append(a, ',');
++        try json.appendSlice(a, if ((i + 1) % 4 == 0) "\"full_attention\"" else "\"linear_attention\"");
++    }
++    try json.appendSlice(a, "],\"rope_parameters\":{\"rope_type\":\"yarn\",\"rope_theta\":10000000,\"partial_rotary_factor\":0.25,\"factor\":2.0,\"original_max_position_embeddings\":262144}}}");
++    return json.toOwnedSlice(a);
++}
++
++test "SenseNova-Loop-9B's EXL3 config: the loop and mHC parse before the format branch, so the loader sees them" {
++    const a = std.testing.allocator;
++    const json = try sensenova(a, "\"quantization_config\":{\"quant_method\":\"exl3\",\"version\":\"1.5.4\",\"bits\":5.0,\"head_bits\":6,\"codebook\":\"mul1\"}");
++    defer a.free(json);
++    const g = try parse(a, json);
++    try std.testing.expect(g.exl3 and g.mhc != null);
++    try std.testing.expectEqual(@as(usize, 4), g.loop_start);
++    try std.testing.expectEqual(@as(usize, 28), g.loop_end);
++    try std.testing.expectEqual(@as(usize, 2), g.loop_count);
++    try std.testing.expectEqual(@as(usize, 56), g.steps());
++    const m = g.mhc.?;
++    try std.testing.expectEqual(@as(usize, 2), m.streams);
++    try std.testing.expectEqual(@as(usize, 20), m.iterations);
++    try std.testing.expectEqual(@as(usize, 8), m.outputs());
++    try std.testing.expect(m.holds(4) and m.holds(27) and !m.holds(3) and !m.holds(28));
++}
++
+ test "a geometry without a valid loop executes its own layers once; the accessors never underflow" {
+     // field-by-field geometries hold garbage in loop_count: steps() must answer `layers`, never wrap.
+     var g: geom.Geometry = undefined;
+diff --git a/zig/src/families/qwen3_5/cuda_native.zig b/zig/src/families/qwen3_5/cuda_native.zig
+index b9d9d01ce..f5c0d8965 100644
+--- a/zig/src/families/qwen3_5/cuda_native.zig
++++ b/zig/src/families/qwen3_5/cuda_native.zig
+@@ -29,6 +29,8 @@ pub const slide = @import("cuda_slide.zig");
+ pub const linked = slide.linked;
+ 
+ pub const model_type = "qwen3_5";
++/// SenseNova-Loop-9B is this engine's looped Qwen3.5 with mHC streams: its config names itself `sensenova_loop`.
++pub const also_model_types: []const []const u8 = &.{"sensenova_loop"};
+ pub const formats: []const []const u8 = &.{ "mlx-q4g64", "exl3" };
+ pub const default_context: i64 = 32768;
+ pub const decode_share: f64 = 0.5;
+diff --git a/zig/src/families/qwen3_5/cuda_weights.zig b/zig/src/families/qwen3_5/cuda_weights.zig
+index d0b476e61..5e752194c 100644
+--- a/zig/src/families/qwen3_5/cuda_weights.zig
++++ b/zig/src/families/qwen3_5/cuda_weights.zig
+@@ -157,10 +157,7 @@ fn bf16vec(e: *Engine, ck: *core.Checkpoint, comptime fmt: []const u8, args: any
+     if (!t.is(.f32, &.{n})) return error.UnexpectedTensor;
+     const out = try e.gpa.alloc(u16, n);
+     defer e.gpa.free(out);
+-    for (out, std.mem.bytesAsSlice(f32, t.bytes)) |*o, f| {
+-        const b: u32 = @bitCast(f);
+-        o.* = @truncate((b +% 0x7fff +% ((b >> 16) & 1)) >> 16);
+-    }
++    core.bf16_round.words(out, t.bytes);
+     return upload(e, std.mem.sliceAsBytes(out));
+ }
+ 
+diff --git a/zig/src/native/cuda.zig b/zig/src/native/cuda.zig
+index a33a85c91..4358a33b7 100644
+--- a/zig/src/native/cuda.zig
++++ b/zig/src/native/cuda.zig
+@@ -166,6 +166,7 @@ pub fn open(a: Allocator, gpa: Allocator, io: std.Io, o: api.Open, problem: *[]c
+     if (std.mem.eql(u8, o.model_type, "qwen4") or std.mem.eql(u8, o.model_type, "qwen4_text")) return @import("qwen4_cuda.zig").open(a, gpa, io, o, problem);
+     if (std.mem.eql(u8, o.model_type, "qwen3")) return @import("cuda_qwen3.zig").open(a, gpa, io, o, problem, budget, windows);
+     inline for (registry) |F| if (std.mem.eql(u8, o.model_type, F.model_type)) return openWith(F, a, gpa, io, o, problem);
++    inline for (registry) |F| if (@import("cuda_alias.zig").only(F, o.model_type)) return openWith(F, a, gpa, io, o, problem);
+     if (std.mem.eql(u8, o.model_type, lfm2.family.model_type)) {
+         if (refusals.lfm2(o)) |why| {
+             problem.* = why;
+diff --git a/zig/src/native/cuda_alias.zig b/zig/src/native/cuda_alias.zig
+index 0a9e9bc71..13ac61df7 100644
+--- a/zig/src/native/cuda_alias.zig
++++ b/zig/src/native/cuda_alias.zig
+@@ -11,3 +11,9 @@ pub fn reads(comptime F: type, model_type: []const u8) bool {
+     for (aliases(F)) |t| if (std.mem.eql(u8, model_type, t)) return true;
+     return false;
+ }
++
++/// Whether `model_type` is one of `F`'s aliases alone, never its own name (callers match own names first).
++pub fn only(comptime F: type, model_type: []const u8) bool {
++    if (std.mem.eql(u8, model_type, F.model_type)) return false;
++    return reads(F, model_type);
++}
+diff --git a/zig/src/native/cuda_families.zig b/zig/src/native/cuda_families.zig
+index de591b1b6..e9c07cace 100644
+--- a/zig/src/native/cuda_families.zig
++++ b/zig/src/native/cuda_families.zig
+@@ -15,26 +15,66 @@ const qwen3 = @import("qwen3_cuda");
+ 
+ /// CUDA families provide metadata, open their lane backend and explain their refusals.
+ pub const registry = .{ nemotron.native, nemotron.omni, glm.native, minimax.native, qwen35.native, qwen35.native_moe, flashnext.native, kolibri1.native, gemma4.native, gemma4.native31, spark25.native, dory.native, @import("dots_mocr_cuda").native, @import("lfm2_moe_cuda").native };
++/// Whether `model_type` is a registry family's own name.
++fn own(comptime model_type: []const u8) bool {
++    inline for (registry) |F| if (comptime std.mem.eql(u8, model_type, F.model_type)) return true;
++    return false;
++}
++
++const Extra = struct { model_type: []const u8, formats: []const []const u8, decisions: []const []const u8 };
++
++/// The aliases worth a capability entry: a config model_type no registry family names itself (`sensenova_loop`).
++const extras: []const Extra = blk: {
++    var out: []const Extra = &.{};
++    for (registry) |F| for (@import("cuda_alias.zig").aliases(F)) |other| {
++        const decisions: []const []const u8 = if (@hasDecl(F, "decision_formats")) F.decision_formats else &.{};
++        if (!own(other)) out = out ++ &[_]Extra{.{ .model_type = other, .formats = F.formats, .decisions = decisions }};
++    };
++    break :blk out;
++};
++
+ pub const families: []const api.Family = blk: {
+-    var out: [registry.len + 5]api.Family = undefined;
+-    for (registry, 0..) |F, i| out[i] = .{ .model_type = F.model_type, .formats = F.formats, .decision_formats = if (@hasDecl(F, "decision_formats")) F.decision_formats else &.{} };
+-    out[registry.len] = lfm2.family;
+-    out[registry.len + 1] = .{ .model_type = "fish_omni", .formats = &.{"fp8-block128"} };
+-    out[registry.len + 2] = .{ .model_type = "qwen4", .formats = @import("qwen4").family.native_host.formats };
+-    out[registry.len + 3] = .{ .model_type = "qwen4_text", .formats = @import("qwen4").family.native_host.formats };
+-    out[registry.len + 4] = .{ .model_type = qwen3.native.model_type, .formats = qwen3.native.formats };
++    var out: [registry.len + extras.len + 5]api.Family = undefined;
++    var at: usize = 0;
++    for (registry) |F| {
++        out[at] = .{ .model_type = F.model_type, .formats = F.formats, .decision_formats = if (@hasDecl(F, "decision_formats")) F.decision_formats else &.{} };
++        at += 1;
++    }
++    for (extras) |e| {
++        out[at] = .{ .model_type = e.model_type, .formats = e.formats, .decision_formats = e.decisions };
++        at += 1;
++    }
++    out[at] = lfm2.family;
++    out[at + 1] = .{ .model_type = "fish_omni", .formats = &.{"fp8-block128"} };
++    out[at + 2] = .{ .model_type = "qwen4", .formats = @import("qwen4").family.native_host.formats };
++    out[at + 3] = .{ .model_type = "qwen4_text", .formats = @import("qwen4").family.native_host.formats };
++    out[at + 4] = .{ .model_type = qwen3.native.model_type, .formats = qwen3.native.formats };
+     const final = out;
+     break :blk &final;
+ };
+ 
+ test "every registered family and d1's decision engine are listed for capabilities" {
+-    try std.testing.expectEqual(@as(usize, registry.len + 5), families.len);
++    try std.testing.expectEqual(@as(usize, registry.len + extras.len + 5), families.len);
+     try std.testing.expectEqualStrings("nemotron_h", families[0].model_type);
+     try std.testing.expectEqualStrings("lfm2_moe", families[registry.len - 1].model_type);
+-    try std.testing.expectEqualStrings("lfm2_vl", families[registry.len].model_type);
+-    try std.testing.expectEqualStrings("qwen4", families[registry.len + 2].model_type);
+-    try std.testing.expectEqualStrings("qwen4_text", families[registry.len + 3].model_type);
+-    try std.testing.expectEqualStrings("qwen3", families[registry.len + 4].model_type);
++    try std.testing.expectEqualStrings("lfm2_vl", families[registry.len + extras.len].model_type);
++    try std.testing.expectEqualStrings("qwen4", families[registry.len + extras.len + 2].model_type);
++    try std.testing.expectEqualStrings("qwen4_text", families[registry.len + extras.len + 3].model_type);
++    try std.testing.expectEqualStrings("qwen3", families[registry.len + extras.len + 4].model_type);
++}
++
++test "a family's other config model_types are listed beside it with the same formats" {
++    var seen = false;
++    for (families) |f| if (std.mem.eql(u8, f.model_type, "sensenova_loop")) {
++        seen = true;
++        try std.testing.expectEqual(@as(usize, 2), f.formats.len);
++        try std.testing.expectEqualStrings("exl3", f.formats[1]);
++    };
++    try std.testing.expect(seen);
++    // every model_type is listed once: Nemotron's Omni wrapper has its own entry, so its alias adds none
++    for (families, 0..) |f, i| for (families[0..i]) |earlier| {
++        try std.testing.expect(!std.mem.eql(u8, f.model_type, earlier.model_type));
++    };
+ }
+ 
+ test "dots.mocr serves its publisher's BF16 weights on CUDA through the dense engine" {
+@@ -59,7 +99,7 @@ test "GLM capabilities: CUDA offers the EXL3 format its loader accepts" {
+ test "capability audit: CUDA Qwen3.5 lists BF16 under decisions only, the MoE entry and the others none" {
+     for (families) |f| {
+         for (f.formats) |format| try std.testing.expect(!std.mem.eql(u8, format, "bf16") or !std.mem.startsWith(u8, f.model_type, "qwen3_5"));
+-        if (std.mem.eql(u8, f.model_type, "qwen3_5")) {
++        if (@import("cuda_alias.zig").reads(qwen35.native, f.model_type)) {
+             try std.testing.expectEqual(@as(usize, 1), f.decision_formats.len);
+             try std.testing.expectEqualStrings("bf16", f.decision_formats[0]);
+         } else try std.testing.expectEqual(@as(usize, 0), f.decision_formats.len);
+diff --git a/zig/src/native/cuda_refusal.zig b/zig/src/native/cuda_refusal.zig
+index d4a0c2ad3..be40793fd 100644
+--- a/zig/src/native/cuda_refusal.zig
++++ b/zig/src/native/cuda_refusal.zig
+@@ -22,7 +22,7 @@ pub fn backend(o: api.Open) ?[]const u8 {
+     }
+     if (o.policy.len > 0) return "--policy is not supported by this CUDA build";
+     if (@import("disk_spill.zig").refusal(o, "")) |why| return why;
+-    if (o.rope_yarn != null and !std.mem.eql(u8, o.model_type, "qwen3_5") and !std.mem.eql(u8, o.model_type, "qwen3_5_moe"))
++    if (o.rope_yarn != null and !std.mem.eql(u8, o.model_type, "qwen3_5") and !std.mem.eql(u8, o.model_type, "qwen3_5_moe") and !std.mem.eql(u8, o.model_type, "sensenova_loop"))
+         return "--rope-yarn: this CUDA family has no YaRN rope; serve it without --rope-yarn";
+     if (o.learn != null and !o.learn_conversations) return "--learn learns shared prompt prefixes on Macs only; CUDA keeps conversation states on disk with --learn-conversations: serve with it, or without --learn, --learn-dir or --learn-gib";
+     if (o.speed_up != null) return "--speed-up links two Macs: serve without --speed-up on CUDA";

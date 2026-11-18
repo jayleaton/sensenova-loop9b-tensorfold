@@ -6,10 +6,13 @@
 #
 # Your own private names (host names, user names, internal tools) belong in .check-public.local (git-ignored, one
 # extended regex per line, # comments allowed) or in CHECK_PUBLIC_EXTRA='a|b'; they match case-insensitively.
+# .check-public.allow (tracked) lists upstream identifiers a rule mistakes for private names, one extended regex a
+# line; a finding line matching one is dropped.
 set -uo pipefail
 cd "$(dirname "${BASH_SOURCE[0]}")/.." || exit 2
 self=scripts/check-public.sh
 local_list=.check-public.local
+allow_list=.check-public.allow
 allowed_authors=${ALLOWED_AUTHORS:-58495321+jayleaton@users.noreply.github.com}
 
 # name|regex (grep -E, case-insensitive)
@@ -36,7 +39,7 @@ fi
 
 files=()
 while IFS= read -r -d '' f; do
-    [[ "$f" == "$self" || "$f" == "$local_list" ]] && continue
+    [[ "$f" == "$self" || "$f" == "$local_list" || "$f" == "$allow_list" ]] && continue
     [[ -f "$f" ]] && files+=("$f")
 done < <(git ls-files -z -co --exclude-standard)
 [[ ${#files[@]} -gt 0 ]] || { echo 'no files to scan (not a git checkout?)' >&2; exit 2; }
@@ -51,6 +54,7 @@ for entry in "${patterns[@]}"; do
     name=${entry%%|*}
     re=${entry#*|}
     hits=$(grep -HnIiE -- "$re" "${files[@]}" 2>/dev/null)
+    [[ -n "$hits" && -f "$allow_list" ]] && hits=$(grep -vE -f <(grep -vE '^[[:space:]]*(#|$)' "$allow_list") <<< "$hits")
     [[ -z "$hits" ]] || report "$name" "$hits"
 done
 # e-mail addresses other than the allowed identities, the patches' noreply authors and reserved example domains
@@ -70,7 +74,8 @@ if [[ "${1:-}" == --history ]]; then
     for entry in "${patterns[@]}"; do
         name=${entry%%|*}
         re=${entry#*|}
-        hits=$(git grep -IinE -e "$re" "${commits[@]}" -- . ":!$self" 2>/dev/null)
+        hits=$(git grep -IinE -e "$re" "${commits[@]}" -- . ":!$self" ":!$allow_list" 2>/dev/null)
+        [[ -n "$hits" && -f "$allow_list" ]] && hits=$(grep -vE -f <(grep -vE '^[[:space:]]*(#|$)' "$allow_list") <<< "$hits")
         [[ -z "$hits" ]] || report "history: $name" "$hits"
         hits=$(grep -niE -e "$re" <<< "$msgs" || true)
         [[ -z "$hits" ]] || report "history messages: $name" "$hits"

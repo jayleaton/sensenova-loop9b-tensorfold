@@ -1,0 +1,2 @@
+# upstream TensorFold's spark25 model family, quoted as diff context in patches/rtx
+\bspark25\.native\b
