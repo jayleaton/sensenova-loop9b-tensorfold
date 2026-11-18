@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Jay Leaton <58495321+jayleaton@users.noreply.github.com>
 Date: Wed, 18 Nov 2026 09:42:10 +0700
-Subject: [PATCH 10/19] tools: checkpoint_view, a probe tree that links its
+Subject: [PATCH 10/22] tools: checkpoint_view, a probe tree that links its
  source for reading and never writes through a link
 
 A probe that linked a reference tree's shards and then opened the same names for writing rewrote the

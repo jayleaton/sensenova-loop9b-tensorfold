@@ -1,0 +1,92 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Jay Leaton <58495321+jayleaton@users.noreply.github.com>
+Date: Wed, 18 Nov 2026 21:54:45 +0700
+Subject: [PATCH 22/22] lanes: shared copy rows fill the backend's row tile and
+ never cross it
+
+On CUDA qwen3_5 a shared round costs ~73 ms up to 16 rows, ~137 ms at 17 and ~200 ms at 33.
+Without a measured width, a round's copy budget is now the room left in cfg.lone_cost_tile,
+spent whole and split by landing rate; the unpriced one-window fallback keeps its landing scale.
+---
+ zig/src/core/lanes/copy_width.zig        | 17 +++++++++-----
+ zig/src/core/lanes/drafted_copy_test.zig | 28 ++++++++++++++++++++++++
+ 2 files changed, 40 insertions(+), 5 deletions(-)
+
+diff --git a/zig/src/core/lanes/copy_width.zig b/zig/src/core/lanes/copy_width.zig
+index 302e3f187..f58505cd3 100644
+--- a/zig/src/core/lanes/copy_width.zig
++++ b/zig/src/core/lanes/copy_width.zig
+@@ -44,14 +44,19 @@ pub fn observe(e: *const Engine, s: *Stream, kept: usize, own: usize) void {
+     if (k == .lone) w.lone = if (kept == own) @min(e.cfg.max_copy, 2 * current(e, s) + 1) else e.cfg.first_copy;
+ }
+ 
+-/// A round's copy rows: the measured shared width less each stream's pending row, else one window's.
+-pub fn budget(e: *const Engine, streams: usize, sampled: bool) u64 {
++const Budget = struct { rows: u64, priced: bool };
++
++/// Copy rows past the pending rows: priced by the measured width or the row tile's room, else one window's unpriced.
++pub fn budget(e: *const Engine, streams: usize, sampled: bool) Budget {
+     const most = streams * (1 + @as(u64, e.cfg.max_copy));
+     const measured = @min(e.rule.row_cost.leastRows(streams, sampled), most);
+-    return if (measured > streams) measured - streams else e.cfg.max_copy;
++    if (measured > streams) return .{ .rows = measured - streams, .priced = true };
++    const tile: u64 = e.cfg.lone_cost_tile;
++    if (tile > 0) return .{ .rows = @min(most, std.mem.alignForward(u64, streams, tile)) - streams, .priced = true };
++    return .{ .rows = e.cfg.max_copy, .priced = false };
+ }
+ 
+-/// The budget times the copying streams' mean landing rate, split by their rates, none past cfg.max_copy.
++/// A priced budget whole, else times the copying streams' mean landing rate; split by rates, none past max_copy.
+ pub fn share(e: *Engine, round: []const *Stream, sampled: bool) !void {
+     const a = e.arena.allocator();
+     var copying: std.ArrayList(*Stream) = .empty;
+@@ -70,7 +75,9 @@ pub fn share(e: *Engine, round: []const *Stream, sampled: bool) !void {
+     }
+     const landing = @min(1, sum / @as(f64, @floatFromInt(copying.items.len)));
+     const parts = try a.alloc(u32, copying.items.len);
+-    split(@intFromFloat(@round(landing * @as(f64, @floatFromInt(budget(e, round.len, sampled))))), weights, e.cfg.max_copy, parts);
++    const b = budget(e, round.len, sampled);
++    const total: u64 = if (b.priced) b.rows else @intFromFloat(@round(landing * @as(f64, @floatFromInt(b.rows))));
++    split(total, weights, e.cfg.max_copy, parts);
+     for (copying.items, parts) |s, p| s.copy_width.share = p;
+ }
+ 
+diff --git a/zig/src/core/lanes/drafted_copy_test.zig b/zig/src/core/lanes/drafted_copy_test.zig
+index 2ec7fe6ff..86d13c3e2 100644
+--- a/zig/src/core/lanes/drafted_copy_test.zig
++++ b/zig/src/core/lanes/drafted_copy_test.zig
+@@ -237,6 +237,34 @@ test "copy width: shares follow the round's chats as they join and leave, a miss
+     try std.testing.expectEqual(cfg.first_copy, cw.current(&e, &streams[0]));
+ }
+ 
++test "copy width: with a row tile, a round's copies fill its room whole and never cross it" {
++    const cw = @import("copy_width.zig");
++    var cfg = try Config.init(gpa, .{ .exact_width = 16, .first_copy_rows = 4, .hidden_rows = true, .batch_rows = 32, .lone_cost_tile = 16 }, 16, 15);
++    defer cfg.deinit(gpa);
++    var target: fake.Fake = .{ .gpa = gpa };
++    defer target.deinit();
++    var clock: fake.FixedClock = .{};
++    var e = Engine.init(gpa, &cfg, target.backend(), clock.clock());
++    defer e.deinit();
++    var streams: [4]sm.Stream = undefined;
++    for (&streams) |*s| s.* = try sm.Stream.init(gpa, .{ .id = "s", .prompt = &.{ 1, 2 }, .max_new = 64, .drafts = true });
++    defer for (&streams) |*s| s.deinit(gpa);
++    var round: [4]*sm.Stream = undefined;
++    for (&round, &streams) |*r, *s| r.* = s;
++    e.alone = false;
++    var parts: [4]u32 = undefined;
++    for ([_]usize{ 2, 3, 4 }, [_][]const u32{ &.{ 7, 7 }, &.{ 5, 4, 4 }, &.{ 3, 3, 3, 3 } }) |n, want| {
++        try cw.share(&e, round[0..n], false);
++        for (parts[0..n], round[0..n]) |*p, s| p.* = cw.current(&e, s);
++        try std.testing.expectEqualSlices(u32, want, parts[0..n]);
++    }
++    for (0..4) |_| cw.observe(&e, &streams[1], 0, 3);
++    try cw.share(&e, round[0..4], false);
++    for (parts[0..4], round[0..4]) |*p, s| p.* = cw.current(&e, s);
++    try std.testing.expectEqual(@as(u32, 12), parts[0] + parts[1] + parts[2] + parts[3]);
++    try std.testing.expect(parts[1] < parts[0]);
++}
++
+ test "copy width: a priced proposer (a loaded drafter) drafts max_copy in shared rounds and never grows a width" {
+     const cw = @import("copy_width.zig");
+     const win = @import("windows.zig");

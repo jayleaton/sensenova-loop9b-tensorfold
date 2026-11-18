@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Jay Leaton <58495321+jayleaton@users.noreply.github.com>
 Date: Wed, 18 Nov 2026 15:09:33 +0700
-Subject: [PATCH 13/19] server: a required or named tool call closes the think
+Subject: [PATCH 13/22] server: a required or named tool call closes the think
  block in time for the call
 
 tool_choice required and named functions now set a thinking budget of

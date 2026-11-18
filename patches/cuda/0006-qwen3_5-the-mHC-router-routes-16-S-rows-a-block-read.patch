@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Jay Leaton <58495321+jayleaton@users.noreply.github.com>
 Date: Wed, 18 Nov 2026 09:28:16 +0700
-Subject: [PATCH 06/19] qwen3_5: the mHC router routes 16/S rows a block,
+Subject: [PATCH 06/22] qwen3_5: the mHC router routes 16/S rows a block,
  reading its weights and each row once
 
 One block per row re-read the 256 KiB fp32 router matrix for every row and the row's streams nine times.

@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Jay Leaton <58495321+jayleaton@users.noreply.github.com>
 Date: Wed, 18 Nov 2026 13:10:17 +0700
-Subject: [PATCH 12/19] qwen3_5: a later stage's first norm folds the residual
+Subject: [PATCH 12/22] qwen3_5: a later stage's first norm folds the residual
  again; the host suite builds
 
 The looped port keyed the first input norm (and mHC's enter) on i != 0, dropping

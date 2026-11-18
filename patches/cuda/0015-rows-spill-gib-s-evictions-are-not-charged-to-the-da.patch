@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Jay Leaton <58495321+jayleaton@users.noreply.github.com>
 Date: Wed, 18 Nov 2026 15:19:16 +0700
-Subject: [PATCH 15/19] rows: --spill-gib's evictions are not charged to the
+Subject: [PATCH 15/22] rows: --spill-gib's evictions are not charged to the
  daily write budget
 
 A spill store parks states RAM evicts; once --learn-daily-gib (32 by

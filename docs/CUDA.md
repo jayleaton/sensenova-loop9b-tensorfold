@@ -5,8 +5,8 @@ The `qwen3_5` CUDA family executes the loop plan and the two-stream mHC on one G
 | | |
 | --- | --- |
 | Hardware | 1x NVIDIA DGX Spark (GB10, 128 GB unified), CUDA 13.0 |
-| Engine | upstream TensorFold `038e4a27872eaa018adc67b1b5ddffd16820c498` (on `main`, 2026-11-17) + [`patches/cuda/`](../patches/cuda/) `0001`-`0019` |
-| Engine tree | `0882211e9e246e25b23eee4cb573eb4d8290977b`: the serving engine (`0001`-`0019`, without `0008`, is the build behind the numbers below, byte for byte) plus the converter (`0008`) |
+| Engine | upstream TensorFold `038e4a27872eaa018adc67b1b5ddffd16820c498` (on `main`, 2026-11-17) + [`patches/cuda/`](../patches/cuda/) `0001`-`0022` |
+| Engine tree | `d5938b12bbcc1294e6a24600111cbd4c8d86f159`: the serving engine (`0001`-`0022`, without `0008`, is the build behind the numbers below, byte for byte) plus the converter (`0008`); the rows marked `0019` were measured on `0001`-`0019`, whose tokens are the same |
 | Weights served | MLX affine 8-bit g64 text weights ([CONVERT](CONVERT.md)) and the BF16 vision tower, YaRN factor 4 (1,048,576 positions) |
 
 ## Build
@@ -101,13 +101,15 @@ Measured on the build above, the tree above and these flags, on one DGX Spark:
 
 | check | result |
 | --- | --- |
-| decode, one chat | 18.0 tok/s |
-| decode, 4 chats at once | 13.2-14.6 tok/s each |
-| decode beside a 35,614-token prompt being read | 11.0 tok/s (that prompt's TTFT 32.5 s) |
-| prefix reuse, a 74K prompt's second turn | 73,728 of 74,255 tokens from cache, TTFT 0.66 s against 52.4 s cold |
+| decode, one chat (`0019`) | 18.0 tok/s |
+| decode, 4 chats at once (`0019`) | 13.2-14.6 tok/s each |
+| copy drafts, 1, 2 and 4 code chats at once, aggregate | 15.3, 33.3 and 54.5 tok/s, against 14.5, 28.0 and 54.0 without drafts |
+| decode beside a 35,614-token prompt being read (`0019`) | 11.0 tok/s (that prompt's TTFT 32.5 s) |
+| prefix reuse, a 74K prompt's second turn (`0019`) | 73,728 of 74,255 tokens from cache, TTFT 0.66 s against 52.4 s cold |
 | drafts on vs off, 2 and 4 chats at once | token ids identical in all 6 replies (768 tokens each, 951-1,330 copied rows) |
 | strict tool gate (`required` and `auto`, text and images) | pass |
-| soak, 4 workers, 12 rotating conversations | 45 requests, 0 errors, 0 wrong answers; required tool turns 3/3 |
+| an OpenCode request (its system prompt and 12 tools, `tool_choice` auto) that needs a file | one well-formed `read` call |
+| soak, 4 workers, 12 rotating conversations (`0019`) | 45 requests, 0 errors, 0 wrong answers; required tool turns 3/3 |
 | disk tier during the soak | 39 states saved, 19 read back, 0 refusals, 0 restore fallbacks |
 | thinking budget | a runaway-prone prompt stopped thinking at 4,097 tokens |
 

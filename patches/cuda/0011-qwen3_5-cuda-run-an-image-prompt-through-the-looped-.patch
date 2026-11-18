@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Jay Leaton <58495321+jayleaton@users.noreply.github.com>
 Date: Wed, 18 Nov 2026 10:41:51 +0800
-Subject: [PATCH 11/19] qwen3_5 cuda: run an image prompt through the looped
+Subject: [PATCH 11/22] qwen3_5 cuda: run an image prompt through the looped
  decoder
 
 The tower and the loop each had a receipt on this branch and nothing joined

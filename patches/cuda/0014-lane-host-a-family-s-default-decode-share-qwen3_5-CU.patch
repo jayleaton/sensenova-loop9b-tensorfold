@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Jay Leaton <58495321+jayleaton@users.noreply.github.com>
 Date: Wed, 18 Nov 2026 15:19:16 +0700
-Subject: [PATCH 14/19] lane host: a family's default decode share; qwen3_5
+Subject: [PATCH 14/22] lane host: a family's default decode share; qwen3_5
  CUDA takes 0.5
 
 A family may declare decode_share; the lane host applies it beside a

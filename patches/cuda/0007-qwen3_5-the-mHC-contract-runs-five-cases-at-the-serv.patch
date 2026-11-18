@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Jay Leaton <58495321+jayleaton@users.noreply.github.com>
 Date: Wed, 18 Nov 2026 09:28:23 +0700
-Subject: [PATCH 07/19] qwen3_5: the mHC contract runs: five cases at the
+Subject: [PATCH 07/22] qwen3_5: the mHC contract runs: five cases at the
  served width, FP64 references, a control each
 
 The committed contract never compiled; it also freed its cases before the gates, unloaded its module before

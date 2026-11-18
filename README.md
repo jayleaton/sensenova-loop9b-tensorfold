@@ -35,8 +35,8 @@ More in [CREDITS](docs/CREDITS.md); license terms in [LICENSING](docs/LICENSING.
 | Model | [`sensenova/SenseNova-Loop-9B`](https://huggingface.co/sensenova/SenseNova-Loop-9B) @ `329a65f701ba8c48b73c30d0cbaa6f0449733673`, BF16, Apache-2.0 |
 | Architecture | Qwen3.5 dense hybrid attention; physical layers `[4, 28)` run twice (56 executions from 32 weight sets), wrapped in a two-stream mHC ([MODEL](docs/MODEL.md)) |
 | Weights served | MLX affine g64, converted with [`tools/sensenova_loop_mlx.py`](docs/CONVERT.md) from the patch series: 8-bit on CUDA, 4-bit on Metal |
-| CUDA | 1x DGX Spark (GB10), TP=1: upstream TensorFold [`038e4a278`](config/cuda/tensorfold.rev) + [`patches/cuda/`](patches/cuda/) `0001`-`0019` |
-| RTX | 16 GB RTX cards (tested on an RTX 5070 Ti, WSL2): the CUDA pin and series + [`patches/rtx/`](patches/rtx/) `0001`-`0002`, EXL3 packs |
+| CUDA | 1x DGX Spark (GB10), TP=1: upstream TensorFold [`038e4a278`](config/cuda/tensorfold.rev) + [`patches/cuda/`](patches/cuda/) `0001`-`0022` |
+| RTX | 16 GB RTX cards (tested on an RTX 5070 Ti, WSL2): the CUDA pin and series `0001`-`0019` + [`patches/rtx/`](patches/rtx/) `0001`-`0002`, EXL3 packs |
 | Metal | Apple Silicon (measured on M5 Ultra and M4 Pro): upstream TensorFold [`6d0a128b0`](config/metal/tensorfold.rev) + [`patches/metal/`](patches/metal/) `0001`-`0044` |
 | Input | text and images on both ([CUDA](docs/CUDA.md#serve), [METAL](docs/METAL.md#images)) |
 | Drafts | copy drafts on by default on both: drafts from a stream's own context, verified, so tokens are unchanged |
@@ -53,7 +53,7 @@ pin, but that tree has not been measured. See [ENGINE](docs/ENGINE.md).
 
 ## What works today
 
-**CUDA, DGX Spark: 8-bit, 1M context, images, four chats.** The served build is `patches/cuda/` `0001`-`0019`
+**CUDA, DGX Spark: 8-bit, 1M context, images, four chats.** The served build is `patches/cuda/` `0001`-`0022`
 ([CUDA](docs/CUDA.md#serve)): the converter's 8-bit text weights, the BF16 vision tower, YaRN factor 4, fp8 KV, a 24
 GiB prompt cache and an NVMe disk tier.
 

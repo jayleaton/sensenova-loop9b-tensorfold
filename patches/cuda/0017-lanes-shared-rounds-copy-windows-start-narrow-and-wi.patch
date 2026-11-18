@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Jay Leaton <58495321+jayleaton@users.noreply.github.com>
 Date: Wed, 18 Nov 2026 15:20:52 +0700
-Subject: [PATCH 17/19] lanes: shared rounds' copy windows start narrow and
+Subject: [PATCH 17/22] lanes: shared rounds' copy windows start narrow and
  widen as copies land
 
 A stream in a shared round started every copy at first_copy (63 rows on qwen3_5) and never widened. It now keeps its own shared width: at most 3 copies first, 2 w + 1 (capped at max_copy) while every copied row lands, back to the first on a miss. Lone rounds keep their width and rule unchanged; committed tokens do not change.

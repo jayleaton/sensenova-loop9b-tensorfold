@@ -7,10 +7,10 @@ patch series applied in order. The pin, the series length and the resulting tree
 | --- | --- | --- |
 | `tensorfold.repo` | `https://github.com/ashhart/TensorFold.git` | same |
 | `tensorfold.rev` | `038e4a27872eaa018adc67b1b5ddffd16820c498` | `6d0a128b0cde35aa091bda933577cfced3519b8a` |
-| `tensorfold.patches` | `0019` | `0044` |
-| `tensorfold.tree` | `0882211e9e246e25b23eee4cb573eb4d8290977b` | `d33e2d93ea37f0b3ed1f208599a24ac00b3de16e` |
+| `tensorfold.patches` | `0022` | `0044` |
+| `tensorfold.tree` | `d5938b12bbcc1294e6a24600111cbd4c8d86f159` | `d33e2d93ea37f0b3ed1f208599a24ac00b3de16e` |
 
-RTX (`config/rtx/`) reuses the CUDA pin and series: `tensorfold.series` lists `cuda:0019 rtx:0002`, applied in that
+RTX (`config/rtx/`) reuses the CUDA pin and the series through `0019`: `tensorfold.series` lists `cuda:0019 rtx:0002`, applied in that
 order, and the result is checked against `8b937545caec6714b0d33b853c2bd31c9f2ab65f`.
 
 Both pins are on upstream `main` (2026-11-17); `038e4a278` is 36 commits older than `6d0a128b0`.
@@ -48,8 +48,9 @@ it is not the pin.
 | `0015` | `--spill-gib`'s evictions are not charged to the daily write budget |
 | `0016` | the CUDA disk tier's staging permit is sized for the longest kept state |
 | `0017`-`0019` | shared rounds' copy windows start at three rows and widen as copies land; never where rows are priced or for a drafter's proposals |
+| `0020`-`0022` | a shared round's copy rows fill the room left in the backend's 16-row tile (a round past it costs about twice as much), split across its chats by recent acceptance; a single chat and a drafter are unchanged |
 
-The tree after `0001`-`0019` is the served CUDA engine with the converter added: its `zig/` source is that build's,
+The tree after `0001`-`0022` is the served CUDA engine with the converter added: its `zig/` source is that build's,
 byte for byte, and the converter (`0008`) is the only difference. `zig/` after `0001`-`0007` is identical to the engine
 behind the 4-bit results; `0008` adds only `tools/`, and `0009` only
 reformats (no blank line at two files' ends, one double blank line, one struct field a line). Both trees as measured

@@ -1,0 +1,335 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Jay Leaton <58495321+jayleaton@users.noreply.github.com>
+Date: Wed, 18 Nov 2026 17:01:15 +0700
+Subject: [PATCH 20/22] lanes: a shared round's copy windows split its copy
+ budget over its copying streams
+
+Replaces the fixed three-copy start. Each shared round recomputes the copy rows it may verify (the measured shared width less each stream's pending row, else one window's max_copy) and splits them over the round's copying streams in proportion to each stream's decayed copied-row landing rate, none past max_copy, the rest by largest remainder. Two chats split 15 copies 8/7, four 4/4/4/3; a chat whose copies miss shrinks and drifts back toward the prior while it copies nothing. Lone rounds keep their width rule; priced proposers and allocate_shared_drafts rows are untouched.
+---
+ zig/src/core/lanes/copy_width.zig        | 115 ++++++++++++++++++-----
+ zig/src/core/lanes/drafted_copy_test.zig |  79 +++++++++++-----
+ zig/src/core/lanes/engine.zig            |  10 +-
+ 3 files changed, 158 insertions(+), 46 deletions(-)
+
+diff --git a/zig/src/core/lanes/copy_width.zig b/zig/src/core/lanes/copy_width.zig
+index eaaa0b5c2..6c83fda53 100644
+--- a/zig/src/core/lanes/copy_width.zig
++++ b/zig/src/core/lanes/copy_width.zig
+@@ -1,42 +1,111 @@
+-//! A stream's copy window: narrow at first, 2 w + 1 while every copied row lands, narrow again on a miss.
++//! A stream's copy window: alone, 2 w + 1 while copies land; shared, its rate-weighted part of the round's budget.
++const std = @import("std");
+ const Engine = @import("engine.zig").Engine;
+ const Stream = @import("stream.zig").Stream;
+ 
+-/// The current width for lone rounds and for rounds shared with other streams, kept apart (null: the first).
+-pub const Widths = struct { lone: ?u32 = null, shared: ?u32 = null };
++/// The lone width (null: cfg.first_copy), this round's shared part, and the copied rows' decayed landed and offered.
++pub const Widths = struct { lone: ?u32 = null, share: ?u32 = null, landed: f64 = 0, offered: f64 = 0 };
+ 
+-/// A shared round's first copy rows at most, as the narrow families' first_copy_rows (4 rows: 3 copies).
+-const shared_first = 3;
++/// Rows of cfg.copy_rate's prior in a landing rate, the weight its history keeps a copy, and a round without one.
++const prior_rows = 4;
++const copy_decay = 0.9;
++const round_decay = 0.98;
+ 
+-/// Which width a round grows: none for a priced proposer (a drafter) or allocate_shared_drafts rows.
+ const Kind = enum { lone, shared, priced };
+ 
++/// None for a priced proposer (a drafter) or where allocate_shared_drafts prices the rows: they keep cfg.first_copy.
+ fn kind(e: *const Engine, s: *const Stream) Kind {
+     if (s.proposer) |p| if (p.vtable.priced) return .priced;
+     return if (e.alone) .lone else if (e.cfg.allocate_shared_drafts) .priced else .shared;
+ }
+ 
+-/// The first width: a lone or priced stream's cfg.first_copy; an unpriced shared stream's no wider than shared_first.
+-pub fn first(e: *const Engine, s: *const Stream) u32 {
+-    return if (kind(e, s) == .shared) @min(e.cfg.first_copy, shared_first) else e.cfg.first_copy;
+-}
+-
+ /// The copies this round may propose.
+ pub fn current(e: *const Engine, s: *const Stream) u32 {
+-    const width: ?u32 = switch (kind(e, s)) {
+-        .lone => s.copy_width.lone,
+-        .shared => s.copy_width.shared,
+-        .priced => null,
++    return switch (kind(e, s)) {
++        .lone => s.copy_width.lone orelse e.cfg.first_copy,
++        .shared => s.copy_width.share orelse e.cfg.first_copy,
++        .priced => e.cfg.first_copy,
+     };
+-    return width orelse first(e, s);
+ }
+ 
+-/// After a copy window: widen it when all its own rows landed, else back to the first width.
+-pub fn observe(e: *const Engine, s: *Stream, whole: bool) void {
+-    const next = if (whole) @min(e.cfg.max_copy, 2 * current(e, s) + 1) else first(e, s);
+-    switch (kind(e, s)) {
+-        .lone => s.copy_width.lone = next,
+-        .shared => s.copy_width.shared = next,
+-        .priced => {},
++/// The stream's copied rows' landing rate, drifting back to cfg.copy_rate while it copies nothing.
++pub fn rate(e: *const Engine, s: *const Stream) f64 {
++    const w = s.copy_width;
++    return (w.landed + prior_rows * e.cfg.copy_rate) / (w.offered + prior_rows);
++}
++
++/// After a copy window of `own` rows, `kept` landing: its rate's history, and the lone width doubled or reset.
++pub fn observe(e: *const Engine, s: *Stream, kept: usize, own: usize) void {
++    const k = kind(e, s);
++    if (k == .priced) return;
++    const w = &s.copy_width;
++    w.landed = copy_decay * w.landed + @as(f64, @floatFromInt(kept));
++    w.offered = copy_decay * w.offered + @as(f64, @floatFromInt(own));
++    if (k == .lone) w.lone = if (kept == own) @min(e.cfg.max_copy, 2 * current(e, s) + 1) else e.cfg.first_copy;
++}
++
++/// A round's copy rows: the measured shared width less each stream's pending row, else one window's.
++pub fn budget(e: *const Engine, streams: usize, sampled: bool) u64 {
++    const most = streams * (1 + @as(u64, e.cfg.max_copy));
++    const measured = @min(e.rule.row_cost.leastRows(streams, sampled), most);
++    return if (measured > streams) measured - streams else e.cfg.max_copy;
++}
++
++/// Each copying stream's part of this round's budget by landing rate, none past cfg.max_copy; the others' none.
++pub fn share(e: *Engine, round: []const *Stream, sampled: bool) !void {
++    const a = e.arena.allocator();
++    var copying: std.ArrayList(*Stream) = .empty;
++    for (round) |s| {
++        s.copy_width.share = null;
++        s.copy_width.landed *= round_decay;
++        s.copy_width.offered *= round_decay;
++        if (s.drafts and kind(e, s) == .shared) try copying.append(a, s);
++    }
++    if (copying.items.len == 0) return;
++    const weights = try a.alloc(f64, copying.items.len);
++    for (weights, copying.items) |*w, s| w.* = rate(e, s);
++    const parts = try a.alloc(u32, copying.items.len);
++    split(budget(e, round.len, sampled), weights, e.cfg.max_copy, parts);
++    for (copying.items, parts) |s, p| s.copy_width.share = p;
++}
++
++/// `total` by `weights`, no part past `most` (its excess to the rest), the leftover rows by largest remainder.
++pub fn split(total: u64, weights: []const f64, most: u32, out: []u32) void {
++    @memset(out, 0);
++    var left = total;
++    var capped = true;
++    while (capped and left > 0) {
++        capped = false;
++        const sum = openWeight(weights, out, most);
++        if (sum <= 0) return;
++        for (weights, out) |w, *o| if (o.* < most and @as(f64, @floatFromInt(left)) * w / sum >= @as(f64, @floatFromInt(most))) {
++            o.* = most;
++            left -= most;
++            capped = true;
++        };
++    }
++    const sum = openWeight(weights, out, most);
++    if (sum <= 0 or left == 0) return;
++    const pool: f64 = @floatFromInt(left);
++    for (weights, out) |w, *o| if (o.* < most) {
++        o.* = @intFromFloat(@floor(pool * w / sum));
++        left -= o.*;
++    };
++    while (left > 0) : (left -= 1) {
++        var best: ?usize = null;
++        var gap: f64 = -std.math.inf(f64);
++        for (weights, out, 0..) |w, o, i| if (o < most and pool * w / sum - @as(f64, @floatFromInt(o)) > gap) {
++            gap = pool * w / sum - @as(f64, @floatFromInt(o));
++            best = i;
++        };
++        out[best orelse return] += 1;
+     }
+ }
++
++fn openWeight(weights: []const f64, out: []const u32, most: u32) f64 {
++    var sum: f64 = 0;
++    for (weights, out) |w, o| if (o < most) {
++        sum += w;
++    };
++    return sum;
++}
+diff --git a/zig/src/core/lanes/drafted_copy_test.zig b/zig/src/core/lanes/drafted_copy_test.zig
+index ff8820be6..b6d81a20c 100644
+--- a/zig/src/core/lanes/drafted_copy_test.zig
++++ b/zig/src/core/lanes/drafted_copy_test.zig
+@@ -176,34 +176,65 @@ test "plain_streams: a family's row policy keeps copies below the switch, and no
+     }
+ }
+ 
+-test "copy width: an unpriced shared stream starts at three copies, grows to 2 w + 1 while they land, narrows on a miss" {
++test "copy width: a round's copy budget splits over its copying streams by landing rate, none past max_copy" {
+     const cw = @import("copy_width.zig");
+-    var cfg = try Config.init(gpa, .{ .exact_width = 16, .hidden_rows = true, .batch_rows = 32 }, 16, 15);
++    var out: [4]u32 = undefined;
++    cw.split(15, &.{1}, 15, out[0..1]);
++    try std.testing.expectEqualSlices(u32, &.{15}, out[0..1]);
++    cw.split(15, &.{ 1, 1 }, 15, out[0..2]);
++    try std.testing.expectEqualSlices(u32, &.{ 8, 7 }, out[0..2]);
++    cw.split(15, &.{ 1, 1, 1, 1 }, 15, out[0..4]);
++    try std.testing.expectEqualSlices(u32, &.{ 4, 4, 4, 3 }, out[0..4]);
++    cw.split(15, &.{ 0.9, 0.3 }, 15, out[0..2]);
++    try std.testing.expectEqualSlices(u32, &.{ 11, 4 }, out[0..2]);
++    cw.split(20, &.{ 0.9, 0.1 }, 15, out[0..2]);
++    try std.testing.expectEqualSlices(u32, &.{ 15, 5 }, out[0..2]);
++    cw.split(40, &.{ 0.5, 0.5 }, 15, out[0..2]);
++    try std.testing.expectEqualSlices(u32, &.{ 15, 15 }, out[0..2]);
++}
++
++test "copy width: shares follow the round's chats as they join and leave, a missing chat's shrinks, a lone chat's is unchanged" {
++    const cw = @import("copy_width.zig");
++    var cfg = try Config.init(gpa, .{ .exact_width = 16, .first_copy_rows = 4, .hidden_rows = true, .batch_rows = 32 }, 16, 15);
+     defer cfg.deinit(gpa);
+     var target: fake.Fake = .{ .gpa = gpa };
+     defer target.deinit();
+     var clock: fake.FixedClock = .{};
+     var e = Engine.init(gpa, &cfg, target.backend(), clock.clock());
+     defer e.deinit();
+-    var s = try sm.Stream.init(gpa, .{ .id = "s", .prompt = &.{ 1, 2 }, .max_new = 64 });
+-    defer s.deinit(gpa);
++    var streams: [4]sm.Stream = undefined;
++    for (&streams) |*s| s.* = try sm.Stream.init(gpa, .{ .id = "s", .prompt = &.{ 1, 2 }, .max_new = 64, .drafts = true });
++    defer for (&streams) |*s| s.deinit(gpa);
++    var round: [4]*sm.Stream = undefined;
++    for (&round, &streams) |*r, *s| r.* = s;
++    var parts: [4]u32 = undefined;
+     e.alone = false;
+-    var widths: [5]u32 = undefined;
+-    for (&widths) |*w| {
+-        w.* = cw.current(&e, &s);
+-        cw.observe(&e, &s, true);
++    for ([_]usize{ 2, 4, 2 }, [_][]const u32{ &.{ 8, 7 }, &.{ 4, 4, 4, 3 }, &.{ 8, 7 } }) |n, want| {
++        _ = e.arena.reset(.retain_capacity);
++        try cw.share(&e, round[0..n], false);
++        for (parts[0..n], round[0..n]) |*p, s| p.* = cw.current(&e, s);
++        try std.testing.expectEqualSlices(u32, want, parts[0..n]);
+     }
+-    try std.testing.expectEqualSlices(u32, &.{ 3, 7, 15, 15, 15 }, &widths);
+-    cw.observe(&e, &s, false);
+-    try std.testing.expectEqual(@as(u32, 3), cw.current(&e, &s));
+-    // a lone round keeps its own width, from cfg.first_copy
++    for (0..4) |_| cw.observe(&e, &streams[1], 0, 7);
++    try cw.share(&e, round[0..2], false);
++    try std.testing.expect(cw.current(&e, &streams[0]) >= 12 and cw.current(&e, &streams[0]) + cw.current(&e, &streams[1]) == 15);
++    for (0..200) |_| try cw.share(&e, round[0..2], false);
++    try std.testing.expectEqualSlices(u32, &.{ 8, 7 }, &.{ cw.current(&e, &streams[0]), cw.current(&e, &streams[1]) });
++    var lone = try sm.Stream.init(gpa, .{ .id = "lone", .prompt = &.{ 1, 2 }, .max_new = 64, .drafts = true });
++    defer lone.deinit(gpa);
+     e.alone = true;
+-    try std.testing.expectEqual(cfg.first_copy, cw.current(&e, &s));
+-    // where allocate_shared_drafts prices shared rows, a shared copy keeps cfg.first_copy and never grows
++    var widths: [4]u32 = undefined;
++    for (&widths) |*w| {
++        w.* = cw.current(&e, &lone);
++        cw.observe(&e, &lone, w.*, w.*);
++    }
++    try std.testing.expectEqualSlices(u32, &.{ 3, 7, 15, 15 }, &widths);
++    cw.observe(&e, &lone, 1, 15);
++    try std.testing.expectEqual(@as(u32, 3), cw.current(&e, &lone));
+     e.alone = false;
+     cfg.allocate_shared_drafts = true;
+-    cw.observe(&e, &s, true);
+-    try std.testing.expectEqual(cfg.first_copy, cw.current(&e, &s));
++    try cw.share(&e, round[0..2], false);
++    try std.testing.expectEqual(cfg.first_copy, cw.current(&e, &streams[0]));
+ }
+ 
+ test "copy width: a priced proposer (a loaded drafter) drafts max_copy in shared rounds and never grows a width" {
+@@ -225,7 +256,7 @@ test "copy width: a priced proposer (a loaded drafter) drafts max_copy in shared
+         for ([_]bool{ true, false, true }) |whole| {
+             const c = try win.copyProposal(&e, &s);
+             try std.testing.expectEqual(@as(usize, @intCast(@min(@as(i64, cfg.max_copy), s.draftRoom() - 1))), c.tokens.len);
+-            cw.observe(&e, &s, whole);
++            cw.observe(&e, &s, if (whole) c.tokens.len else 0, c.tokens.len);
+             try std.testing.expectEqual(cw.Widths{}, s.copy_width);
+         }
+     }
+@@ -261,6 +292,7 @@ const SharedCopies = struct {
+     var streams: [2]?*sm.Stream = @splat(null);
+     var widths: [2][64]usize = undefined;
+     var lens: [2]usize = @splat(0);
++    var widest_round: usize = 0;
+ 
+     fn slot(s: *sm.Stream) usize {
+         for (&streams, 0..) |*x, i| if (x.* == null or x.* == s) {
+@@ -271,8 +303,11 @@ const SharedCopies = struct {
+     }
+ 
+     fn verify(ptr: *anyopaque, windows: []const be.Window, out: []be.Verified) anyerror!void {
++        var round: usize = 0;
++        defer widest_round = @max(widest_round, round);
+         if (windows.len >= 2) for (windows) |w| {
+             if (w.held > 0 or w.tokens.len == 0) continue;
++            round += w.tokens.len;
+             const i = slot(w.stream);
+             widths[i][lens[i]] = w.tokens.len;
+             lens[i] += 1;
+@@ -284,6 +319,7 @@ const SharedCopies = struct {
+ fn echoRun(drafts: bool, tokens: *[2][64]u32, lens: *[2]usize) !void {
+     SharedCopies.streams = @splat(null);
+     SharedCopies.lens = @splat(0);
++    SharedCopies.widest_round = 0;
+     var target: fake.Fake = .{ .gpa = gpa };
+     defer target.deinit();
+     var seen = target.backend();
+@@ -308,7 +344,7 @@ fn echoRun(drafts: bool, tokens: *[2][64]u32, lens: *[2]usize) !void {
+     }
+ }
+ 
+-test "shared rounds: copy windows start at three rows and widen as copies land; replies equal one-token decode" {
++test "shared rounds: two chats split one window's copies and widen past three; replies equal one-token decode" {
+     var plain: [2][64]u32 = undefined;
+     var plain_lens: [2]usize = undefined;
+     try echoRun(false, &plain, &plain_lens);
+@@ -319,10 +355,9 @@ test "shared rounds: copy windows start at three rows and widen as copies land;
+     var widest: usize = 0;
+     var windows: usize = 0;
+     for (&SharedCopies.widths, SharedCopies.lens) |*widths, n| {
+-        if (n == 0) continue;
+-        try std.testing.expectEqual(@as(usize, 3), widths[0]);
+-        widest = @max(widest, std.mem.max(usize, widths[0..n]));
++        widest = @max(widest, if (n > 0) std.mem.max(usize, widths[0..n]) else 0);
+         windows += n;
+     }
+-    try std.testing.expect(windows >= 2 and widest > 3);
++    try std.testing.expect(windows >= 2 and widest > 3 and widest <= 8);
++    try std.testing.expect(SharedCopies.widest_round <= 15);
+ }
+diff --git a/zig/src/core/lanes/engine.zig b/zig/src/core/lanes/engine.zig
+index ecaa46b34..50e7a73c4 100644
+--- a/zig/src/core/lanes/engine.zig
++++ b/zig/src/core/lanes/engine.zig
+@@ -146,8 +146,10 @@ pub const Engine = struct {
+             const chosen = try e.takeTurns(live.items);
+             e.shared_rounds += 1;
+             for (chosen) |s| s.served = e.shared_rounds;
++            try copyShares(e, chosen);
+             try e.roundStreams(chosen);
+         } else {
++            if (!e.alone) try copyShares(e, live.items);
+             for (live.items) |s| {
+                 // logprobs and grammars take verify windows: rows' logits are read, or bits made, before a forward
+                 const windowed = (e.cfg.family_mtp and s.drafts) or !e.cfg.pipelined or s.logprobs != null or s.grammar != null;
+@@ -160,6 +162,12 @@ pub const Engine = struct {
+         try trail.state(e);
+     }
+ 
++    fn copyShares(e: *Engine, round: []const *Stream) !void {
++        var sampled = false;
++        for (round) |s| sampled = sampled or s.sampling != null;
++        try @import("copy_width.zig").share(e, round, sampled);
++    }
++
+     /// Least recently served streams within the stream and row limits, never cutting pending or forced rows.
+     fn takeTurns(e: *Engine, live: []*Stream) ![]*Stream {
+         const a = e.arena.allocator();
+@@ -289,7 +297,7 @@ pub const Engine = struct {
+                 const own: usize = own_end - 1;
+                 if (p.kind == .copy) {
+                     win.observeCopied(e, s, p.recalled, own_kept, own);
+-                    @import("copy_width.zig").observe(e, s, own_kept == own);
++                    @import("copy_width.zig").observe(e, s, own_kept, own);
+                 } else if (p.kind == .head) {
+                     if (p.lanes) |l| if (s.odds != null) s.observeLanes(l, path);
+                     const ds = try accept.depths(a, parents);

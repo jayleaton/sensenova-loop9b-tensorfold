@@ -1,0 +1,76 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Jay Leaton <58495321+jayleaton@users.noreply.github.com>
+Date: Wed, 18 Nov 2026 17:05:15 +0700
+Subject: [PATCH 21/22] lanes: a shared round's copy rows scale with its
+ copying streams' mean landing rate
+
+The split always spent the whole budget, so streams whose copies all missed kept wide windows. The round now splits the budget times the copying streams' mean landing rate: 2 fresh chats get 7/7 of 15, 4 get 4/4/3/3, a chat whose copies missed falls to 1 beside a landing one and recovers as its rate drifts back to the prior.
+---
+ zig/src/core/lanes/copy_width.zig        | 11 ++++++++---
+ zig/src/core/lanes/drafted_copy_test.zig |  8 ++++----
+ 2 files changed, 12 insertions(+), 7 deletions(-)
+
+diff --git a/zig/src/core/lanes/copy_width.zig b/zig/src/core/lanes/copy_width.zig
+index 6c83fda53..302e3f187 100644
+--- a/zig/src/core/lanes/copy_width.zig
++++ b/zig/src/core/lanes/copy_width.zig
+@@ -51,7 +51,7 @@ pub fn budget(e: *const Engine, streams: usize, sampled: bool) u64 {
+     return if (measured > streams) measured - streams else e.cfg.max_copy;
+ }
+ 
+-/// Each copying stream's part of this round's budget by landing rate, none past cfg.max_copy; the others' none.
++/// The budget times the copying streams' mean landing rate, split by their rates, none past cfg.max_copy.
+ pub fn share(e: *Engine, round: []const *Stream, sampled: bool) !void {
+     const a = e.arena.allocator();
+     var copying: std.ArrayList(*Stream) = .empty;
+@@ -63,9 +63,14 @@ pub fn share(e: *Engine, round: []const *Stream, sampled: bool) !void {
+     }
+     if (copying.items.len == 0) return;
+     const weights = try a.alloc(f64, copying.items.len);
+-    for (weights, copying.items) |*w, s| w.* = rate(e, s);
++    var sum: f64 = 0;
++    for (weights, copying.items) |*w, s| {
++        w.* = rate(e, s);
++        sum += w.*;
++    }
++    const landing = @min(1, sum / @as(f64, @floatFromInt(copying.items.len)));
+     const parts = try a.alloc(u32, copying.items.len);
+-    split(budget(e, round.len, sampled), weights, e.cfg.max_copy, parts);
++    split(@intFromFloat(@round(landing * @as(f64, @floatFromInt(budget(e, round.len, sampled))))), weights, e.cfg.max_copy, parts);
+     for (copying.items, parts) |s, p| s.copy_width.share = p;
+ }
+ 
+diff --git a/zig/src/core/lanes/drafted_copy_test.zig b/zig/src/core/lanes/drafted_copy_test.zig
+index b6d81a20c..2ec7fe6ff 100644
+--- a/zig/src/core/lanes/drafted_copy_test.zig
++++ b/zig/src/core/lanes/drafted_copy_test.zig
+@@ -193,7 +193,7 @@ test "copy width: a round's copy budget splits over its copying streams by landi
+     try std.testing.expectEqualSlices(u32, &.{ 15, 15 }, out[0..2]);
+ }
+ 
+-test "copy width: shares follow the round's chats as they join and leave, a missing chat's shrinks, a lone chat's is unchanged" {
++test "copy width: shares follow the round's chats as they join and leave, a missing chat's shrinks and recovers, a lone chat's is unchanged" {
+     const cw = @import("copy_width.zig");
+     var cfg = try Config.init(gpa, .{ .exact_width = 16, .first_copy_rows = 4, .hidden_rows = true, .batch_rows = 32 }, 16, 15);
+     defer cfg.deinit(gpa);
+@@ -209,7 +209,7 @@ test "copy width: shares follow the round's chats as they join and leave, a miss
+     for (&round, &streams) |*r, *s| r.* = s;
+     var parts: [4]u32 = undefined;
+     e.alone = false;
+-    for ([_]usize{ 2, 4, 2 }, [_][]const u32{ &.{ 8, 7 }, &.{ 4, 4, 4, 3 }, &.{ 8, 7 } }) |n, want| {
++    for ([_]usize{ 2, 4, 2 }, [_][]const u32{ &.{ 7, 7 }, &.{ 4, 4, 3, 3 }, &.{ 7, 7 } }) |n, want| {
+         _ = e.arena.reset(.retain_capacity);
+         try cw.share(&e, round[0..n], false);
+         for (parts[0..n], round[0..n]) |*p, s| p.* = cw.current(&e, s);
+@@ -217,9 +217,9 @@ test "copy width: shares follow the round's chats as they join and leave, a miss
+     }
+     for (0..4) |_| cw.observe(&e, &streams[1], 0, 7);
+     try cw.share(&e, round[0..2], false);
+-    try std.testing.expect(cw.current(&e, &streams[0]) >= 12 and cw.current(&e, &streams[0]) + cw.current(&e, &streams[1]) == 15);
++    try std.testing.expectEqualSlices(u32, &.{ 7, 1 }, &.{ cw.current(&e, &streams[0]), cw.current(&e, &streams[1]) });
+     for (0..200) |_| try cw.share(&e, round[0..2], false);
+-    try std.testing.expectEqualSlices(u32, &.{ 8, 7 }, &.{ cw.current(&e, &streams[0]), cw.current(&e, &streams[1]) });
++    try std.testing.expectEqualSlices(u32, &.{ 7, 6 }, &.{ cw.current(&e, &streams[0]), cw.current(&e, &streams[1]) });
+     var lone = try sm.Stream.init(gpa, .{ .id = "lone", .prompt = &.{ 1, 2 }, .max_new = 64, .drafts = true });
+     defer lone.deinit(gpa);
+     e.alone = true;
