@@ -3,7 +3,8 @@
 On CUDA, TensorFold serves a converted checkpoint: a plain BF16 Qwen3.5 tree is decision-only there and is refused for
 serving. On Metal, the dense loader reads BF16 too, but the measured profile serves 4-bit. Both backends load the same
 converted tree. The converter is `tools/sensenova_loop_mlx.py`, carried in both patch series
-(`patches/cuda/0008`, `patches/metal/0002`-`0004`), so it is in every patched engine checkout.
+(`patches/cuda/0008`, `patches/metal/0002`-`0004` and `0026`), so it is in every patched engine checkout. The Metal
+copy also writes the vision tower; the CUDA copy is text only until CUDA images are qualified.
 
 ## Commands
 
@@ -32,7 +33,8 @@ To test the norm classification: `cd ENGINE/tools && python3 -m pytest sensenova
 | `A_log`, `dt_bias` (f32) | bf16 |
 | mHC routers `mhc_attn`, `mhc_ffn` | fp32, unchanged |
 | names | `model.language_model.*` to `language_model.model.*`, `lm_head.*` to `language_model.lm_head.*` |
-| `model.visual.*`, `loop_gate.logits` | left out: the vision tower is not served yet, and the loop gate is unused |
+| `model.visual.*` | Metal series (`0026`): `vision_tower.*`, 333 tensors in bf16, unquantized (0.85 GiB); CUDA series: left out |
+| `loop_gate.logits` | left out: unused at inference |
 
 Codes follow `zig/src/core/affine4_host.zig`'s `quantizeMlx` word for word: the group edge with the larger magnitude
 sets the signed scale and the bias, the step is `(max - min) / (2^bits - 1)`, and codes round half away from zero.

@@ -7,8 +7,8 @@ patch series applied in order. The pin, the series length and the resulting tree
 | --- | --- | --- |
 | `tensorfold.repo` | `https://github.com/ashhart/TensorFold.git` | same |
 | `tensorfold.rev` | `038e4a27872eaa018adc67b1b5ddffd16820c498` | `6d0a128b0cde35aa091bda933577cfced3519b8a` |
-| `tensorfold.patches` | `0009` | `0026` |
-| `tensorfold.tree` | `31714680052c2be236d6162d450c96b1f61f3bb6` | `f882fabdaefda68b13e03fb2eba66390d7a15942` |
+| `tensorfold.patches` | `0009` | `0034` |
+| `tensorfold.tree` | `31714680052c2be236d6162d450c96b1f61f3bb6` | `4a9c746f081054a4bc8837ac101d53306f26db81` |
 
 Both pins are on upstream `main` (2026-11-17); `038e4a278` is 36 commits older than `6d0a128b0`.
 `scripts/fetch-engine.sh BACKEND DEST [SOURCE]` fetches the pin, applies `patches/BACKEND/0001`..`LAST` with `git am`
@@ -40,9 +40,9 @@ it is not the pin.
 
 `zig/` after `0001`-`0007` is identical to the measured CUDA engine; `0008` adds only `tools/`, and `0009` only
 reformats (no blank line at two files' ends, one double blank line, one struct field a line). Both trees as measured
-failed `zig fmt --check`; CUDA `0009` and Metal `0026` are that rewrite, and each leaves every source token unchanged.
+failed `zig fmt --check`; CUDA `0009` and Metal `0034` are that rewrite, and each leaves every source token unchanged.
 
-## Metal series, `patches/metal/` (29 files, +2045 / -67)
+## Metal series, `patches/metal/` (34 files, +2356 / -71)
 
 | patch | change |
 | --- | --- |
@@ -58,7 +58,19 @@ failed `zig fmt --check`; CUDA `0009` and Metal `0026` are that rewrite, and eac
 | `0018`, `0019`, `0021`, `0025` | `docs/recipes/sensenova-loop-9b-metal.md`: the recipe, its noise floor, the router's cost and cold prefill |
 | `0020`, `0023`, `0024` | the router's outputs side by side, the router and the merge with two streams fixed at compile time; each bit-identical |
 | `0022` | `tools/router_fp64.py`: the router's FP64 reference and the reduction orders it admits |
-| `0026` | formatting and comments only, the same tokens: four `qwen27` files as `zig fmt` writes them |
+| `0026` | the converter carries the vision tower: `model.visual.*` as `vision_tower.*`, 333 tensors in bf16 |
+| `0027` | `tools/vision_golden.py`: the transformers side of the vision checks |
+| `0028`, `0033` | the recipe's `## Images` section: serving, tower parity, what it reads, speed with an image |
+| `0029`, `0030` | dump the tower's merged rows and each block's residual (`TF_QWEN_VISION_DUMP`, `TF_QWEN_VISION_BLOCKS`) |
+| `0031` | initialise the vision dump at load (a struct default never applies to the tower; an image request segfaulted) |
+| `0032` | dump the prompt's M-RoPE planes (`TF_QWEN_ROPE_DUMP`) for a `get_rope_index` check |
+| `0034` | formatting and comments only, the same tokens: four `qwen27` files as `zig fmt` writes them |
+
+`0001`-`0025` are the archive's `sensenova/loop9b-metal-prefill` (`79222dc1a`); `0026`-`0033` are
+`sensenova/loop9b-metal-vision` (`12b5090b8`), which forked before the last three prefill commits, replayed on top.
+Their engine source equals the vision branch's plus the prefill branch's router and merge kernels. Two changes from the
+archive: the 28 dump files the vision branch committed (`vision-*.bin`, 36 MB of activations) are left out, and the
+recipe keeps the prefill branch's M5 Ultra wording where the vision branch's text still said M3 Ultra.
 
 Each patch is one engine commit with its own message. TensorFold asks for one change per pull request, a kernel-contract
 `SUMMARY` for each new GPU kernel, zero new lean-checker findings and an FP64 reference for any changed reduction

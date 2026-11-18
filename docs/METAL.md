@@ -7,9 +7,9 @@ checkpoint. The series also carries the recipe TensorFold keeps for it,
 | | |
 | --- | --- |
 | Hardware | Mac Studio M5 Ultra, macOS 27.2 |
-| Engine | upstream TensorFold `6d0a128b0cde35aa091bda933577cfced3519b8a` (on `main`, 2026-11-17) + [`patches/metal/`](../patches/metal/) `0001`-`0026` |
-| Engine tree | `f882fabdaefda68b13e03fb2eba66390d7a15942`: the measured engine (`0001`-`0025`) with `0026`'s formatting fixes, token for token the same code |
-| Weights | MLX affine 4-bit g64 ([CONVERT](CONVERT.md)) |
+| Engine | upstream TensorFold `6d0a128b0cde35aa091bda933577cfced3519b8a` (on `main`, 2026-11-17) + [`patches/metal/`](../patches/metal/) `0001`-`0034` |
+| Engine tree | `4a9c746f081054a4bc8837ac101d53306f26db81`: the measured text engine (`0001`-`0025`), the image path (`0026`-`0033`) and `0034`'s formatting fixes |
+| Weights | MLX affine 4-bit g64, vision tower bf16 ([CONVERT](CONVERT.md)) |
 
 ## Build
 
@@ -36,13 +36,75 @@ engine-metal/zig-out/native/bin/tensorfold-native serve loop9b-mlx4 --name loop9
   --context 2048 --prompt-cache-gib 0 --no-drafts
 ```
 
-Load takes about 1.7 s for 4.72 GiB of weights. Startup logs the plan:
+The converted tree carries the vision tower (5.57 GiB in all); without `--vision` the tower is not loaded. The text
+numbers below were measured on a text-only tree of 4.72 GiB. Load takes about 1.7 s for 4.72 GiB of weights. Startup logs the plan:
 `build: plan.linear 42 slots 8 cap 2048 steps 56 mhc true`; each visit owns its KV and recurrent state, 14 attention
 and 42 linear slots. Raise `--context` for longer prompts; admission caps it at 262,144 although the checkpoint
 advertises 524,288 positions.
 
 `--no-drafts` is the only supported mode: the checkpoint ships no drafter, and the loop's second visit is not a
 speculative path. Do not enable MTP or DFlash2 against it.
+
+## Images
+
+Image input is supported on Metal. The checkpoint's 27-block Qwen3.5-VL tower (hidden 1152, 16 heads of 72,
+intermediate 4304, a conv3d patch embed `[1152, 3, 2, 16, 16]`, merge 2, merger to 4096) is the tower TensorFold
+already reads for Qwen3.8-27B, at this model's 4096 output width. The engine's existing `core/qwen_vl` reader takes it;
+no tower kernel is new.
+
+```bash
+PROFILE=vision scripts/serve.sh metal engine-metal loop9b-mlx4
+# engine-metal/zig-out/native/bin/tensorfold-native serve loop9b-mlx4 --name loop9b --port 8090 \
+#   --context 4096 --prompt-cache-gib 0 --no-drafts --vision
+```
+
+An OpenAI `image_url` part works as-is. PNG needs nothing; JPEG needs libjpeg-turbo 3.1.4.1
+(`TENSORFOLD_LIBTURBOJPEG`). `--vision` loads the tower with 1.78 GiB of scratch for 4096 image tokens a request.
+Image rows enter at the embedding, and the loop and mHC then run over the whole sequence, image rows included. Every
+row of one image shares a single text position and walks its merge grid in M-RoPE's `h` and `w`; text after the image
+resumes past the grid's larger side.
+
+### Tower parity
+
+Against transformers on the same checkpoint, a chart resized to 16x36 patches (144 merged rows):
+
+| comparison | max | mean | cosine |
+| --- | ---: | ---: | ---: |
+| engine vs transformers bf16 | 3.63 | 3.9e-03 | **0.99869** |
+| transformers bf16 vs transformers fp32 (the noise floor) | 3.86 | 4.2e-03 | 0.99784 |
+| engine vs transformers fp32 | 1.64 | 2.7e-03 | 0.99952 |
+
+The engine is closer to the fp32 reference than the bf16 reference is, so the remainder is accumulation order, not a
+port defect. All 27 blocks are checked the same way: engine rms tracks the reference within 0.2% at every block, and
+per-block cosine stays at or above 0.9989. Nothing steps; the last block's absolute error rises only because the
+tower's own activations rise there (reference rms 1.5 to 186). The M-RoPE positions equal `get_rope_index` on
+**513 of 513 cells**: all three axes over all 171 prompt rows, image rows and the text after them.
+
+### What it reads
+
+Asked for the labels on a chart of this model's release benchmarks, it reads all seven: AutomationBench,
+Terminal-Bench 2.1, NL2Repo, AIDA-Bench, BIRD, x²-Banking, GAIA. The known limitation: asked to name *models* on a
+chart that has no model legend, it answers with names that are not on it, where the reference declines.
+
+### Speed with an image
+
+| metric | value |
+| --- | ---: |
+| prompt tokens | 164 (144 image rows + 20 text) |
+| prefill | 1,397-1,519 tok/s |
+| TTFT | 0.11-0.12 s |
+| decode | 30.7 tok/s |
+
+An image costs prefill in proportion to its rows. These numbers were taken before the router and merge changes
+(`0023`, `0024`) that brought text decode from 33 to 60 tok/s, and they have not been re-measured on this engine.
+
+### Dumps and one fix
+
+`TF_QWEN_VISION_DUMP=1` writes an image's merged rows, `TF_QWEN_VISION_BLOCKS=1` each block's residual and
+`TF_QWEN_ROPE_DUMP=1` the prompt's `(t, h, w)` planes, all beside the server and off by default. The tower is created
+with `gpa.create` and assigned field by field, so a struct default never applies: a dump field left out segfaulted
+an image request until `0031` initialised it at load. `tools/vision_golden.py` is the transformers side of these
+checks.
 
 ## Results
 
@@ -108,7 +170,8 @@ Decode is 60 tok/s against 83 for 56 executions without the window; at one row t
 
 ### Not covered
 
-- Images and video: the vision tower is not converted or loaded, and image parts are refused ([In progress](../README.md#in-progress)).
+- Video: the processor's video path is not wired, and video parts are refused.
+- More than one image a request: the path is written for it, untested here.
 - Contexts past 262,144 tokens.
 - Concurrent streams: every Metal number here is one stream.
 - Other Apple chips.

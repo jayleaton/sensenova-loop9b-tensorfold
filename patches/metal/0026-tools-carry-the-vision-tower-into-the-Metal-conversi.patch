@@ -1,0 +1,44 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Jay Leaton <58495321+jayleaton@users.noreply.github.com>
+Date: Wed, 18 Nov 2026 08:59:52 +0800
+Subject: [PATCH 26/34] tools: carry the vision tower into the Metal conversion
+
+The 4-bit conversion dropped model.visual.*, so --vision had no tower to load.
+The 333 tensor tower is Qwen3.5-VL's and qwen_vl reads it through the mlx-vlm
+prefix vision_tower.* in bf16 only, from the shard headers the index names.
+Names are rewritten to that prefix and the tower stays bf16 while the language
+model stays affine 4-bit: 1356 tensors, 5.57 GiB.
+
+Verified on this Mac: --vision loads the tower, 1.78 GiB with scratch for 4096
+image tokens.
+---
+ tools/sensenova_loop_mlx.py | 9 ++++++++-
+ 1 file changed, 8 insertions(+), 1 deletion(-)
+
+diff --git a/tools/sensenova_loop_mlx.py b/tools/sensenova_loop_mlx.py
+index 59de53100..2cb742c75 100644
+--- a/tools/sensenova_loop_mlx.py
++++ b/tools/sensenova_loop_mlx.py
+@@ -18,7 +18,7 @@ import torch
+ from safetensors import safe_open
+ from safetensors.torch import save_file
+ 
+-SKIP_PREFIXES = ("model.visual.", "model.language_model.loop_gate.")
++SKIP_PREFIXES = ("model.language_model.loop_gate.",)
+ QUANT_SUFFIXES = (
+     "embed_tokens.weight",
+     "lm_head.weight",
+@@ -136,6 +136,13 @@ def main():
+             if shard_file not in handles:
+                 handles[shard_file] = safe_open(os.path.join(args.source, shard_file), "pt")
+             t = handles[shard_file].get_tensor(name).contiguous()
++            # the vision tower keeps its checkpoint names: qwen_vl weights reads model.visual.* in bf16
++            if name.startswith("model.visual."):
++                # qwen_vl's loader scans the mlx-vlm prefix and reads bf16 only
++                pending["vision_tower." + name[len("model.visual."):]] = t if t.dtype == torch.bfloat16 else t.to(torch.bfloat16)
++                if sum(v.numel() * v.element_size() for v in pending.values()) >= args.shard_bytes:
++                    flush()
++                continue
+             out = name.replace("model.language_model.", "language_model.model.")
+             if name.startswith("lm_head."):
+                 out = name.replace("lm_head.", "language_model.lm_head.", 1)

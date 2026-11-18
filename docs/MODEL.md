@@ -42,6 +42,7 @@ additions TensorFold had not executed on that family: a shared-weight loop and a
 | BF16 checkpoint (text, vision, fp32 routers) | 17.53 GiB |
 | MLX affine 8-bit g64, text only | 9.3-9.7 GiB |
 | MLX affine 4-bit g64, text only | 4.7-5.6 GiB (measured trees: 4.72 GiB on Metal, 5.55 GiB on CUDA) |
+| MLX affine 4-bit g64 with the bf16 vision tower | 5.57 GiB (Metal) |
 | KV per token, bf16 | 56 KiB (14 attention executions x 4 heads x 256 x K,V x 2 B) |
 | recurrent state per stream | about 90 MiB (42 Gated DeltaNet executions), constant in context |
 

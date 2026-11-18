@@ -1,0 +1,52 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Jay Leaton <58495321+jayleaton@users.noreply.github.com>
+Date: Wed, 18 Nov 2026 09:31:43 +0800
+Subject: [PATCH 28/34] docs: the image path in the recipe
+
+Names the tower's shape, that it is the same one TensorFold already reads at this
+model's width, and the one non-obvious mapping: qwen_vl finds it through the
+mlx-vlm vision_tower.* prefix in bf16, so the converter rewrites and leaves those
+333 tensors unquantized. Video stays out of scope.
+---
+ docs/recipes/sensenova-loop-9b-metal.md | 21 ++++++++++++++++++++-
+ 1 file changed, 20 insertions(+), 1 deletion(-)
+
+diff --git a/docs/recipes/sensenova-loop-9b-metal.md b/docs/recipes/sensenova-loop-9b-metal.md
+index 72bbd67af..ee23ac094 100644
+--- a/docs/recipes/sensenova-loop-9b-metal.md
++++ b/docs/recipes/sensenova-loop-9b-metal.md
+@@ -55,6 +55,25 @@
+ `--no-drafts` is the only supported mode: this checkpoint ships no drafter, and the loop's second visit is not a
+ speculative path. Do not enable MTP or DFlash2 against it.
+ 
++## Images
++
++The checkpoint carries a 27-block Qwen3.5-VL tower: hidden 1152, 16 heads of 72, intermediate 4304, a 5-D conv3d
++patch embed `[1152, 3, 2, 16, 16]`, and a merger to 4096. It is the same tower TensorFold reads for Qwen3.8-27B, at
++this model's 4096 width instead of 5120, so the engine's existing `core/qwen_vl` reader takes it unchanged.
++
++The conversion carries it, and one detail is not obvious: `core/qwen_vl` finds the tower through the mlx-vlm prefix
++`vision_tower.*` and reads bf16 only, so the converter rewrites `model.visual.<name>` to `vision_tower.<name>` and
++leaves those 333 tensors unquantized while the language model stays affine 4-bit. The tower costs 0.85 GiB, taking
++the checkpoint to 5.57 GiB, and `--vision` loads it with 1.78 GiB of scratch for 4096 image tokens a request.
++
++```bash
++zig-out/native/bin/tensorfold-native serve loop9b-vision-mlx4 --name loop9b \
++  --context 4096 --prompt-cache-gib 0 --no-drafts --vision
++```
++
++JPEG input needs libjpeg-turbo 3.1.4.1 (`TENSORFOLD_LIBTURBOJPEG`); PNG needs nothing. Image rows enter at the
++embedding, and the loop and mHC then run over the whole sequence, image rows included, as they do for text.
++
+ ## Measured on an M5 Ultra (macOS 27.2), 4-bit, drafts off
+ 
+ Cold prefill, one fresh process or server per arm, chunk 2048 (the M5 default), 2 repetitions that agree to 0.3%.
+@@ -131,7 +150,7 @@
+ 
+ ## What is not covered
+ 
+-- images and video: the 27-block vision tower is not converted or loaded, and image parts are refused.
++- video: the processor's video path is not wired, and video parts are refused.
+ - contexts past 262144: the checkpoint advertises 524288 positions, but admission caps at 262144.
+ - concurrent streams: every number here is one stream.
+ - other Apple chips: measured on M5 Ultra only.

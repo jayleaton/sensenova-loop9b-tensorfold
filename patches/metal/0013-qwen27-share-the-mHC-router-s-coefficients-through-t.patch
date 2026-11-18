@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Jay Leaton <58495321+jayleaton@users.noreply.github.com>
 Date: Wed, 18 Nov 2026 03:58:12 +0800
-Subject: [PATCH 13/26] qwen27: share the mHC router's coefficients through
+Subject: [PATCH 13/34] qwen27: share the mHC router's coefficients through
  threadgroup memory
 
 The branch kernel wrote pre/post/mix to device memory from lane 0 and then read

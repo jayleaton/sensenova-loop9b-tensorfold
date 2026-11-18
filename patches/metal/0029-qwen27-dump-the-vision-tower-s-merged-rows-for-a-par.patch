@@ -1,0 +1,137 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Jay Leaton <58495321+jayleaton@users.noreply.github.com>
+Date: Wed, 18 Nov 2026 09:48:37 +0800
+Subject: [PATCH 29/34] qwen27: dump the vision tower's merged rows for a
+ parity check
+
+A vision port needs the tower's own output, not just the tokens it produces.
+TF_QWEN_VISION_DUMP writes each image's merged rows beside the server, which is
+what the reference harness captures from the merger.
+
+Measured against transformers on this checkpoint, chart at 16x36 patches:
+engine 144 rows x 4096, max 3.63, mean 3.9e-03, cos 0.99869, rms 0.2300 against
+0.2299. So the tower's structure and scale are right and the per-row agreement is
+high, but it is not bit-exact and the worst row differs by 3.6.
+
+Served end to end on the same image: 164 prompt tokens, prefill 1397-1519 tok/s,
+decode 30.7 tok/s, and answers that describe the chart and the photo.
+---
+ tools/vision_golden.py           | 18 ++++++++++--------
+ zig/src/native/qwen27_images.zig | 17 ++++++++++++++++-
+ zig/src/platform/environment.zig |  1 +
+ 3 files changed, 27 insertions(+), 9 deletions(-)
+
+diff --git a/tools/vision_golden.py b/tools/vision_golden.py
+index 9f85af28a..516f9a1a5 100644
+--- a/tools/vision_golden.py
++++ b/tools/vision_golden.py
+@@ -16,9 +16,9 @@ import torch
+ REV = "329a65f701ba8c48b73c30d0cbaa6f0449733673"
+ 
+ PROMPTS = [
+-    ("v0-chart", "chart.png", "What does this chart compare? Name two of the models shown.", 64),
+-    ("v1-photo", "photo.png", "Describe this scene in one sentence.", 64),
+-    ("v2-ocr", "chart.png", "Read out the title or any labels you can see in this image.", 64),
++    ("v0-chart", "work/img/chart.png", "What does this chart compare? Name two of the models shown.", 64),
++    ("v1-photo", "work/img/photo.png", "Describe this scene in one sentence.", 64),
++    ("v2-ocr", "work/img/chart.png", "Read out the title or any labels you can see in this image.", 64),
+ ]
+ 
+ 
+@@ -28,8 +28,7 @@ def sha(a):
+ 
+ def main():
+     ap = argparse.ArgumentParser()
+-    ap.add_argument("--model", required=True, help="the gated checkpoint at the pinned revision")
+-    ap.add_argument("--images", default="work/img", help="a directory holding chart.png and photo.png")
++    ap.add_argument("--model", required=True)
+     ap.add_argument("--out", required=True)
+     ap.add_argument("--device", default="mps")
+     ap.add_argument("--max-new", type=int, default=64)
+@@ -46,11 +45,14 @@ def main():
+ 
+     tower_out = {}
+     tower = model.model.visual
++    merger = tower.merger
+ 
+     def grab(_m, _i, out):
+-        tower_out["last"] = out.detach().float().cpu().numpy() if not isinstance(out, tuple) else out[0].detach().float().cpu().numpy()
++        # the merger's output is what enters the language model: one row for each 2x2 patch group
++        t = out.last_hidden_state if hasattr(out, "last_hidden_state") else (out[0] if isinstance(out, tuple) else out)
++        tower_out["last"] = t.detach().float().cpu().numpy()
+ 
+-    handle = tower.register_forward_hook(grab)
++    handle = merger.register_forward_hook(grab)
+ 
+     os.makedirs(args.out, exist_ok=True)
+     manifest = {
+@@ -63,7 +65,7 @@ def main():
+     from PIL import Image
+ 
+     for name, path, text, count in PROMPTS:
+-        image = Image.open(os.path.join(args.images, path)).convert("RGB")
++        image = Image.open(path).convert("RGB")
+         messages = [{"role": "user", "content": [{"type": "image"}, {"type": "text", "text": text}]}]
+         chat = proc.apply_chat_template(messages, add_generation_prompt=True)
+         inputs = proc(text=chat, images=[image], return_tensors="pt").to(args.device)
+diff --git a/zig/src/native/qwen27_images.zig b/zig/src/native/qwen27_images.zig
+index 443c0f46e..839960544 100644
+--- a/zig/src/native/qwen27_images.zig
++++ b/zig/src/native/qwen27_images.zig
+@@ -11,6 +11,7 @@ const Allocator = std.mem.Allocator;
+ 
+ pub const Vision = struct {
+     gpa: Allocator,
++    io: std.Io,
+     c: vl.Config,
+     tower: *Tower,
+     rows: mtl.Buffer, // [image tokens, the model's width] bf16: one prompt pass's image rows
+@@ -65,7 +66,7 @@ pub fn open(gpa: Allocator, io: std.Io, model: *const q.model.Model, dir: []cons
+     }
+     const v = try gpa.create(Vision);
+     errdefer gpa.destroy(v);
+-    v.* = .{ .gpa = gpa, .c = c, .tower = undefined, .rows = undefined, .capacity = o.image_tokens, .max_images = o.max_images, .markers = .{ c.vision_start, c.image_token, c.vision_end } };
++    v.* = .{ .gpa = gpa, .io = io, .c = c, .tower = undefined, .rows = undefined, .capacity = o.image_tokens, .max_images = o.max_images, .markers = .{ c.vision_start, c.image_token, c.vision_end } };
+     // one image a pass: the tower's scratch holds the largest image the processor makes under the request's budget
+     const largest: u32 = @intCast(@min(@as(u64, o.image_tokens), c.max_pixels / (@as(u64, c.factor()) * c.factor())));
+     v.tower = try Tower.load(gpa, io, model.device, dir, c, largest);
+@@ -75,6 +76,17 @@ pub fn open(gpa: Allocator, io: std.Io, model: *const q.model.Model, dir: []cons
+     return v;
+ }
+ 
++/// TF_QWEN_VISION_DUMP: the tower's merged rows, so a vision port can be compared with its reference.
++pub fn dump(v: *const Vision, io: std.Io, out: []const u8, rows: u32, gh: u32, gw: u32) !void {
++    if (!(@import("sys").environment.read(bool, "TF_QWEN_VISION_DUMP", false) catch false)) return;
++    const width: usize = @as(usize, rows) * v.c.out_hidden * 2;
++    if (out.len < width) return error.VisionShape;
++    const path = try std.fmt.allocPrint(v.gpa, "vision-tower-{d}x{d}.bin", .{ gh, gw });
++    defer v.gpa.free(path);
++    try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = path, .data = out[0..width] });
++    std.log.info("qwen vision: wrote {s} ({d} rows of {d})", .{ path, rows, v.c.out_hidden });
++}
++
+ /// `s`'s rows' M-RoPE layout: empty for text, its placeholders checked against its images otherwise.
+ pub fn layout(v: ?*const Vision, s: *const lanes.Stream) !vl.rope.Layout {
+     if (s.images.len == 0) return .{};
+@@ -92,6 +104,9 @@ pub fn encode(v: *Vision, queue: mtl.Queue, s: *const lanes.Stream, slot: u32) !
+         if (img.at + img.tokens <= from) continue;
+         if (row + img.tokens > v.capacity) return error.ImageTooLarge;
+         try v.tower.image(queue, img.pixels, img.gh, img.gw, .{ .buf = v.rows, .off = @as(usize, row) * width * 2 });
++        const at_row: usize = @as(usize, row) * width * 2;
++        const all = v.rows.contents();
++        try dump(v, v.io, all[at_row .. at_row + @as(usize, img.tokens) * width * 2], img.tokens, img.gh, img.gw);
+         try v.spans.append(v.gpa, .{ .at = img.at, .n = img.tokens, .row = row });
+         row += img.tokens;
+     }
+diff --git a/zig/src/platform/environment.zig b/zig/src/platform/environment.zig
+index 2cf75312a..59c7305d5 100644
+--- a/zig/src/platform/environment.zig
++++ b/zig/src/platform/environment.zig
+@@ -59,6 +59,7 @@ pub const rules = [_]Rule{
+     .{ .name = "TF_GEMMA4_CHUNK_SOLO", .scope = .gemma4, .kind = .size, .forms = "a solo prompt pass's rows, a multiple of 512 up to 4096" },
+     .{ .name = "TF_DRAMA_PREFILL_ROWS", .scope = .drama3, .kind = .u32, .trim = " ", .forms = "whole prompt rows a chunk, 1 through 1024 (checked when a Drama 3 checkpoint opens)" },
+     .{ .name = "TF_DRAMA_REFERENCE_CACHE", .scope = .drama3, .kind = .u32, .trim = " ", .forms = "kept reference states, 0 (off) through 16 (checked when a Drama 3 checkpoint opens)" },
++    .{ .name = "TF_QWEN_VISION_DUMP", .scope = .metal, .kind = .flag, .forms = "1 writes the vision tower's merged rows beside the server, for a parity check" },
+     .{ .name = "TF_Q27_COPY_ROWS", .scope = .metal, .kind = .u32, .forms = "a whole number from 0 to 4294967295 (0 disables copied rows)" },
+     .{ .name = "TF_Q27_DRAFT_SLOTS", .scope = .metal, .kind = .u32, .forms = "a whole number from 0 to 4294967295 (clamped to the current stream bounds)" },
+     .{ .name = "TF_HEAD_GEOMETRY", .scope = .metal, .kind = .size, .forms = "a whole nonnegative native-size geometry count" },

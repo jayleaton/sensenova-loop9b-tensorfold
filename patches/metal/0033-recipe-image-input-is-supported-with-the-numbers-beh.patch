@@ -1,0 +1,136 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Jay Leaton <58495321+jayleaton@users.noreply.github.com>
+Date: Wed, 18 Nov 2026 10:36:55 +0800
+Subject: [PATCH 33/34] recipe: image input is supported, with the numbers
+ behind it
+
+Rewrites the Images section so it stands alone: what the tower is and the one
+field it differs in, the conversion detail that decides working from failing,
+how to serve it, the parity numbers against the model's own bf16 noise floor
+with all 27 blocks checked, what it reads and the one thing it does not, perf
+with an image, and the tower's default-init trap for anyone adding a dump.
+
+Measured, not estimated: tower engine-vs-bf16 max 3.63 cos 0.99869 inside a
+3.86 / 0.99784 noise floor; 513 of 513 M-RoPE cells; seven benchmark labels
+read correctly; 164 prompt tokens at 1397-1519 tok/s prefill and 30.7 tok/s
+decode. Text-only numbers are unchanged, so the page keeps one set of perf
+figures and adds vision beside them.
+---
+ docs/recipes/sensenova-loop-9b-metal.md | 83 ++++++++++++++++++++++---
+ 1 file changed, 73 insertions(+), 10 deletions(-)
+
+diff --git a/docs/recipes/sensenova-loop-9b-metal.md b/docs/recipes/sensenova-loop-9b-metal.md
+index ee23ac094..9e382b326 100644
+--- a/docs/recipes/sensenova-loop-9b-metal.md
++++ b/docs/recipes/sensenova-loop-9b-metal.md
+@@ -5,7 +5,8 @@
+ `329a65f701ba8c48b73c30d0cbaa6f0449733673`, BF16, MLX affine 4-bit groups of 64.
+ 
+ This recipe is **experimental**: two of three parity prompts are token-exact, prefill is within 3% of what the
+-execution count predicts, and served decode is about 15% below it. All three are measured below rather than estimated.
++execution count predicts, and served decode is about 15% below it. All three are measured below rather than
++estimated. **Image input is supported**; the `## Images` section stands on its own.
+ 
+ ## The model
+ 
+@@ -57,22 +58,83 @@
+ 
+ ## Images
+ 
+-The checkpoint carries a 27-block Qwen3.5-VL tower: hidden 1152, 16 heads of 72, intermediate 4304, a 5-D conv3d
+-patch embed `[1152, 3, 2, 16, 16]`, and a merger to 4096. It is the same tower TensorFold reads for Qwen3.8-27B, at
+-this model's 4096 width instead of 5120, so the engine's existing `core/qwen_vl` reader takes it unchanged.
++**Image input is supported.** The checkpoint carries a 27-block Qwen3.5-VL tower: hidden 1152, 16 heads of 72,
++intermediate 4304, a 5-D conv3d patch embed `[1152, 3, 2, 16, 16]`, spatial merge 2, and a merger to 4096. It is the
++same tower TensorFold already reads for Qwen3.8-27B, differing in exactly one field: `out_hidden_size` is 4096 here
++against 5120 there, which `core/qwen_vl` already checks against the language model's width. So the existing reader
++takes it unchanged; nothing in the tower's kernels is new.
+ 
+-The conversion carries it, and one detail is not obvious: `core/qwen_vl` finds the tower through the mlx-vlm prefix
+-`vision_tower.*` and reads bf16 only, so the converter rewrites `model.visual.<name>` to `vision_tower.<name>` and
+-leaves those 333 tensors unquantized while the language model stays affine 4-bit. The tower costs 0.85 GiB, taking
+-the checkpoint to 5.57 GiB, and `--vision` loads it with 1.78 GiB of scratch for 4096 image tokens a request.
++Two details are not obvious and are the difference between an image that loads and one that is read correctly:
++
++- the converter rewrites `model.visual.<name>` to `vision_tower.<name>` — the mlx-vlm prefix `core/qwen_vl` scans
++  for — and writes those **333 tensors bf16, unquantized**, while the language model stays affine 4-bit.
++  `core/qwen_vl/weights.zig` asserts bf16 and an exact tensor count. The tower costs 0.85 GiB, taking the checkpoint
++  to 5.57 GiB; `--vision` loads it with 1.78 GiB of scratch for 4096 image tokens a request.
++- image rows are embedded at the prompt and the loop and mHC then run over the whole sequence, image rows included,
++  exactly as they do over text. Their rotary positions are M-RoPE's: every row of one image shares a single text
++  position and walks its merge grid in `h` and `w`, and text after the image resumes past the grid's larger side.
+ 
+ ```bash
++zig build native -Dcpu=apple_m1
+ zig-out/native/bin/tensorfold-native serve loop9b-vision-mlx4 --name loop9b \
+   --context 4096 --prompt-cache-gib 0 --no-drafts --vision
+ ```
+ 
+-JPEG input needs libjpeg-turbo 3.1.4.1 (`TENSORFOLD_LIBTURBOJPEG`); PNG needs nothing. Image rows enter at the
+-embedding, and the loop and mHC then run over the whole sequence, image rows included, as they do for text.
++An OpenAI `image_url` part works as-is. PNG needs nothing; JPEG needs libjpeg-turbo 3.1.4.1
++(`TENSORFOLD_LIBTURBOJPEG`).
++
++### What the tower measures against
++
++The tower is compared with transformers running the same checkpoint, on a chart resized to 16×36 patches and 144
++merged rows. It lands inside the model's own bf16 noise rather than above it:
++
++| comparison | max | mean | cos |
++| --- | --- | --- | --- |
++| engine vs bf16 reference | 3.63 | 3.9e-03 | **0.99869** |
++| transformers bf16 vs transformers fp32 (the noise floor) | 3.86 | 4.2e-03 | 0.99784 |
++| engine vs fp32 | 1.64 | 2.7e-03 | 0.99952 |
++
++The engine is *closer* to an fp32 reference than the bf16 reference is, so what remains is accumulation order, not a
++port defect. All 27 blocks are checked the same way: engine rms tracks the reference within 0.2% at every block, and
++per-block cosine never falls below 0.9992 until the last at 0.99890. Nothing steps. The last block's absolute error
++rises only because the tower's own activations rise there (reference rms 1.5 → 186), and the engine follows that
++rise. The M-RoPE positions agree with `get_rope_index` on **513 of 513 cells** — all three axes, all 171 prompt rows,
++image rows and the text after them.
++
++### What it reads
++
++Asked for the labels on a chart of this model's own release benchmarks, it reads all seven:
++
++> AutomationBench, Terminal-Bench 2.1, NL2Repo, AIDA-Bench, BIRD, x²-Banking, GAIA
++
++The reference reads fewer and hedges. The one known limitation is narrower: asked to name *models* in a chart that
++has no model legend, the engine answers "SimShort and SimShort-Pro", which are not on it. The reference declines to
++name any. Reading text is correct; naming models a figure does not show is not.
++
++### With an image
++
++| metric | value |
++| --- | --- |
++| prompt tokens | 164 (144 image rows + 20 text) |
++| prefill | 1397–1519 tok/s |
++| TTFT | 0.11–0.12 s |
++| decode | 30.7 tok/s |
++
++Against the text-only numbers below, an image costs prefill in proportion to its rows and nothing per token.
++
++These image numbers were taken before the router and merge changes that brought text decode from 33 to 60 tok/s,
++and they have not been re-measured since.
++
++### When a port needs a dump
++
++Three environment variables write receipts beside the server, all off by default and each costing one environment
++read a prompt when unset: `TF_QWEN_VISION_DUMP=1` writes an image's merged rows to `vision-tower-<h>x<w>.bin`,
++`TF_QWEN_VISION_BLOCKS=1` writes each of the 27 blocks' residuals, and `TF_QWEN_ROPE_DUMP=1` writes the prompt's
++`(t, h, w)` planes with the ids beside them.
++
++One trap, hit while adding the last of those: the tower is built with `gpa.create` and assigned field by field, so a
++declared default on the struct never applies and any field not explicitly set is undefined. A dump field added that
++way segfaulted a served image request until it was initialised at load.
+ 
+ ## Measured on an M5 Ultra (macOS 27.2), 4-bit, drafts off
+ 
+@@ -151,6 +213,7 @@
+ ## What is not covered
+ 
+ - video: the processor's video path is not wired, and video parts are refused.
++- more than one image a request: the path is written for it and it is untested here.
+ - contexts past 262144: the checkpoint advertises 524288 positions, but admission caps at 262144.
+ - concurrent streams: every number here is one stream.
+ - other Apple chips: measured on M5 Ultra only.

@@ -31,8 +31,8 @@ More in [CREDITS](docs/CREDITS.md); license terms in [LICENSING](docs/LICENSING.
 | Architecture | Qwen3.5 dense hybrid attention; physical layers `[4, 28)` run twice (56 executions from 32 weight sets), wrapped in a two-stream mHC ([MODEL](docs/MODEL.md)) |
 | Weights served | MLX affine g64, 4-bit (or 8-bit), converted with [`tools/sensenova_loop_mlx.py`](docs/CONVERT.md) from the patch series |
 | CUDA | 1x DGX Spark (GB10), TP=1: upstream TensorFold [`038e4a278`](config/cuda/tensorfold.rev) + [`patches/cuda/`](patches/cuda/) `0001`-`0009` |
-| Metal | Mac Studio M5 Ultra: upstream TensorFold [`6d0a128b0`](config/metal/tensorfold.rev) + [`patches/metal/`](patches/metal/) `0001`-`0026` |
-| Input | text; image input is [in progress](#in-progress) |
+| Metal | Mac Studio M5 Ultra: upstream TensorFold [`6d0a128b0`](config/metal/tensorfold.rev) + [`patches/metal/`](patches/metal/) `0001`-`0034` |
+| Input | text on both; **images on Metal** ([METAL](docs/METAL.md#images)); CUDA images [in progress](#in-progress) |
 
 The two series sit on different upstream commits, so each backend keeps its own pin. Each pin is the upstream commit
 its backend was measured on, and each series rebuilds the measured engine tree exactly
@@ -54,6 +54,12 @@ pin, but that tree has not been measured. See [ENGINE](docs/ENGINE.md).
 | Last-row logits, 56 executions | `max\|Δlogit\|` 2.203, top-1 match, top-5 set 5/5 | top-1 match on all three prompts |
 | Greedy agreement | 30/31 teacher-forced | 64/64 code, 64/64 arithmetic, 19/64 prose |
 | Planned gate | `max\|Δlogit\|` ≤ 0.05: **not met** (mHC drift) | 64/64 on two of three prompts; prose stops at the reference's own bf16/fp32 noise floor (19/64) |
+
+**Images on Metal.** The vision tower sits inside the model's own bf16 noise: engine against bf16 max 3.63, cosine
+0.99869, where transformers bf16 against fp32 is 3.86 / 0.99784 and the engine against fp32 is 1.64 / 0.99952. All 27
+blocks track the reference within 0.2% rms, M-RoPE positions match `get_rope_index` on 513 of 513 cells, and it reads
+all seven labels of a benchmark chart. Asked to name models on a chart with no legend, it invents names
+([METAL](docs/METAL.md#images)).
 
 **Quantized on CUDA:** q8 cosine 0.980 with 18/31 greedy agreement, q4 19/31. A stock
 `mlx-community/Qwen3.5-2B-MLX-4bit` through the same binary scores cosine 0.927 and 4/15 against its own BF16, so this
@@ -103,6 +109,7 @@ scripts/serve.sh cuda engine-cuda loop9b-mlx4                # --parallel 4 --co
 scripts/build-engine.sh metal engine-metal                   # pin + patches/metal, then zig build native -Dcpu=apple_m1
 python3 engine-metal/tools/sensenova_loop_mlx.py --source SenseNova-Loop-9B --out loop9b-mlx4
 scripts/serve.sh metal engine-metal loop9b-mlx4              # --context 2048 --prompt-cache-gib 0 --no-drafts
+PROFILE=vision scripts/serve.sh metal engine-metal loop9b-mlx4   # image input: --context 4096 ... --vision
 ```
 
 Then:
@@ -118,8 +125,8 @@ the pin, applies the series and checks the resulting tree.
 
 ## In progress
 
-- **Image input.** The checkpoint has a Qwen3.5-VL vision tower. The converter leaves it out, so the trees above
-  serve text only. Wiring the tower is under way on Metal and has an open OCR defect; there are no image results yet.
+- **CUDA image input.** The CUDA engine has the Qwen3.5-VL tower code at this geometry, but GPU qualification for
+  this checkpoint is pending, and the CUDA series' converter still leaves the tower out.
 - **CUDA task gate.** The same three-prompt greedy gate Metal passes, on CUDA.
 
 ## Documentation

@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Jay Leaton <58495321+jayleaton@users.noreply.github.com>
 Date: Wed, 18 Nov 2026 05:03:25 +0800
-Subject: [PATCH 22/26] tools: the mHC router's FP64 reference and the
+Subject: [PATCH 22/34] tools: the mHC router's FP64 reference and the
  reduction orders it admits
 
 Splitting the router's reduction looked like a free path to the 83 tok/s the

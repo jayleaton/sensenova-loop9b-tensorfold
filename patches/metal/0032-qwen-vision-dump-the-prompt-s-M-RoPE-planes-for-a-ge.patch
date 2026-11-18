@@ -1,0 +1,69 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Jay Leaton <58495321+jayleaton@users.noreply.github.com>
+Date: Wed, 18 Nov 2026 10:35:34 +0800
+Subject: [PATCH 32/34] qwen vision: dump the prompt's M-RoPE planes for a
+ get_rope_index check
+
+TF_QWEN_ROPE_DUMP writes the layout's (t, h, w) for every prompt row beside
+the server, plus the ids beside it so a reference can index exactly this prompt
+instead of a template's reconstruction of it.
+
+Measured on the chart prompt, 171 rows, 144 placeholders at 4 through 147, grid
+[1, 16, 36]: transformers' get_rope_index on the same ids and grid agrees on
+513 of 513 cells, all three axes. Image rows sit at t 4 with h and w walking the
+8 x 18 merge grid, and the trailing text resumes at 22, past the image's larger
+side, exactly as the reference does.
+
+Off by default: one environment read a prompt, nothing allocated when unset.
+---
+ zig/src/native/qwen27_images.zig | 24 +++++++++++++++++++++++-
+ zig/src/platform/environment.zig |  1 +
+ 2 files changed, 24 insertions(+), 1 deletion(-)
+
+diff --git a/zig/src/native/qwen27_images.zig b/zig/src/native/qwen27_images.zig
+index 2cd32a99b..074f8743c 100644
+--- a/zig/src/native/qwen27_images.zig
++++ b/zig/src/native/qwen27_images.zig
+@@ -91,7 +91,29 @@ pub fn dump(v: *const Vision, io: std.Io, out: []const u8, rows: u32, gh: u32, g
+ pub fn layout(v: ?*const Vision, s: *const lanes.Stream) !vl.rope.Layout {
+     if (s.images.len == 0) return .{};
+     const x = v orelse return error.NoVision;
+-    return vl.rope.Layout.init(s.prompt(), s.images, x.ids(), x.c.merge);
++    const l = try vl.rope.Layout.init(s.prompt(), s.images, x.ids(), x.c.merge);
++    try dumpRope(x, s, &l);
++    return l;
++}
++
++/// TF_QWEN_ROPE_DUMP: the prompt's (t, h, w), three planes of one i32 a row, for get_rope_index parity.
++pub fn dumpRope(v: *const Vision, s: *const lanes.Stream, l: *const vl.rope.Layout) !void {
++    if (!(@import("sys").environment.read(bool, "TF_QWEN_ROPE_DUMP", false) catch false)) return;
++    const prompt = s.prompt();
++    const buf = try v.gpa.alloc(u8, @as(usize, prompt.len) * 12);
++    defer v.gpa.free(buf);
++    var at: usize = 0;
++    for (0..3) |axis| for (0..prompt.len) |p| {
++        std.mem.writeInt(i32, buf[at..][0..4], l.position(@intCast(p))[axis], .little);
++        at += 4;
++    };
++    try std.Io.Dir.cwd().writeFile(v.io, .{ .sub_path = "rope-positions.bin", .data = buf });
++    // the ids alongside, so the reference can index exactly this prompt rather than a template's reconstruction
++    const ids = try v.gpa.alloc(u8, @as(usize, prompt.len) * 4);
++    defer v.gpa.free(ids);
++    for (prompt, 0..) |t, p| std.mem.writeInt(u32, ids[p * 4 ..][0..4], t, .little);
++    try std.Io.Dir.cwd().writeFile(v.io, .{ .sub_path = "rope-ids.bin", .data = ids });
++    std.log.info("qwen vision: wrote rope-positions.bin and rope-ids.bin ({d} rows, {d} image runs)", .{ prompt.len, l.count });
+ }
+ 
+ /// The tower's rows of `s`'s images past prompt row `from` (an earlier image a kept state already holds runs not).
+diff --git a/zig/src/platform/environment.zig b/zig/src/platform/environment.zig
+index 663dabeff..933623017 100644
+--- a/zig/src/platform/environment.zig
++++ b/zig/src/platform/environment.zig
+@@ -60,6 +60,7 @@ pub const rules = [_]Rule{
+     .{ .name = "TF_DRAMA_PREFILL_ROWS", .scope = .drama3, .kind = .u32, .trim = " ", .forms = "whole prompt rows a chunk, 1 through 1024 (checked when a Drama 3 checkpoint opens)" },
+     .{ .name = "TF_DRAMA_REFERENCE_CACHE", .scope = .drama3, .kind = .u32, .trim = " ", .forms = "kept reference states, 0 (off) through 16 (checked when a Drama 3 checkpoint opens)" },
+     .{ .name = "TF_QWEN_VISION_BLOCKS", .scope = .metal, .kind = .flag, .forms = "1 writes each vision block's residual beside the server, a diagnostic" },
++    .{ .name = "TF_QWEN_ROPE_DUMP", .scope = .metal, .kind = .flag, .forms = "1 writes the prompt's M-RoPE (t, h, w) beside the server, for a get_rope_index parity check" },
+     .{ .name = "TF_QWEN_VISION_DUMP", .scope = .metal, .kind = .flag, .forms = "1 writes the vision tower's merged rows beside the server, for a parity check" },
+     .{ .name = "TF_Q27_COPY_ROWS", .scope = .metal, .kind = .u32, .forms = "a whole number from 0 to 4294967295 (0 disables copied rows)" },
+     .{ .name = "TF_Q27_DRAFT_SLOTS", .scope = .metal, .kind = .u32, .forms = "a whole number from 0 to 4294967295 (clamped to the current stream bounds)" },

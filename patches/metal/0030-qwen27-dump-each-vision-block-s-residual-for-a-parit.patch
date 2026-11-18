@@ -1,0 +1,158 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Jay Leaton <58495321+jayleaton@users.noreply.github.com>
+Date: Wed, 18 Nov 2026 10:10:31 +0800
+Subject: [PATCH 30/34] qwen27: dump each vision block's residual for a parity
+ curve
+
+TF_QWEN_VISION_BLOCKS copies a block's residual aside as it finishes, one buffer a
+block, allocated only when the flag is set so an unset run costs nothing. A small
+qwv_copy_bf16 kernel turns the tower's fp32 residual into the bf16 rows a
+reference comparison wants.
+
+Measured on this checkpoint, chart at 16x36 patches, all 27 blocks plus the
+merger against transformers in bf16: engine rms tracks the reference within 0.2%
+at every block, cos never below 0.9989, and there is no step. Block 26's absolute
+error jumps to 4864 only because the tower's own activations jump there (reference
+rms 1.5 -> 186), and the engine follows that jump.
+
+The engine is also closer to an fp32 reference than bf16 is: engine vs fp32 max
+1.64 cos 0.99952, while HF bf16 vs HF fp32 is max 3.86 cos 0.99784. So the tower
+sits at the model's own noise floor, not above it.
+---
+ zig/kernels/metal/core/qwen_vision.metal |  8 +++++
+ zig/src/core/qwen_vl/tower.zig           | 37 ++++++++++++++++++++++--
+ zig/src/native/qwen27_images.zig         |  8 +++++
+ zig/src/platform/environment.zig         |  1 +
+ 4 files changed, 52 insertions(+), 2 deletions(-)
+
+diff --git a/zig/kernels/metal/core/qwen_vision.metal b/zig/kernels/metal/core/qwen_vision.metal
+index 69e80ecd7..65c97553f 100644
+--- a/zig/kernels/metal/core/qwen_vision.metal
++++ b/zig/kernels/metal/core/qwen_vision.metal
+@@ -147,3 +147,11 @@ struct QwvAct {
+   const ulong i = ulong(at.y) * width + at.x;
+   y[i] = bfloat(float(y[i]) + float(b[at.x]));
+ }
++
++// A parity dump's copy: the tower's fp32 residual to bf16 rows, for comparison with a reference.
++[[max_total_threads_per_threadgroup(256)]] [[kernel]] void qwv_copy_bf16(
++    const device float* x [[buffer(0)]], device bfloat* y [[buffer(1)]], constant uint& cells [[buffer(2)]],
++    uint at [[thread_position_in_grid]]) {
++  if (at >= cells) return;
++  y[at] = bfloat(x[at]);
++}
+diff --git a/zig/src/core/qwen_vl/tower.zig b/zig/src/core/qwen_vl/tower.zig
+index 2d597689b..13d9944b9 100644
+--- a/zig/src/core/qwen_vl/tower.zig
++++ b/zig/src/core/qwen_vl/tower.zig
+@@ -24,8 +24,9 @@ const Kernels = struct {
+     gelu: mtl.Pipeline,
+     residual: mtl.Pipeline,
+     bias: mtl.Pipeline,
++    copy: mtl.Pipeline,
+ 
+-    const names = .{ .{ "embed", "qwv_embed" }, .{ "norm", "qwv_layer_norm" }, .{ "qkv", "qwv_qkv" }, .{ "softmax", "qwv_softmax" }, .{ "heads", "qwv_heads" }, .{ "gelu", "qwv_bias_gelu" }, .{ "residual", "qwv_residual" }, .{ "bias", "qwv_bias" } };
++    const names = .{ .{ "embed", "qwv_embed" }, .{ "norm", "qwv_layer_norm" }, .{ "qkv", "qwv_qkv" }, .{ "softmax", "qwv_softmax" }, .{ "heads", "qwv_heads" }, .{ "gelu", "qwv_bias_gelu" }, .{ "residual", "qwv_residual" }, .{ "bias", "qwv_bias" }, .{ "copy", "qwv_copy_bf16" } };
+ 
+     fn load(gpa: std.mem.Allocator, device: mtl.Device) !Kernels {
+         const src = try frags.source(device, gpa, sources.core_qwen_vision);
+@@ -103,6 +104,10 @@ pub fn planBytes(gpa: std.mem.Allocator, c: Config, max_tokens: u32) !usize {
+ 
+ pub const Tower = struct {
+     gpa: std.mem.Allocator,
++    /// Kept for a parity dump's buffers: nothing else needs the device after load.
++    device: mtl.Device,
++    /// TF_QWEN_VISION_BLOCKS: a block's output copied aside, one buffer a block; empty when off.
++    dump: []?mtl.Buffer = &.{},
+     c: Config,
+     k: Kernels,
+     w: wts.Weights,
+@@ -136,6 +141,7 @@ pub const Tower = struct {
+         const t = try gpa.create(Tower);
+         errdefer gpa.destroy(t);
+         t.gpa = gpa;
++        t.device = device;
+         t.c = c;
+         t.k = try Kernels.load(gpa, device);
+         errdefer t.k.deinit();
+@@ -156,6 +162,14 @@ pub const Tower = struct {
+             view.* = .{ .buf = t.scratch, .off = at };
+             at += std.mem.alignForward(usize, n, 256);
+         }
++        if (@import("sys").environment.read(bool, "TF_QWEN_VISION_BLOCKS", false) catch false) {
++            const blocks = try gpa.alloc(?mtl.Buffer, c.depth);
++            @memset(blocks, null);
++            errdefer gpa.free(blocks);
++            const bytes = P * c.hidden * 2;
++            for (blocks) |*b| b.* = try device.buffer(bytes, mtl.ResourceOptions.shared | mtl.ResourceOptions.untracked);
++            t.dump = blocks;
++        }
+         t.bytes = plan.bytes() + t.w.buf.length();
+         return t;
+     }
+@@ -224,7 +238,10 @@ pub const Tower = struct {
+         e.setValue(h, 5);
+         e.setBuffer(t.x.buf, t.x.off, 6);
+         e.dispatchThreads(mtl.Size.of(h, P, 1), mtl.Size.of(256, 1, 1));
+-        for (t.w.blocks) |b| t.block(e, b, P);
++        for (t.w.blocks, 0..) |b, bi| {
++            t.block(e, b, P);
++            if (bi < t.dump.len) if (t.dump[bi]) |dst| t.copyOut(e, t.x, dst, @as(usize, P) * h);
++        }
+         t.norm(e, t.x, t.w.norm_w, t.w.norm_b, t.xn, P, h);
+         // the merge: four neighbouring patches' rows, in merge order, are one row of xn read as [T, merged]
+         t.linear(e, t.xn, t.w.fc1_w, t.att, T, c.merged(), c.merged());
+@@ -237,6 +254,22 @@ pub const Tower = struct {
+         e.dispatchThreads(mtl.Size.of(c.out_hidden, T, 1), mtl.Size.of(256, 1, 1));
+     }
+ 
++    /// A block's dumped residual, bf16, for a parity comparison; empty when the dump is off.
++    pub fn blockDump(t: *const Tower, index: usize) []const u8 {
++        if (index >= t.dump.len) return &.{};
++        const b = t.dump[index] orelse return &.{};
++        return b.contents()[0..b.length()];
++    }
++
++    /// The dump of a block's residual: bf16, the tower keeps `x` in fp32 so this reads it as the norm would.
++    fn copyOut(t: *Tower, e: mtl.ComputeEncoder, x: Ref, dst: mtl.Buffer, cells: usize) void {
++        e.setBuffer(x.buf, x.off, 0);
++        e.setBuffer(dst, 0, 1);
++        e.setValue(@as(u32, @intCast(cells)), 2);
++        e.setPipeline(t.k.copy);
++        e.dispatchThreads(mtl.Size.of(@intCast(cells), 1, 1), mtl.Size.of(256, 1, 1));
++    }
++
+     fn block(t: *Tower, e: mtl.ComputeEncoder, b: wts.Block, P: u32) void {
+         const c = t.c;
+         const h = c.hidden;
+diff --git a/zig/src/native/qwen27_images.zig b/zig/src/native/qwen27_images.zig
+index 839960544..2cd32a99b 100644
+--- a/zig/src/native/qwen27_images.zig
++++ b/zig/src/native/qwen27_images.zig
+@@ -104,6 +104,14 @@ pub fn encode(v: *Vision, queue: mtl.Queue, s: *const lanes.Stream, slot: u32) !
+         if (img.at + img.tokens <= from) continue;
+         if (row + img.tokens > v.capacity) return error.ImageTooLarge;
+         try v.tower.image(queue, img.pixels, img.gh, img.gw, .{ .buf = v.rows, .off = @as(usize, row) * width * 2 });
++        // TF_QWEN_VISION_BLOCKS: each block's residual beside the server, for a growth curve against a reference
++        for (0..v.c.depth) |bi| {
++            const data = v.tower.blockDump(bi);
++            if (data.len == 0) break;
++            const path = try std.fmt.allocPrint(v.gpa, "vision-block-{d:0>2}.bin", .{bi});
++            defer v.gpa.free(path);
++            try std.Io.Dir.cwd().writeFile(v.io, .{ .sub_path = path, .data = data });
++        }
+         const at_row: usize = @as(usize, row) * width * 2;
+         const all = v.rows.contents();
+         try dump(v, v.io, all[at_row .. at_row + @as(usize, img.tokens) * width * 2], img.tokens, img.gh, img.gw);
+diff --git a/zig/src/platform/environment.zig b/zig/src/platform/environment.zig
+index 59c7305d5..663dabeff 100644
+--- a/zig/src/platform/environment.zig
++++ b/zig/src/platform/environment.zig
+@@ -59,6 +59,7 @@ pub const rules = [_]Rule{
+     .{ .name = "TF_GEMMA4_CHUNK_SOLO", .scope = .gemma4, .kind = .size, .forms = "a solo prompt pass's rows, a multiple of 512 up to 4096" },
+     .{ .name = "TF_DRAMA_PREFILL_ROWS", .scope = .drama3, .kind = .u32, .trim = " ", .forms = "whole prompt rows a chunk, 1 through 1024 (checked when a Drama 3 checkpoint opens)" },
+     .{ .name = "TF_DRAMA_REFERENCE_CACHE", .scope = .drama3, .kind = .u32, .trim = " ", .forms = "kept reference states, 0 (off) through 16 (checked when a Drama 3 checkpoint opens)" },
++    .{ .name = "TF_QWEN_VISION_BLOCKS", .scope = .metal, .kind = .flag, .forms = "1 writes each vision block's residual beside the server, a diagnostic" },
+     .{ .name = "TF_QWEN_VISION_DUMP", .scope = .metal, .kind = .flag, .forms = "1 writes the vision tower's merged rows beside the server, for a parity check" },
+     .{ .name = "TF_Q27_COPY_ROWS", .scope = .metal, .kind = .u32, .forms = "a whole number from 0 to 4294967295 (0 disables copied rows)" },
+     .{ .name = "TF_Q27_DRAFT_SLOTS", .scope = .metal, .kind = .u32, .forms = "a whole number from 0 to 4294967295 (clamped to the current stream bounds)" },

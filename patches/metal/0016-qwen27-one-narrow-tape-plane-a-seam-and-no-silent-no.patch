@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Jay Leaton <58495321+jayleaton@users.noreply.github.com>
 Date: Wed, 18 Nov 2026 04:06:47 +0800
-Subject: [PATCH 16/26] qwen27: one narrow-tape plane a seam, and no silent
+Subject: [PATCH 16/34] qwen27: one narrow-tape plane a seam, and no silent
  no-ops
 
 The narrow tape shared the streams tape's plane count, so a seam id past that

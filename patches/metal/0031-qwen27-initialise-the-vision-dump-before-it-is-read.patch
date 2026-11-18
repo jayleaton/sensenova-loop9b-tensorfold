@@ -1,0 +1,29 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Jay Leaton <58495321+jayleaton@users.noreply.github.com>
+Date: Wed, 18 Nov 2026 10:15:11 +0800
+Subject: [PATCH 31/34] qwen27: initialise the vision dump before it is read
+
+A created struct carries no field defaults, so Tower.dump was undefined rather
+than the empty slice it declares, and a run with TF_QWEN_VISION_BLOCKS unset read
+through a garbage pointer in the test host. Fixed by setting it at load, which is
+what keeps an unset run free.
+
+Found because a served image request segfaulted in the tower's encode; the dump
+is now off by default and costs one comparison a block.
+---
+ zig/src/core/qwen_vl/tower.zig | 2 ++
+ 1 file changed, 2 insertions(+)
+
+diff --git a/zig/src/core/qwen_vl/tower.zig b/zig/src/core/qwen_vl/tower.zig
+index 13d9944b9..7f10dc357 100644
+--- a/zig/src/core/qwen_vl/tower.zig
++++ b/zig/src/core/qwen_vl/tower.zig
+@@ -142,6 +142,8 @@ pub const Tower = struct {
+         errdefer gpa.destroy(t);
+         t.gpa = gpa;
+         t.device = device;
++        // a created struct carries no field defaults: every field is set here or below
++        t.dump = &.{};
+         t.c = c;
+         t.k = try Kernels.load(gpa, device);
+         errdefer t.k.deinit();

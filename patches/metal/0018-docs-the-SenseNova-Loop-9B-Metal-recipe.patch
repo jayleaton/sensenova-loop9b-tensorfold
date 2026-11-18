@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Jay Leaton <58495321+jayleaton@users.noreply.github.com>
 Date: Wed, 18 Nov 2026 04:41:27 +0800
-Subject: [PATCH 18/26] docs: the SenseNova-Loop-9B Metal recipe
+Subject: [PATCH 18/34] docs: the SenseNova-Loop-9B Metal recipe
 
 Records the model's shape, the two converter mappings that matter (the
 zero-centred norms and the loader's namespace), how to serve it, and the

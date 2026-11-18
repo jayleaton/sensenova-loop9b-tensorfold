@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Jay Leaton <58495321+jayleaton@users.noreply.github.com>
 Date: Wed, 18 Nov 2026 03:24:22 +0800
-Subject: [PATCH 09/26] qwen27: tap a windowed model at its own width
+Subject: [PATCH 09/34] qwen27: tap a windowed model at its own width
 
 A windowed checkpoint carries its residual as the flat streams, twice as wide as
 a plain layer's hidden state, so Taps.init now takes its width from the window

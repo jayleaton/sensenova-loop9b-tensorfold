@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Jay Leaton <58495321+jayleaton@users.noreply.github.com>
 Date: Wed, 18 Nov 2026 04:40:40 +0800
-Subject: [PATCH 17/26] qwen27: a window tap fires only when asked, and a wider
+Subject: [PATCH 17/34] qwen27: a window tap fires only when asked, and a wider
  seam tape
 
 Two taps per window layer were firing unconditionally, one of them a probe left

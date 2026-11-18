@@ -4,8 +4,8 @@
 
 - **No task gate on CUDA yet.** Metal passes code 64/64 and reasoning 64/64 with prose at the reference's noise floor
   ([METAL](METAL.md#task-gate)); CUDA has BF16 parity and quantized cosine, not the greedy task gate.
-- **Text only.** The converter leaves out the vision tower, so neither backend serves images. On Metal the tower is
-  being wired and has an open OCR defect; nothing is claimed for image input until it is fixed and measured.
+- **Images on Metal only.** CUDA has the tower code at this geometry, but its GPU qualification for this checkpoint
+  is pending and the CUDA converter leaves the tower out.
 - **No drafter.** The checkpoint ships no MTP or draft weights, so there is no speculative decoding.
 - **Context.** The checkpoint advertises 524,288 positions; the measured profiles use 32K (CUDA) and 2K (Metal), and
   Metal admission caps at 262,144. Longer contexts are not measured.
@@ -25,6 +25,11 @@
   kernel time.
 
 ## Metal
+
+- **Images: invented model names.** Asked to name models on a chart that has no model legend, it answers with names
+  that are not on the chart; reading the text that is there is correct.
+- **Images: one a request and no video.** More than one image a request is untested; video parts are refused.
+- **Image speed predates the router changes**: 30.7 tok/s decode with an image was measured before `0023`/`0024`.
 
 - **Prose greedy agreement 19/64**, at the reference's own bf16/fp32 noise floor ([METAL](METAL.md#task-gate)).
 - **Decode is 60 tok/s against 83 for 56 executions without the window**: at one row the router is a single

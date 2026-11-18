@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Jay Leaton <58495321+jayleaton@users.noreply.github.com>
 Date: Wed, 18 Nov 2026 09:28:15 +0800
-Subject: [PATCH 23/26] qwen27: the mHC router with two streams fixed and its
+Subject: [PATCH 23/34] qwen27: the mHC router with two streams fixed and its
  lane loops unrolled, bit for bit
 
 Each lane keeps its own summation order; the loads of eight steps now overlap.

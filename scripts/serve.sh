@@ -1,9 +1,10 @@
 #!/usr/bin/env bash
-# Serve a converted SenseNova-Loop-9B tree with one backend's measured profile (config/<backend>/serve.args).
+# Serve a converted SenseNova-Loop-9B tree with one backend's measured profile (config/<backend>/serve[-PROFILE].args).
 #
 #   scripts/serve.sh cuda|metal ENGINE_DIR MODEL_DIR [extra tensorfold-native serve flags]
 #
-# PORT (default 8090) and NAME (default loop9b) set the listen port and the served model name.
+# PORT (default 8090) and NAME (default loop9b) set the listen port and the served model name; PROFILE=vision picks
+# config/<backend>/serve-vision.args (Metal: image input).
 set -euo pipefail
 backend=${1:?usage: scripts/serve.sh cuda|metal ENGINE_DIR MODEL_DIR [flags]}
 engine=${2:?usage: scripts/serve.sh cuda|metal ENGINE_DIR MODEL_DIR [flags]}
@@ -14,6 +15,8 @@ case "$backend" in
     cuda | metal) ;;
     *) echo 'backend must be cuda or metal' >&2; exit 2 ;;
 esac
-read -r -a profile < "$root/config/$backend/serve.args"
+args=$root/config/$backend/serve${PROFILE:+-$PROFILE}.args
+[[ -f "$args" ]] || { echo "no profile $args" >&2; exit 2; }
+read -r -a profile < "$args"
 exec "$engine/zig-out/native/bin/tensorfold-native" serve "$model" --name "${NAME:-loop9b}" --port "${PORT:-8090}" \
     "${profile[@]}" "$@"
