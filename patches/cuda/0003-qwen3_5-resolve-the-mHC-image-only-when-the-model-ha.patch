@@ -1,0 +1,177 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Jay Leaton <58495321+jayleaton@users.noreply.github.com>
+Date: Wed, 18 Nov 2026 04:15:52 +0700
+Subject: [PATCH 3/9] qwen3_5: resolve the mHC image only when the model has
+ streams; accept f32 dt_bias
+
+- cuda_mhc.install returns early for a model without mHC, so the family's own
+  handles must still resolve: they do, the mHC four are gone from Fns.
+- the bf16 attention tiles' dynamic shared memory opt-in is restored (it was
+  lost while consolidating the resolve block, and every attention launch failed
+  with CUDA_ERROR_INVALID_VALUE without it).
+- loop_settings/mhc accept start 0 (a loop may begin at layer 0).
+- dt_bias and the norms read an HF checkpoint's own dtype: f32 dt_bias widened
+  to bf16, and the affine path keeps raw w (it does not add the 1).
+---
+ zig/src/families/qwen3_5/cuda_engine.zig    | 13 +++++-----
+ zig/src/families/qwen3_5/cuda_layers.zig    |  4 ---
+ zig/src/families/qwen3_5/cuda_loop_plan.zig | 15 +++++++++---
+ zig/src/families/qwen3_5/cuda_mhc.zig       | 27 +++++++++++----------
+ 4 files changed, 31 insertions(+), 28 deletions(-)
+
+diff --git a/zig/src/families/qwen3_5/cuda_engine.zig b/zig/src/families/qwen3_5/cuda_engine.zig
+index 4740225ae..9ca90e0f2 100644
+--- a/zig/src/families/qwen3_5/cuda_engine.zig
++++ b/zig/src/families/qwen3_5/cuda_engine.zig
+@@ -34,7 +34,8 @@ pub const aligned = scratch_memory.aligned; // Device allocations are 256-byte a
+ 
+ /// qwen35.cuh's Geo.
+ pub const Geo = extern struct { hid: c_int, nk: c_int, nv: c_int, qh: c_int, kvh: c_int, nl: c_int };
+-const mhc_kernels = @import("cuda_mhc.zig").resolve;
++const mhc = @import("cuda_mhc.zig");
++const tiles = @import("cuda_forward.zig");
+ 
+ const layers = @import("cuda_layers.zig");
+ pub const Proj = layers.Proj;
+@@ -147,8 +148,8 @@ pub const Engine = struct {
+     pl: u64,
+     po: u64,
+     logits: u64,
+-    hs: u64, // the residual streams (rows, streams, hidden), and each row's router state
+-    mhc_state: u64,
++    hs: u64, // the streams (rows, streams, hidden)
++    mhc_state: u64, mhc_fns: mhc.Fns, // each row's router state, and the streams' own kernel handles
+     mt2: @import("cuda_mt2.zig").Mt2,
+     routed: routed.Scratch = .{}, // qwen3_5_moe's routed rows
+     amax: u64, // the argmax slices' bests: most_verify rows of argmaxSlices(vocab) (f32, i32)
+@@ -268,7 +269,8 @@ pub const Engine = struct {
+         e.plan = try cuda.grouped.Router.resolve(e.mods[10]);
+         e.moe = try cuda.moe.Fns.resolve(e.mods[13]);
+         inline for (@typeInfo(Fns).@"struct".field_names) |name| @field(e.fns, name) = try e.mods[4].function("tf_q35_" ++ name);
+-        try @import("cuda_mhc.zig").install(e); // SenseNova-Loop's own image
++        for ([_]cuda.Function{ e.fns.attn_partial, e.fns.attn_rows, e.fns.attn_rows_join, e.fns.attn_partial_whole, e.fns.attn_rows_whole }) |f| try f.allowDynamicShared(tiles.attn_tiles);
++        try mhc.install(e, &e.mhc_fns);
+         inline for (@typeInfo(Keeps).@"struct".field_names) |name| @field(e.keeps, name) = try e.mods[6].function("tf_q35k_" ++ name);
+         e.prompt_attn = try @import("cuda_prompt.zig").resolve(e.mods[16], e.mods[17]);
+         try e.int8.resolve(e.mods[18]);
+@@ -595,6 +597,3 @@ pub const Engine = struct {
+     }
+ };
+ 
+-test {
+-    _ = @import("cuda_engine_suite.zig");
+-}
+diff --git a/zig/src/families/qwen3_5/cuda_layers.zig b/zig/src/families/qwen3_5/cuda_layers.zig
+index 28f9d0be0..fdca85e7a 100644
+--- a/zig/src/families/qwen3_5/cuda_layers.zig
++++ b/zig/src/families/qwen3_5/cuda_layers.zig
+@@ -79,10 +79,6 @@ pub const Fns = struct {
+     argmax_merge: cuda.Function,
+     tap: cuda.Function,
+     splice: cuda.Function,
+-    mhc_branch: cuda.Function,
+-    mhc_merge: cuda.Function,
+-    mhc_enter: cuda.Function,
+-    mhc_leave: cuda.Function,
+ };
+ 
+ /// qwen35_keep.cu's kernels (Cache.keep).
+diff --git a/zig/src/families/qwen3_5/cuda_loop_plan.zig b/zig/src/families/qwen3_5/cuda_loop_plan.zig
+index e1285c6e9..e46504c57 100644
+--- a/zig/src/families/qwen3_5/cuda_loop_plan.zig
++++ b/zig/src/families/qwen3_5/cuda_loop_plan.zig
+@@ -7,6 +7,13 @@ fn object(v: std.json.Value) !std.json.ObjectMap {
+     return if (v == .object) v.object else error.UnsupportedQwenGeometry;
+ }
+ 
++/// A whole field, zero included (a loop may start at layer 0).
++fn whole(o: std.json.ObjectMap, key: []const u8) !usize {
++    const v = o.get(key) orelse return error.UnsupportedQwenGeometry;
++    if (v != .integer or v.integer < 0 or v.integer > geometry.max_layers) return error.UnsupportedQwenGeometry;
++    return @intCast(v.integer);
++}
++
+ /// A positive whole field.
+ fn integer(o: std.json.ObjectMap, key: []const u8) !usize {
+     const v = o.get(key) orelse return error.UnsupportedQwenGeometry;
+@@ -32,8 +39,8 @@ pub fn read(g: *geometry.Geometry, root: std.json.ObjectMap) !void {
+ fn loopPlan(g: *geometry.Geometry, root: std.json.ObjectMap) !void {
+     const v = root.get("loop_settings") orelse return;
+     const o = try object(v);
+-    const start = try integer(o, "start");
+-    const end = try integer(o, "end");
++    const start = try whole(o, "start");
++    const end = try whole(o, "end");
+     const count = try integer(o, "eval_count");
+     if (start >= end or end > g.layers or count < 1) return error.UnsupportedQwenGeometry;
+     // the reference runs fixed-count loop checkpoints only: `counts` is exactly [eval_count] when present
+@@ -52,8 +59,8 @@ fn loopPlan(g: *geometry.Geometry, root: std.json.ObjectMap) !void {
+ fn mhcSettings(g: *geometry.Geometry, root: std.json.ObjectMap) !void {
+     const v = root.get("mhc") orelse return;
+     const o = try object(v);
+-    const start = try integer(o, "start");
+-    const end = try integer(o, "end");
++    const start = try whole(o, "start");
++    const end = try whole(o, "end");
+     const streams = try integer(o, "streams");
+     const iterations = try integer(o, "iterations");
+     if (start >= end or end > g.layers or (streams != 2 and streams != 4) or iterations < 1 or iterations > 64)
+diff --git a/zig/src/families/qwen3_5/cuda_mhc.zig b/zig/src/families/qwen3_5/cuda_mhc.zig
+index c99b22c26..8104e203b 100644
+--- a/zig/src/families/qwen3_5/cuda_mhc.zig
++++ b/zig/src/families/qwen3_5/cuda_mhc.zig
+@@ -1,40 +1,41 @@
+-//! SenseNova-Loop's mHC: its own kernel image, and the four launches the forward makes through it.
++//! SenseNova-Loop's mHC: its own kernel image, its handles, and the four launches the forward makes.
++const std = @import("std");
+ const E = @import("cuda_engine.zig");
++const cuda = @import("cuda");
+ const geometry = @import("cuda_geometry.zig");
+ const sig = @import("cuda_signatures.zig");
+ const launch = @import("cuda_forward.zig").launch;
+ 
+-/// The kernels' image (module 19), under the family's symbol prefix.
+-pub fn install(e: *E.Engine) !void {
+-    inline for (kernels) |name| @field(e.fns, name) = try e.mods[19].function("tf_q35_" ++ name);
++/// The four kernels, from the image the family does not hold (module 19).
++pub const Fns = struct { mhc_branch: cuda.Function, mhc_merge: cuda.Function, mhc_enter: cuda.Function, mhc_leave: cuda.Function };
++
++/// Resolve this module's handles; a model without streams never reaches the image.
++pub fn install(e: *E.Engine, fns: *Fns) !void {
++    if (e.g.mhc == null) return;
++    inline for (@typeInfo(Fns).@"struct".field_names) |name| @field(fns, name) = try e.mods[19].function("tf_q35_" ++ name);
+ }
+ 
+-/// The bf16 tiles' two buffers, which the shared-memory opt-in must declare.
+-pub const tiles = @import("cuda_forward.zig").attn_tiles;
+-
+-const kernels = .{ "mhc_branch", "mhc_merge", "mhc_enter", "mhc_leave" };
+-
+ /// h into every stream at the window's entry, folding the previous layer's output when it is still pending.
+ pub fn enter(e: *E.Engine, rows: usize, m: geometry.Mhc, fold: bool) !void {
+     const geo = e.geo;
+     const r: u64 = if (fold) e.r else 0;
+-    try launch(e, e.fns.mhc_enter, sig.mhc_enter, .{ (rows * e.g.hidden + 255) / 256, 1, 1 }, .{ 256, 1, 1 }, .{ geo, e.h, r, e.hs, @as(c_int, @intCast(rows)), @as(c_int, @intCast(m.streams)) });
++    try launch(e, e.mhc_fns.mhc_enter, sig.mhc_enter, .{ (rows * e.g.hidden + 255) / 256, 1, 1 }, .{ 256, 1, 1 }, .{ geo, e.h, r, e.hs, @as(c_int, @intCast(rows)), @as(c_int, @intCast(m.streams)) });
+ }
+ 
+ /// The streams' mean into h: the window's last execution.
+ pub fn leave(e: *E.Engine, rows: usize, m: geometry.Mhc) !void {
+     const geo = e.geo;
+-    try launch(e, e.fns.mhc_leave, sig.mhc_leave, .{ (rows * e.g.hidden + 255) / 256, 1, 1 }, .{ 256, 1, 1 }, .{ geo, e.hs, e.h, @as(c_int, @intCast(rows)), @as(c_int, @intCast(m.streams)) });
++    try launch(e, e.mhc_fns.mhc_leave, sig.mhc_leave, .{ (rows * e.g.hidden + 255) / 256, 1, 1 }, .{ 256, 1, 1 }, .{ geo, e.hs, e.h, @as(c_int, @intCast(rows)), @as(c_int, @intCast(m.streams)) });
+ }
+ 
+ /// A sublayer's branch out of the streams (into h), with its pre/post/mix kept for the merge.
+ pub fn branch(e: *E.Engine, w: u64, b: u64, rows: usize, m: geometry.Mhc) !void {
+     const geo = e.geo;
+-    try launch(e, e.fns.mhc_branch, sig.mhc_branch, .{ rows, 1, 1 }, .{ 256, 1, 1 }, .{ geo, e.hs, w, b, e.h, e.mhc_state, @as(c_int, @intCast(rows)), @as(c_int, @intCast(m.streams)), @as(c_int, @intCast(m.iterations)), @as(f32, m.pre_scale) });
++    try launch(e, e.mhc_fns.mhc_branch, sig.mhc_branch, .{ rows, 1, 1 }, .{ 256, 1, 1 }, .{ geo, e.hs, w, b, e.h, e.mhc_state, @as(c_int, @intCast(rows)), @as(c_int, @intCast(m.streams)), @as(c_int, @intCast(m.iterations)), @as(f32, m.pre_scale) });
+ }
+ 
+ /// The sublayer's output (r) back into the streams.
+ pub fn merge(e: *E.Engine, rows: usize, m: geometry.Mhc) !void {
+     const geo = e.geo;
+-    try launch(e, e.fns.mhc_merge, sig.mhc_merge, .{ (rows * e.g.hidden + 255) / 256, 1, 1 }, .{ 256, 1, 1 }, .{ geo, e.r, e.mhc_state, e.hs, @as(c_int, @intCast(rows)), @as(c_int, @intCast(m.streams)) });
++    try launch(e, e.mhc_fns.mhc_merge, sig.mhc_merge, .{ (rows * e.g.hidden + 255) / 256, 1, 1 }, .{ 256, 1, 1 }, .{ geo, e.r, e.mhc_state, e.hs, @as(c_int, @intCast(rows)), @as(c_int, @intCast(m.streams)) });
+ }

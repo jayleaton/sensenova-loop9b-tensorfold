@@ -1,0 +1,119 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Jay Leaton <58495321+jayleaton@users.noreply.github.com>
+Date: Wed, 18 Nov 2026 09:36:36 +0800
+Subject: [PATCH 25/26] docs: SenseNova-Loop-9B cold prefill at 512 to 32k, its
+ controls, and the router's bit-identical speedup
+
+---
+ docs/recipes/sensenova-loop-9b-metal.md | 74 ++++++++++++++-----------
+ 1 file changed, 43 insertions(+), 31 deletions(-)
+
+diff --git a/docs/recipes/sensenova-loop-9b-metal.md b/docs/recipes/sensenova-loop-9b-metal.md
+index 632b607f4..72bbd67af 100644
+--- a/docs/recipes/sensenova-loop-9b-metal.md
++++ b/docs/recipes/sensenova-loop-9b-metal.md
+@@ -4,8 +4,8 @@
+ [TensorFold](https://github.com/ashhart/TensorFold) on one Mac. Revision
+ `329a65f701ba8c48b73c30d0cbaa6f0449733673`, BF16, MLX affine 4-bit groups of 64.
+ 
+-This recipe is **experimental**: two of three parity prompts are token-exact and the served decode rate is
+-about 4x below what the execution count predicts. Both are measured below rather than estimated.
++This recipe is **experimental**: two of three parity prompts are token-exact, prefill is within 3% of what the
++execution count predicts, and served decode is about 15% below it. All three are measured below rather than estimated.
+ 
+ ## The model
+ 
+@@ -55,44 +55,56 @@
+ `--no-drafts` is the only supported mode: this checkpoint ships no drafter, and the loop's second visit is not a
+ speculative path. Do not enable MTP or DFlash2 against it.
+ 
+-## Measured on an M3 Ultra (macOS 27.2), 4-bit, drafts off
++## Measured on an M5 Ultra (macOS 27.2), 4-bit, drafts off
+ 
+-Through the served API with `tools/bench_openai.py`, 64 tokens, two repetitions, temperature 0:
++Cold prefill, one fresh process or server per arm, chunk 2048 (the M5 default), 2 repetitions that agree to 0.3%.
++Prompts are the first N tokens of `docs/recipes/*.md` in name order. Through the served API with
++`--prompt-cache-gib 0`, `max_tokens 1`, counting only requests that report `cached_tokens 0`:
++
++| prompt tokens | looped | 56 executions, no window | plain 32-layer | stock Qwen3.5-9B | mlx-lm 0.32.2, stock |
++| --- | --- | --- | --- | --- | --- |
++| 512 | **2710** | 2789 | 4815 | 4824 | 4721 |
++| 2048 | **2754** | 2803 | 4837 | 4841 | 4987 |
++| 8192 | **2718** | 2769 | 4850 | 4856 | 4846 |
++| 32768 | **2460** | 2505 | 4426 | 4429 | 4305 |
++
++The controls come from `tf-qwen27-run --max-tokens 0` on the same binary; the looped column matches it within 0.5%.
++Stock is `mlx-community/Qwen3.5-9B-4bit` @ `8b2b98c0`. Decode and short-prompt latency through `tools/bench_openai.py`,
++64 tokens, 2 repetitions, temperature 0:
+ 
+ | metric | looped | plain 32-layer control |
+ | --- | --- | --- |
+-| decode | **33.19 tok/s** | **123.7 tok/s** |
+-| prefill | 150.2 tok/s | 1457.8 tok/s |
+-| TTFT | 0.032 s | 0.010 s |
++| decode | **59.96 tok/s** | 123.7 tok/s |
++| TTFT, 14-token prompt | 0.019 s | 0.010 s |
+ 
+-The plain control is the same binary and the same weights with `loop_settings.counts=[1]` and no `mhc`, so it
+-isolates the loop and the mHC. Keeping 56 executions but removing only the window gives **83.1 tok/s**, so the
+-loop's own cost is as expected — and the window was the whole gap.
++`bench_openai.py`'s `prefill_tps` is the prompt's tokens over TTFT. With a 14-token prompt that measures one pass's
++latency, not prefill throughput: an earlier "150 tok/s" was 14 tokens over 0.093 s.
+ 
+-The window was one kernel: `tf_mhc_branch`, the router. Skipping each mHC kernel in turn moved decode only for the
+-router (11.3 -> 80.4 tok/s); `merge`, `enter` and `leave` were free. It dispatched **32 threads a row** and computed
+-its eight outputs one after another, so each lane walked 128 elements per output per stream in a single simdgroup.
+-An output a simdgroup — the same 32-lane order, run side by side — is **bit-identical** and takes decode from
+-**11.3 to 35.3 tok/s** (33.19 through the served API). A wider 256-thread tree reduction reaches 42.4 but changes
+-the fp32 reduction order and costs parity against the reference, so it is not landed.
++Prefill sits at 97-98% of the no-window column, and that column is the plain path times 32/56: each execution costs
++what a plain layer does and the GEMMs run at mlx-lm's rate. What is left of the window at 8k is about 50 ms of 3.0 s,
++mostly the router. Dense projections are 83% of GPU time at about 80 TFLOPS.
+ 
+-Remaining: 33 against the 83 no-window figure. The router is one threadgroup at decode (one row), so it cannot fill
+-the GPU.
++The window was one kernel, `tf_mhc_branch`, the router; `merge`, `enter` and `leave` were nearly free. Three changes,
++each bit-identical, so no FP64 study was needed:
+ 
+-`tools/router_fp64.py` settles which reduction orders are open to it. Over **528 real rows** (three prompts,
+-physical layers 4, 5 and 27, both sites, both visits) against an FP64 reference:
++| change | decode | prefill 8k |
++| --- | --- | --- |
++| the router, one simdgroup, outputs in turn | 11.3 | — |
++| outputs side by side, one simdgroup an output | 36.5 | 2596 |
++| two streams fixed at compile time, lane loops unrolled by 8 | 62.7 | 2694 |
++| `merge` with two streams fixed at compile time | 63.6 | 2720 |
+ 
+-| order | logit max\|err\| | logit mean\|err\| | pre max | post max | mix max |
+-| --- | --- | --- | --- | --- | --- |
+-| 32-lane, an output a simdgroup (shipped) | 2.47e-05 | 1.48e-06 | 4.8e-07 | 1.18e-06 | 1.13e-07 |
+-| split-K, 8 slices combined in order | 2.40e-05 | 1.48e-06 | 4.7e-07 | 1.21e-06 | 1.07e-07 |
+-| split-K, 4 slices combined in order | 2.47e-05 | 1.48e-06 | 4.4e-07 | 1.21e-06 | 1.05e-07 |
++Each lane keeps its own summation order, so the router reads the same bits; unrolling only lets eight steps' loads
++overlap, and the fixed stream count is what lets the compiler do it. Prompt hashes at 512, 1003, 2k, 8k and 32k, the
++decoded tokens and the served token hashes equal the previous kernel's.
+ 
+-All three sit at fp32's own rounding and differ by at most a few percent, so a reduction-order change is numerically
+-free here — which is what CONTRIBUTING asks to establish before a reorder lands. It buys nothing, though: the
+-8-slice split-K kernel measured **34.1 tok/s** against the shipped 35.3, because at one row the inner loop over the
+-eight outputs costs more than the extra parallelism pays. So the 32-lane order stays, and the router's cost at one
+-row is a property of the shape rather than of the arithmetic.
++Measured and not landed, all bit-identical: a router taking 4 or 8 rows a threadgroup to share the weight reads
++(+1% and -2%), and a simdgroup owning whole rows and all eight outputs (-5% before unrolling, within noise after). The
++router is latency-bound, not bandwidth-bound. A 256-thread tree reduction reaches 42.4 tok/s decode on the old
++kernel but changes the reduction order; `tools/router_fp64.py` shows such orders are numerically free (528 real rows
++against FP64, all at fp32 rounding).
++
++Remaining: decode is 60 against the no-window 83. At one row the router is a single threadgroup.
+ 
+ ## Fidelity
+ 
+@@ -122,7 +134,7 @@
+ - images and video: the 27-block vision tower is not converted or loaded, and image parts are refused.
+ - contexts past 262144: the checkpoint advertises 524288 positions, but admission caps at 262144.
+ - concurrent streams: every number here is one stream.
+-- other Apple chips: measured on M3 Ultra only.
++- other Apple chips: measured on M5 Ultra only.
+ 
+ ## Credits
+ 

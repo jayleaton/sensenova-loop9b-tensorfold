@@ -1,0 +1,23 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Jay Leaton <58495321+jayleaton@users.noreply.github.com>
+Date: Wed, 18 Nov 2026 04:02:15 +0800
+Subject: [PATCH 15/26] qwen27: one comment line for the window's fold
+
+---
+ zig/src/families/qwen27/forward.zig | 3 +--
+ 1 file changed, 1 insertion(+), 2 deletions(-)
+
+diff --git a/zig/src/families/qwen27/forward.zig b/zig/src/families/qwen27/forward.zig
+index c7fa8a6ac..809fd580c 100644
+--- a/zig/src/families/qwen27/forward.zig
++++ b/zig/src/families/qwen27/forward.zig
+@@ -147,8 +147,7 @@ pub const Stages = struct {
+             const b = s.hc(f);
+             // only the window's first layer expands h into the streams; after it the residual is the streams
+             if (m.config.physical(index) == mh.start) {
+-                // the window's input is the residual with its pending output folded in once: fold in place
+-                // a dedicated buffer, so the residual swap cannot move the fold's output away from enter
++                // the window's input folds its pending output once, into a buffer no swap can move
+                 const folded = f.get(.mhc_folded);
+                 if (s.pending) |pending| {
+                     m.glue.residual(e, s.hidden, pending, folded, h, s.rows);

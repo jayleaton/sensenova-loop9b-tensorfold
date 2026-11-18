@@ -1,0 +1,1088 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Jay Leaton <58495321+jayleaton@users.noreply.github.com>
+Date: Wed, 18 Nov 2026 02:32:26 +0800
+Subject: [PATCH 05/26] qwen27: run a looped checkpoint's executions and its
+ two-stream mHC on Metal
+
+The 27B engine iterated physical layers. A SenseNova-Loop checkpoint declares a
+shared-weight loop (layers [4,28) run twice: 56 executions from 32 weight sets)
+and manifold-constrained hyper-connections over that range, so the config now
+reads loop_settings and mhc through the shared loop_schedule plan and the runner
+indexes its KV and recurrent caches by **execution** rather than by physical
+block: 14 attention slots and 42 GDN slots for this model, each visit with its
+own state. The GDN pool's layer count follows the plan.
+
+Kernels qwen27/mhc.metal: branch (rms over the flattened streams, one simdgroup
+an output's dot product, sigmoid pre, 2*sigmoid post, log-space Sinkhorn over the
+2x2 map, and the branch the sublayer runs on), merge (mix . streams + post *
+branch), and the window's enter/leave boundaries. Coefficients are rounded to
+bf16 before use, as the reference casts them. tf-qwen27-mhc-check compares all
+four against a CPU reference of the same arithmetic: merge, enter and leave are
+bit-identical and branch is exact.
+---
+ zig/build/qwen27.zig                     |   3 +-
+ zig/kernels/metal/qwen27/mhc.metal       | 128 ++++++++++++
+ zig/src/families/qwen27/config.zig       |  26 +++
+ zig/src/families/qwen27/decode_round.zig |  30 +--
+ zig/src/families/qwen27/forward.zig      | 104 ++++++++--
+ zig/src/families/qwen27/gdn_pool.zig     |   3 +-
+ zig/src/families/qwen27/gpu_frame.zig    |  26 ++-
+ zig/src/families/qwen27/gpu_weights.zig  |  21 +-
+ zig/src/families/qwen27/mhc.zig          | 120 +++++++++++
+ zig/src/families/qwen27/model.zig        |   6 +
+ zig/src/families/qwen27/qwen27.zig       |   1 +
+ zig/src/metal/command.zig                |   5 +
+ zig/tests/qwen27/mhc_check.zig           | 241 +++++++++++++++++++++++
+ zig/tests/qwen27/run.zig                 |   1 +
+ 14 files changed, 682 insertions(+), 33 deletions(-)
+ create mode 100644 zig/kernels/metal/qwen27/mhc.metal
+ create mode 100644 zig/src/families/qwen27/mhc.zig
+ create mode 100644 zig/tests/qwen27/mhc_check.zig
+
+diff --git a/zig/build/qwen27.zig b/zig/build/qwen27.zig
+index 53a9cb00f..b4a5a8751 100644
+--- a/zig/build/qwen27.zig
++++ b/zig/build/qwen27.zig
+@@ -16,7 +16,7 @@ pub const Shared = struct {
+ };
+ 
+ /// The 27B's Metal sources, embedded by name (zig/kernels/metal/qwen27).
+-const parts = [_][]const u8{ "xsum", "norm_xs", "norm_input", "mlp_xs", "mlp_ane", "glue", "copy", "moe", "moe_rows", "attention_mpp", "attention_io", "attention_prompt", "attention_prompt_sg" };
++const parts = [_][]const u8{ "xsum", "norm_xs", "norm_input", "mlp_xs", "mlp_ane", "glue", "copy", "moe", "moe_rows", "attention_mpp", "attention_io", "attention_prompt", "attention_prompt_sg", "mhc" };
+ 
+ /// The shared modules, imported into `engine` (whose `core` is itself) for the server and the release binary.
+ pub fn engineModules(b: *std.Build, target: std.Build.ResolvedTarget, metal: *std.Build.Module, sources: *std.Build.Module, engine: *std.Build.Module) Shared {
+@@ -108,6 +108,7 @@ pub fn targets(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.bu
+     const family: []const std.Build.Module.Import = &.{ .{ .name = "qwen27", .module = qwen27 }, .{ .name = "core", .module = qwen_core }, .{ .name = "metal", .module = metal } };
+     _ = program(b, "tf-qwen27-run", "Build the native greedy, chunk and prompt-speed check on real weights", "zig/tests/qwen27/run.zig", target, true, &.{ .{ .name = "qwen27", .module = qwen27 }, .{ .name = "core", .module = qwen_core }, .{ .name = "metal", .module = metal }, .{ .name = "core_lane", .module = core_lane }, .{ .name = "qwen_runtime_sources", .module = s.runtime_sources }, .{ .name = "qwen_gdn_source", .module = s.gdn_source } });
+     _ = program(b, "tf-qwen27-attention-fused", "Build the fused-chain versus tail-kernel attention byte check on this Mac's tensor units, no models", "zig/tests/qwen27/attention_fused.zig", target, false, &.{ .{ .name = "qwen27", .module = qwen27 }, .{ .name = "metal", .module = metal }, .{ .name = "qwen_runtime_sources", .module = s.runtime_sources } });
++    _ = program(b, "tf-qwen27-mhc-check", "Build the mHC branch, merge, enter and leave kernels against a CPU reference of the same arithmetic, no models", "zig/tests/qwen27/mhc_check.zig", target, false, &.{ .{ .name = "qwen27", .module = qwen27 }, .{ .name = "metal", .module = metal }, .{ .name = "qwen_runtime_sources", .module = s.runtime_sources } });
+     _ = program(b, "tf-qwen27-attention-pages", "Build the KV-page attention kernels against main's, bit for bit through shuffled pages, no models", "zig/tests/qwen27/attention_pages.zig", target, false, &.{ .{ .name = "qwen27", .module = qwen27 }, .{ .name = "metal", .module = metal } });
+     _ = program(b, "tf-qwen27-attention-share", "Build the KV-page attention timed with streams on one prefix's pages against copies, no models", "zig/tests/qwen27/attention_share.zig", target, false, &.{ .{ .name = "qwen27", .module = qwen27 }, .{ .name = "metal", .module = metal } });
+     _ = program(b, "tf-qwen27-attention-precision", "Build decode attention's error against a float64 reference on this Mac, no models", "zig/tests/qwen27/attention_precision.zig", target, false, &.{ .{ .name = "qwen27", .module = qwen27 }, .{ .name = "metal", .module = metal }, .{ .name = "qwen_runtime_sources", .module = s.runtime_sources } });
+diff --git a/zig/kernels/metal/qwen27/mhc.metal b/zig/kernels/metal/qwen27/mhc.metal
+new file mode 100644
+index 000000000..f068a5419
+--- /dev/null
++++ b/zig/kernels/metal/qwen27/mhc.metal
+@@ -0,0 +1,128 @@
++using namespace metal;
++// Hyper-connections (mHC): the router's branch, the streams' merge, and the two window boundaries.
++// The coefficients are bf16-rounded before use, as the reference casts them; Sinkhorn runs in log space.
++// Streams are stored stream-major: plane `s` is `streams + s * rows * hidden`, so an operator takes one row range.
++
++struct TfMhc { uint hidden, streams, outs, iters, plane; float pre_scale; };
++
++// A coefficient rounded to bf16 before use, as the reference casts it (`pre.to(dtype)`, `mix.to(dtype)`).
++static inline float tf_mhc_rbf(float v) {
++  return float(bfloat(v));
++}
++
++// One row's router: `outs` mixes of the flattened streams, Sinkhorn over the S x S map, then the branch
++// `pre . streams` the sublayer runs on. STATE keeps S pre, S post and S*S mix as f32 for the merge.
++[[max_total_threads_per_threadgroup(32)]] kernel void tf_mhc_branch(device const bfloat* HS [[buffer(0)]],
++                          device const float* W [[buffer(1)]],
++                          device const float* B [[buffer(2)]],
++                          device bfloat* BRANCH [[buffer(3)]],
++                          device float* STATE [[buffer(4)]],
++                          constant TfMhc& a [[buffer(5)]],
++                          uint row [[threadgroup_position_in_grid]],
++                          uint lane [[thread_index_in_simdgroup]]) {
++  const uint S = a.streams, n = a.outs, H = a.hidden, D = S * H;
++  if (S == 0u || S > 4u || n > 8u) return;
++  threadgroup float mean;
++  // the row's mean square over the flattened streams, then one simdgroup an output's dot product
++  float acc = 0.f;
++  for (uint s = 0; s < S; ++s) for (uint i = lane; i < H; i += 32u) {
++    const float x = float(HS[s * a.plane + row * H + i]);
++    acc += x * x;
++  }
++  acc = simd_sum(acc);
++  if (lane == 0) mean = rsqrt(acc / float(D) + 1e-6f);
++  threadgroup_barrier(mem_flags::mem_threadgroup);
++  const float inv = mean;
++
++  float logits[8];
++  for (uint o = 0; o < n; ++o) {
++    const device float* w = W + uint64_t(o) * D;
++    float s = 0.f;
++    for (uint t = 0; t < S; ++t) for (uint i = lane; i < H; i += 32u) {
++      s += w[t * H + i] * (float(HS[t * a.plane + row * H + i]) * inv);
++    }
++    s = simd_sum(s);
++    logits[o] = s + (B == nullptr ? 0.f : B[o]);
++  }
++  // the coefficients: pre sigmoid, post 2 sigmoid, mix Sinkhorn-normalized in log space
++  float* st = STATE + uint64_t(row) * n;
++  if (lane == 0) {
++    for (uint s = 0; s < S; ++s) {
++      st[s] = 1.f / (1.f + exp(-logits[s]));
++      st[S + s] = 2.f / (1.f + exp(-logits[S + s]));
++    }
++    float m[16];
++    for (uint i = 0; i < S * S; ++i) m[i] = logits[2 * S + i];
++    for (uint it = 0; it < a.iters; ++it) {
++      for (uint r = 0; r < S; ++r) {
++        float mx = -INFINITY;
++        for (uint c = 0; c < S; ++c) mx = fmax(mx, m[r * S + c]);
++        float sum = 0.f;
++        for (uint c = 0; c < S; ++c) sum += exp(m[r * S + c] - mx);
++        const float lz = mx + log(sum);
++        for (uint c = 0; c < S; ++c) m[r * S + c] -= lz;
++      }
++      for (uint c = 0; c < S; ++c) {
++        float mx = -INFINITY;
++        for (uint r = 0; r < S; ++r) mx = fmax(mx, m[r * S + c]);
++        float sum = 0.f;
++        for (uint r = 0; r < S; ++r) sum += exp(m[r * S + c] - mx);
++        const float lz = mx + log(sum);
++        for (uint r = 0; r < S; ++r) m[r * S + c] -= lz;
++      }
++    }
++    for (uint i = 0; i < S * S; ++i) st[2 * S + i] = exp(m[i]);
++  }
++  threadgroup_barrier(mem_flags::mem_threadgroup);
++  for (uint d = lane; d < H; d += 32u) {
++    float b = 0.f;
++    for (uint s = 0; s < S; ++s) b += tf_mhc_rbf(st[s]) * float(HS[s * a.plane + row * H + d]);
++    if (a.pre_scale != 1.f) b *= a.pre_scale;
++    BRANCH[row * H + d] = bfloat(b);
++  }
++}
++
++// streams = mix . streams + post * branch, a thread a (row, column): the outputs of a column read its inputs.
++kernel void tf_mhc_merge(device const bfloat* BRANCH [[buffer(0)]],
++                         device const float* STATE [[buffer(1)]],
++                         device bfloat* HS [[buffer(2)]],
++                         constant TfMhc& a [[buffer(3)]],
++                         uint2 at [[thread_position_in_grid]]) {
++  const uint row = at.y, d = at.x, S = a.streams, H = a.hidden;
++  if (d >= H) return;
++  const float* st = STATE + uint64_t(row) * a.outs;
++  const float b = float(BRANCH[row * H + d]);
++  float ins[4];
++  for (uint t = 0; t < S; ++t) ins[t] = float(HS[t * a.plane + row * H + d]);
++  for (uint s = 0; s < S; ++s) {
++    float v = 0.f;
++    for (uint t = 0; t < S; ++t) v += tf_mhc_rbf(st[2 * S + s * S + t]) * ins[t];
++    HS[s * a.plane + row * H + d] = bfloat(v + tf_mhc_rbf(st[S + s]) * b);
++  }
++}
++
++// h into every stream (a window's first execution); R, when present, is the previous layer's pending output.
++kernel void tf_mhc_enter(device const bfloat* H [[buffer(0)]],
++                         device const bfloat* R [[buffer(1)]],
++                         device bfloat* HS [[buffer(2)]],
++                         constant TfMhc& a [[buffer(3)]],
++                         uint2 at [[thread_position_in_grid]]) {
++  const uint d = at.x, row = at.y, Hd = a.hidden;
++  if (d >= Hd) return;
++  const uint out = row * Hd + d;
++  const float v = float(H[out]) + (R == nullptr ? 0.f : float(R[out]));
++  const bfloat o = bfloat(v);
++  for (uint s = 0; s < a.streams; ++s) HS[s * a.plane + out] = o;
++}
++
++// The streams' mean back into h: a window's last execution.
++kernel void tf_mhc_leave(device const bfloat* HS [[buffer(0)]],
++                         device bfloat* H [[buffer(1)]],
++                         constant TfMhc& a [[buffer(2)]],
++                         uint2 at [[thread_position_in_grid]]) {
++  const uint d = at.x, row = at.y, Hd = a.hidden;
++  if (d >= Hd) return;
++  float s = 0.f;
++  for (uint i = 0; i < a.streams; ++i) s += float(HS[i * a.plane + row * Hd + d]);
++  H[row * Hd + d] = bfloat(s / float(a.streams));
++}
+diff --git a/zig/src/families/qwen27/config.zig b/zig/src/families/qwen27/config.zig
+index 95232b749..ad104aec3 100644
+--- a/zig/src/families/qwen27/config.zig
++++ b/zig/src/families/qwen27/config.zig
+@@ -4,6 +4,7 @@ const layer_pattern = @import("qwen35_layers");
+ const rules = @import("qwen35_rules");
+ const rope_config = @import("rope_config");
+ const rope_yarn = @import("rope_yarn");
++const schedule = @import("loop_schedule");
+ 
+ pub const Kind = enum { linear, attention };
+ pub const max_layers = 128;
+@@ -43,6 +44,9 @@ pub const Config = struct {
+     moe_intermediate: usize = 0,
+     /// Whether a row's top-k softmax weights are renormalized to sum to one (`norm_topk_prob`).
+     renorm: bool = false,
++    /// A shared-weight loop's executions and the mHC window over them; `plan.loops()` false runs every layer once.
++    plan: schedule.Plan = .{},
++    mhc: ?schedule.Mhc = null,
+ 
+     pub fn moe(c: Config) bool {
+         return c.experts != 0;
+@@ -68,6 +72,21 @@ pub const Config = struct {
+         return 2 * c.k_heads * c.dk + c.gdnValueDim();
+     }
+ 
++    /// The executions one forward runs: a **physical** layer unless a loop repeats a range of them.
++    pub fn steps(c: Config) usize {
++        return if (c.plan.len == 0) c.layers else c.plan.len;
++    }
++
++    /// The execution's cache slot: its own kind's ordinal, so each visit has its own KV and recurrent state.
++    pub fn slot(c: Config, exec: usize) usize {
++        return if (c.plan.len == 0) exec else c.plan.slot(exec);
++    }
++
++    /// The physical layer execution `exec` runs: the weights it reads.
++    pub fn physical(c: Config, exec: usize) usize {
++        return if (c.plan.len == 0) exec else c.plan.physical(exec);
++    }
++
+     pub fn isEos(c: Config, token: u32) bool {
+         return std.mem.indexOfScalar(u32, c.eos[0..c.eos_count], token) != null;
+     }
+@@ -360,6 +379,13 @@ pub fn parse(gpa: std.mem.Allocator, json: []const u8, generation: ?[]const u8)
+     var full: [max_layers]bool = undefined;
+     try layer_pattern.read(full[0..c.layers], t);
+     for (c.kinds[0..c.layers], full[0..c.layers]) |*k, f| k.* = if (f) .attention else .linear;
++    // a looped checkpoint repeats a range of layers, and mHC wraps the streams over that range
++    schedule.read(&c.plan, root.get("loop_settings") orelse t.get("loop_settings"), c.layers, std.mem.indexOfScalar(bool, full[0..c.layers], true) != null) catch |err| switch (err) {
++        error.NoFullAttention => return error.UnsupportedLoopOnlyLinear,
++        else => return error.UnsupportedLoopSchedule,
++    };
++    c.plan.count(full[0..c.layers]);
++    c.mhc = schedule.readMhc(root.get("mhc") orelse t.get("mhc"), c.plan) catch return error.UnsupportedMhc;
+     if (root.get("eos_token_id") orelse t.get("eos_token_id")) |v| try eos(&c, v);
+     if (generation) |text| {
+         const gen = try std.json.parseFromSlice(std.json.Value, gpa, text, .{});
+diff --git a/zig/src/families/qwen27/decode_round.zig b/zig/src/families/qwen27/decode_round.zig
+index 4248c0345..af5f471fd 100644
+--- a/zig/src/families/qwen27/decode_round.zig
++++ b/zig/src/families/qwen27/decode_round.zig
+@@ -89,16 +89,18 @@ pub const Runner = struct {
+     fn build(a: std.mem.Allocator, m: *Model, slots: u32, capacity: u32, ready: u32, paged: bool) !Runner {
+         if (slots == 0 or slots > attn.planning.max_streams or capacity == 0 or m.frame.capacity % 16 != 0 or ready == 0 or ready > slots) return error.BadRoundCapacity;
+         const geometry = try attn.planning.Geometry.fromConfig(m.config, m.device.tensorUnits());
+-        const linear_index = try a.alloc(u32, m.config.layers);
++        // indexed by execution, not by physical block: a shared-weight loop's second visit needs its own KV
++        // and its own recurrent state, so the ordinals count executions of each kind
++        const linear_index = try a.alloc(u32, m.config.steps());
+         errdefer a.free(linear_index);
+-        const attention_index = try a.alloc(u32, m.config.layers);
++        const attention_index = try a.alloc(u32, m.config.steps());
+         errdefer a.free(attention_index);
+         var ng: u32 = 0;
+         var na: u32 = 0;
+-        for (linear_index, attention_index, 0..) |*g, *v, block| {
++        for (linear_index, attention_index, 0..) |*g, *v, exec| {
+             g.* = std.math.maxInt(u32);
+             v.* = std.math.maxInt(u32);
+-            if (m.config.kind(block) == .linear) {
++            if (m.config.kind(m.config.physical(exec)) == .linear) {
+                 g.* = ng;
+                 ng += 1;
+             } else {
+@@ -106,7 +108,7 @@ pub const Runner = struct {
+                 na += 1;
+             }
+         }
+-        var pool = try GdnPool.init(m.device, try abi.Shape.init(m.config), ng, slots, m.frame.capacity);
++        var pool = try GdnPool.init(m.device, try abi.Shape.init(m.config), m.config.plan.linear, slots, m.frame.capacity);
+         errdefer pool.deinit();
+         const pipelines = @import("core").startup_receipt.span(.runtime_pipelines);
+         const units = m.device.tensorUnits();
+@@ -305,7 +307,7 @@ pub const Runner = struct {
+         const spanned = if (r.trace) |t| t.spanned else 0; // a profiled pass's spans commit buffers of their own
+         const handed = if (r.model.ane) |share| share.gpu_seconds else 0;
+         var stages = forward.Stages{ .model = r.model, .rows = @intCast(round.ids.len), .hooks = .{ .ptr = r, .gdn = gdnForward, .attention = attentionForward, .tap = if (r.capture_taps) tap else null, .keys = if (r.keysOnly(head)) keysForward else null }, .head = head, .tail = r.tail, .images = placed.images, .reduce = r.reduce, .picks = r.picks };
+-        r.last_gpu_seconds = @import("core").segments.runCommitting(r.model.device, &.{r.model.queue}, r.model.config.layers, .concurrent, &stages, commit_every) catch |err| {
++        r.last_gpu_seconds = @import("core").segments.runCommitting(r.model.device, &.{r.model.queue}, r.model.config.steps(), .concurrent, &stages, commit_every) catch |err| {
+             r.failed = true;
+             return err;
+         };
+@@ -502,16 +504,16 @@ pub const Runner = struct {
+         return views[0..round.slots.len];
+     }
+ 
+-    fn gdnForward(ptr: *anyopaque, e: mtl.ComputeEncoder, block: usize, weights: wts.Gdn, frame: *Frame, rows: u32) !void {
++    fn gdnForward(ptr: *anyopaque, e: mtl.ComputeEncoder, exec: usize, weights: wts.Gdn, frame: *Frame, rows: u32) !void {
+         const r: *Runner = @ptrCast(@alignCast(ptr));
+         var hook = GdnHook{ .pool = &r.gdn, .quant = &r.model.kernels, .glue = r.model.glue, .plan = r.current_gdn orelse return error.RoundNotReady, .linear_index = r.linear_index, .accepted_chain = r.accepted_chain };
+-        try GdnHook.forward(&hook, e, block, weights, frame, rows);
++        try GdnHook.forward(&hook, e, exec, weights, frame, rows);
+     }
+ 
+-    fn attentionForward(ptr: *anyopaque, e: mtl.ComputeEncoder, block: usize, weights: wts.Attention, f: *Frame, rows: u32) !void {
++    fn attentionForward(ptr: *anyopaque, e: mtl.ComputeEncoder, exec: usize, weights: wts.Attention, f: *Frame, rows: u32) !void {
+         const r: *Runner = @ptrCast(@alignCast(ptr));
+         const plan = (r.current_attention orelse return error.RoundNotReady).*;
+-        const layer = r.attention_index[block];
++        const layer = r.attention_index[exec];
+         var views: [attn.planning.max_streams]attn.Cache = undefined;
+         const caches = r.layerCaches(layer, r.current_round orelse return error.RoundNotReady, &views);
+         try r.bindings[layer].upload(plan, caches);
+@@ -528,21 +530,21 @@ pub const Runner = struct {
+ 
+     /// Whether a pass at `head` runs its last layer's keys and values alone (prompt_tail.zig's facts on this runner).
+     fn keysOnly(r: *const Runner, head: forward.Head) bool {
+-        const last = r.model.config.layers - 1;
++        const last = r.model.config.steps() - 1;
+         return @import("prompt_tail.zig").keysOnly(.{
+             .keeps_none = head == .none,
+             .last_tapped = r.capture_taps and std.mem.indexOfScalar(usize, r.taps.ids[0..r.taps.count], last) != null,
+             .pair = r.reduce != null,
+             .ane = r.model.ane != null,
+-            .last_attention = r.model.weights.layers[last].mixer == .attention,
++            .last_attention = r.model.weights.layers[r.model.config.physical(last)].mixer == .attention,
+         });
+     }
+ 
+     /// The last layer of a pass that keeps no row: k and v into the cache, as attentionForward writes them.
+-    fn keysForward(ptr: *anyopaque, e: mtl.ComputeEncoder, block: usize, weights: wts.Attention, f: *Frame, rows: u32) !void {
++    fn keysForward(ptr: *anyopaque, e: mtl.ComputeEncoder, exec: usize, weights: wts.Attention, f: *Frame, rows: u32) !void {
+         const r: *Runner = @ptrCast(@alignCast(ptr));
+         const plan = (r.current_attention orelse return error.RoundNotReady).*;
+-        const layer = r.attention_index[block];
++        const layer = r.attention_index[exec];
+         var views: [attn.planning.max_streams]attn.Cache = undefined;
+         const caches = r.layerCaches(layer, r.current_round orelse return error.RoundNotReady, &views);
+         try r.bindings[layer].upload(plan, caches);
+diff --git a/zig/src/families/qwen27/forward.zig b/zig/src/families/qwen27/forward.zig
+index acd74c1cc..9bfd52782 100644
+--- a/zig/src/families/qwen27/forward.zig
++++ b/zig/src/families/qwen27/forward.zig
+@@ -8,6 +8,7 @@ const Config = @import("config.zig").Config;
+ pub const Ref = @import("projection.zig").Ref;
+ const Frame = @import("gpu_frame.zig").Frame;
+ const ane_mlp = @import("ane_mlp.zig");
++const mhc_mod = @import("mhc.zig");
+ 
+ pub const Mixer = struct {
+     ptr: *anyopaque,
+@@ -63,6 +64,9 @@ pub const Reduce = struct {
+ pub const Head = enum { all, last, none };
+ /// The tap index the embedding answers to: no layer has it, so a dump can carry the rows a layer 0 begins from.
+ pub const embedding_tap = 1000;
++/// The normed input a mixer reads, and the mixer's own output before o_proj: neither is a layer index.
++pub const normed_tap = 1001;
++pub const mixer_out_tap = 1002;
+ /// A verified head's dependent readback work stays in its final command buffer.
+ pub const Tail = struct { ptr: *anyopaque, encode: *const fn (*anyopaque, mtl.ComputeEncoder) anyerror!void };
+ pub const Stages = struct {
+@@ -80,6 +84,30 @@ pub const Stages = struct {
+     reduce: ?Reduce = null,
+     /// Head seam picks (one u32 a row), required with `Reduce.argmax`: the ranks must pick the same token.
+     picks: ?Ref = null,
++    /// Whether the mHC window's streams have been entered, and not yet collapsed.
++    entered: bool = false,
++    /// Whether the execution's physical layer carries the mHC wrapping, and whether the one before it did.
++    fn holds(m: *Model, index: usize) bool {
++        const mh = m.config.mhc orelse return false;
++        return mh.holds(m.config.physical(index));
++    }
++    fn held(m: *Model, index: usize) bool {
++        const mh = m.config.mhc orelse return false;
++        return index > 0 and mh.holds(m.config.physical(index - 1));
++    }
++
++    /// The mHC buffers a window reads: the stream planes, the router's state and the branch.
++    fn hc(s: *Stages, f: *Frame) mhc_mod.Buffers {
++        const mh = s.model.config.mhc.?;
++        return .{
++            .streams = f.get(.streams),
++            .state = f.get(.mhc_state),
++            .branch = f.get(.mhc_branch),
++            .outs = 2 * @as(u32, mh.streams) + @as(u32, mh.streams) * mh.streams,
++            .plane = @intCast(@as(usize, f.capacity) * s.model.config.hidden), // elements: the shader's bfloat stride
++        };
++    }
++
+     pub fn begin(s: *Stages, lane: *@import("core").segments.Lane) !void {
+         const m = s.model;
+         if (s.rows == 0 or s.rows > m.frame.capacity or lane.k != 0) return error.BadFrameRows;
+@@ -101,8 +129,30 @@ pub const Stages = struct {
+         const m = s.model;
+         const f = &m.frame;
+         const e = lane.enc;
+-        const layer = m.weights.layers[index];
++        const layer = m.weights.layers[m.config.physical(index)];
+         const h: u32 = @intCast(m.config.hidden);
++        if (holds(m, index)) {
++            const mh = m.config.mhc.?;
++            const b = s.hc(f);
++            if (!s.entered) {
++                // the window's first execution: h into every stream, folding the previous layer's pending output
++                const from = s.hidden;
++                if (index != 0 and !held(m, index)) {
++                    // the previous layer's output is still pending: fold it into h here, as a norm would
++                    if (s.pending) |pending| m.glue.residual(e, s.hidden, pending, s.hidden, h, s.rows);
++                    e.barrier();
++                    if (s.hooks.tap) |tap| try tap(s.hooks.ptr, e, index - 1, s.hidden, s.rows);
++                }
++                mhc_mod.enter(e, m.mhc.?, b, b.params(mh, h, f.capacity), s.rows, from, null);
++                e.barrier();
++                s.entered = true;
++            }
++            mhc_mod.branch(e, m.mhc.?, b, b.params(mh, h, f.capacity), s.rows, layer.mhc_attn.?.weight.buffer, layer.mhc_attn.?.bias.buffer);
++            e.barrier();
++            try m.kernels.norm(e, b.branch, null, wts.ref(layer.norm), f.get(.eps), f.get(.dims), f.get(.input), f.get(.input), f.get(.sums), h, s.rows);
++            e.barrier();
++            return;
++        }
+         try m.kernels.norm(e, s.hidden, s.pending, wts.ref(layer.norm), f.get(.eps), f.get(.dims), s.residual, f.get(.input), f.get(.sums), h, s.rows);
+         e.barrier();
+         if (s.pending != null) {
+@@ -110,18 +160,20 @@ pub const Stages = struct {
+             if (s.hooks.tap) |tap| try tap(s.hooks.ptr, e, index - 1, s.hidden, s.rows);
+         }
+     }
++
+     /// The last layer of a pass whose other rows nothing reads: q, attention, o and the MLP have no reader.
+     fn keysOnly(s: *const Stages, index: usize) bool {
+-        return s.hooks.keys != null and s.head == .none and index + 1 == s.model.config.layers;
++        return s.hooks.keys != null and s.head == .none and index + 1 == s.model.config.steps();
+     }
+     pub fn mixer(s: *Stages, lane: *@import("core").segments.Lane, index: usize) !void {
+         const m = s.model;
++        if (index == 0) if (s.hooks.tap) |tap| try tap(s.hooks.ptr, lane.enc, normed_tap, s.model.frame.get(.input), s.rows);
+         if (s.keysOnly(index)) {
+-            try s.hooks.keys.?(s.hooks.ptr, lane.enc, index, m.weights.layers[index].mixer.attention, &m.frame, s.rows);
++            try s.hooks.keys.?(s.hooks.ptr, lane.enc, index, m.weights.layers[m.config.physical(index)].mixer.attention, &m.frame, s.rows);
+             lane.enc.barrier();
+             return;
+         }
+-        switch (m.weights.layers[index].mixer) {
++        switch (m.weights.layers[m.config.physical(index)].mixer) {
+             .linear => |g| try s.hooks.gdn(s.hooks.ptr, lane.enc, index, g, &m.frame, s.rows),
+             .attention => |a| try s.hooks.attention(s.hooks.ptr, lane.enc, index, a, &m.frame, s.rows),
+         }
+@@ -132,7 +184,7 @@ pub const Stages = struct {
+         const m = s.model;
+         const f = &m.frame;
+         var e = lane.enc;
+-        const layer = m.weights.layers[index];
++        const layer = m.weights.layers[m.config.physical(index)];
+         const h: u32 = @intCast(m.config.hidden);
+         const out = switch (layer.mixer) {
+             .linear => |g| g.out,
+@@ -160,9 +212,18 @@ pub const Stages = struct {
+             if (s.reduce.?.broken()) return error.PairFailed;
+             e.barrier();
+         }
+-        try m.kernels.norm(e, s.hidden, f.get(.output), wts.ref(layer.post_norm), f.get(.eps), f.get(.dims), s.residual, f.get(.input), f.get(.sums), h, s.rows);
++        if (index == 0) if (s.hooks.tap) |tap| try tap(s.hooks.ptr, lane.enc, mixer_out_tap, f.get(.mixer_out), s.rows);
++        if (holds(m, index)) {
++            const mh = m.config.mhc.?;
++            const b = s.hc(f);
++            mhc_mod.merge(e, m.mhc.?, b, b.params(mh, h, f.capacity), s.rows, f.get(.output));
++            e.barrier();
++            mhc_mod.branch(e, m.mhc.?, b, b.params(mh, h, f.capacity), s.rows, layer.mhc_ffn.?.weight.buffer, layer.mhc_ffn.?.bias.buffer);
++            e.barrier();
++            try m.kernels.norm(e, b.branch, null, wts.ref(layer.post_norm), f.get(.eps), f.get(.dims), f.get(.input), f.get(.input), f.get(.sums), h, s.rows);
++        } else try m.kernels.norm(e, s.hidden, f.get(.output), wts.ref(layer.post_norm), f.get(.eps), f.get(.dims), s.residual, f.get(.input), f.get(.sums), h, s.rows);
+         e.barrier();
+-        std.mem.swap(Ref, &s.hidden, &s.residual);
++        if (!holds(m, index)) std.mem.swap(Ref, &s.hidden, &s.residual);
+         if (layer.moe) |*mo| if (!m.moe.?.sorted(mo, m.kernels.prompt)) {
+             // decode rows: the routed block runs the shared expert as one more slot of the experts' kernel
+             try m.moe.?.block(lane.enc, m.config, mo, f, s.rows, m.kernels.prompt);
+@@ -236,6 +297,22 @@ pub const Stages = struct {
+             try m.moe.?.block(lane.enc, m.config, mo, f, s.rows, m.kernels.prompt);
+             lane.enc.barrier();
+         }
++        if (holds(m, index)) {
++            const mh = m.config.mhc.?;
++            const b = s.hc(f);
++            mhc_mod.merge(e, m.mhc.?, b, b.params(mh, h, f.capacity), s.rows, f.get(.output));
++            e.barrier();
++            // the window's last execution: the next one leaves it, so the streams collapse back into h
++            if (!(index + 1 < m.config.steps() and holds(m, index + 1))) {
++                mhc_mod.leave(e, m.mhc.?, b, b.params(mh, h, f.capacity), s.rows, s.hidden);
++                e.barrier();
++                s.entered = false;
++                s.pending = null;
++                return;
++            }
++            s.pending = null;
++            return;
++        }
+         s.pending = f.get(.output);
+     }
+     pub fn finish(s: *Stages, lane: *@import("core").segments.Lane) !void {
+@@ -243,11 +320,11 @@ pub const Stages = struct {
+         const f = &m.frame;
+         // The head seam reopens the encoder, so it goes back in the lane; rank 0's half-vocab argmax is not a token.
+         var e = lane.enc;
+-        if (s.keysOnly(m.config.layers - 1)) return if (s.tail) |tail| tail.encode(tail.ptr, e);
++        if (s.keysOnly(m.config.steps() - 1)) return if (s.tail) |tail| tail.encode(tail.ptr, e);
+         try m.kernels.norm(e, s.hidden, s.pending, wts.ref(m.weights.norm), f.get(.eps), f.get(.dims), s.residual, f.get(.input), f.get(.sums), @intCast(m.config.hidden), s.rows);
+         e.barrier();
+         std.mem.swap(Ref, &s.hidden, &s.residual);
+-        if (s.hooks.tap) |tap| try tap(s.hooks.ptr, e, m.config.layers - 1, s.hidden, s.rows);
++        if (s.hooks.tap) |tap| try tap(s.hooks.ptr, e, m.config.steps() - 1, s.hidden, s.rows);
+         if (s.head == .all and s.rows > @import("gpu_frame.zig").logit_rows) return error.BadFrameRows;
+         if (s.head != .none) {
+             var input = f.get(.input);
+@@ -291,10 +368,11 @@ fn run(m: *Model, e: *mtl.ComputeEncoder, stages: *Stages) !void {
+     var lane = @import("core").segments.Lane{ .k = 0, .cb = undefined, .enc = e.*, .fence = undefined };
+     defer e.* = lane.enc;
+     try stages.begin(&lane);
+-    for (0..m.config.layers) |index| {
+-        try stages.pre(&lane, index);
+-        try stages.mixer(&lane, index);
+-        try stages.post(&lane, index);
++    // a shared-weight loop runs some physical layers more than once: the plan names the weights and the cache slot
++    for (0..m.config.steps()) |exec| {
++        try stages.pre(&lane, exec);
++        try stages.mixer(&lane, exec);
++        try stages.post(&lane, exec);
+     }
+     try stages.finish(&lane);
+ }
+diff --git a/zig/src/families/qwen27/gdn_pool.zig b/zig/src/families/qwen27/gdn_pool.zig
+index 6d3a40771..82732d0bd 100644
+--- a/zig/src/families/qwen27/gdn_pool.zig
++++ b/zig/src/families/qwen27/gdn_pool.zig
+@@ -68,7 +68,8 @@ pub const Budget = struct {
+     scratch: usize,
+ 
+     pub fn init(shape: abi.Shape, layers: usize, slots: usize, rows: usize) !Budget {
+-        if (layers == 0 or layers > shape.c.layers or slots == 0 or slots > 128 or rows == 0 or rows > @import("gpu_frame.zig").max_rows) return error.BadGdnPool;
++        // `layers` counts a mixer's executions, which a shared-weight loop makes more than the physical layers
++        if (layers == 0 or layers > @import("gpu_frame.zig").max_rows or slots == 0 or slots > 128 or rows == 0 or rows > @import("gpu_frame.zig").max_rows) return error.BadGdnPool;
+         const layer_slots = try std.math.mul(usize, layers, slots);
+         const layer_rows = try std.math.mul(usize, layers, rows);
+         const query = try abi.countBytes(u16, shape.c.k_heads * shape.c.dk, layer_rows);
+diff --git a/zig/src/families/qwen27/gpu_frame.zig b/zig/src/families/qwen27/gpu_frame.zig
+index 1efb68fd2..febb2aaa3 100644
+--- a/zig/src/families/qwen27/gpu_frame.zig
++++ b/zig/src/families/qwen27/gpu_frame.zig
+@@ -4,7 +4,9 @@ const mtl = @import("metal");
+ const Config = @import("config.zig").Config;
+ const Ref = @import("projection.zig").Ref;
+ 
+-pub const Field = enum { ids, dims, positions, hidden, residual, input, sums, mixed, mixer_out, output, z, a, b, query, key, value, norm_query, norm_key, q_gate, gate, up, activated, act_sums, logits, drawn, eps, parents, windows, row_slots, segments, keeps, kept_rows, rotated_key, takes, slot_steps, router, picks, route_weights, offsets, order, sorted_weights, sorted_rows, expert_gate, expert_up, expert_act, expert_out, expert_sums };
++pub const Field = enum { ids, dims, positions, hidden, residual, input, sums, mixed, mixer_out, output, z, a, b, query, key, value, norm_query, norm_key, q_gate, gate, up, activated, act_sums, logits, drawn, eps, parents, windows, row_slots, segments, keeps, kept_rows, rotated_key, takes, slot_steps, router, picks, route_weights, offsets, order, sorted_weights, sorted_rows, expert_gate, expert_up, expert_act, expert_out, expert_sums,
++    /// A looped checkpoint's mHC: the residual streams (four planes at most), the router's f32 outputs, the branch.
++    streams, mhc_state, mhc_branch };
+ 
+ /// A prompt pass's rows at most (a chain); rounds with trees and every logits row stay within `logit_rows`.
+ pub const max_rows = 2048;
+@@ -37,11 +39,31 @@ pub fn allocationSizes(config: Config, capacity: u32) [std.enums.values(Field).l
+         slots * 4,                                                                          slots * 4,                                                                                                                              slots * config.hidden * 2,
+         slots * config.moe_intermediate * 2,                                                slots * config.moe_intermediate * 2,                                                                                                    slots * config.moe_intermediate * 2,
+         slots * config.hidden * 2,                                                          slots * @max(config.hidden, config.moe_intermediate) / 64 * 4,
++        // the window's streams, router state and branch: nothing at all unless the checkpoint declares mHC
++        streamBytes(config, capacity),                                                       mhcStateBytes(config, capacity),                                                                    mhcBranchBytes(config, capacity),
+     };
+ }
+ 
++/// The streams an mHC window holds: `streams` planes of a row's hidden state (0 when there are none).
++fn streamBytes(config: Config, capacity: u32) usize {
++    const mh = config.mhc orelse return 0;
++    return @as(usize, capacity) * config.hidden * 2 * mh.streams;
++}
++
++/// The router's f32 outputs: pre, post and the inline S x S map size.
++fn mhcStateBytes(config: Config, capacity: u32) usize {
++    const mh = config.mhc orelse return 0;
++    return @as(usize, capacity) * (2 * mh.streams + mh.streams * mh.streams) * 4;
++}
++
++/// One branch row a sublayer runs on.
++fn mhcBranchBytes(config: Config, capacity: u32) usize {
++    if (config.mhc == null) return 0;
++    return @as(usize, capacity) * config.hidden * 2;
++}
++
+ pub const small_rows = 512;
+-const scratch_fields = [_]Field{ .hidden, .residual, .input, .sums, .mixed, .mixer_out, .output, .z, .a, .b, .query, .key, .value, .norm_query, .norm_key, .q_gate, .gate, .up, .activated, .act_sums };
++const scratch_fields = [_]Field{ .hidden, .residual, .input, .sums, .mixed, .mixer_out, .output, .z, .a, .b, .query, .key, .value, .norm_query, .norm_key, .q_gate, .gate, .up, .activated, .act_sums, .streams, .mhc_state, .mhc_branch };
+ 
+ pub fn decodeSizes(config: Config, capacity: u32) [scratch_fields.len]usize {
+     const widths = allocationSizes(config, @min(capacity, small_rows));
+diff --git a/zig/src/families/qwen27/gpu_weights.zig b/zig/src/families/qwen27/gpu_weights.zig
+index 1383e2244..de4cdcab0 100644
+--- a/zig/src/families/qwen27/gpu_weights.zig
++++ b/zig/src/families/qwen27/gpu_weights.zig
+@@ -17,7 +17,9 @@ pub const Attention = struct { q: Linear, kv: Linear, out: Linear, q_norm: Tenso
+ /// The routed block: the router (experts, shared gate, zero rows), the stacked experts, the shared expert's matrices.
+ pub const Moe = struct { router: row_gpu.Weights, gate: row_gpu.Experts, up: row_gpu.Experts, down: row_gpu.Experts, shared_gate: row_gpu.Weights, shared_up: row_gpu.Weights, shared_down: row_gpu.Weights };
+ /// With experts, `gu` and `down` are the shared expert's.
+-pub const Layer = struct { norm: Tensor, post_norm: Tensor, gu: Linear, down: Linear, moe: ?Moe = null, mixer: union(@import("config.zig").Kind) { linear: Gdn, attention: Attention } };
++/// A layer's two mHC routers, f32 as the checkpoint ships them: `[outputs, streams*hidden]` and `[outputs]`.
++pub const Router = struct { weight: Tensor, bias: Tensor };
++pub const Layer = struct { norm: Tensor, post_norm: Tensor, gu: Linear, down: Linear, moe: ?Moe = null, mhc_attn: ?Router = null, mhc_ffn: ?Router = null, mixer: union(@import("config.zig").Kind) { linear: Gdn, attention: Attention } };
+ 
+ pub const Weights = struct {
+     allocator: std.mem.Allocator,
+@@ -320,7 +322,22 @@ const Builder = struct {
+             .{ .module = try Name.full(a, prefix, "mlp.up_proj"), .n = g.intermediate, .w = w[@backingInt(M.up)], .span = s.intermediateRows() },
+         }, g.hidden);
+         const down = if (shared) |t| try b.stack(&.{t[2]}) else try b.linear(&.{.{ .module = try Name.full(a, prefix, "mlp.down_proj"), .n = g.hidden, .w = w[@backingInt(M.down)], .span = s.outputRows() }}, g.intermediate);
+-        return .{ .norm = try b.tensor(try Name.full(a, prefix, "input_layernorm.weight"), .bf16, &.{c.hidden}), .post_norm = try b.tensor(try Name.full(a, prefix, "post_attention_layernorm.weight"), .bf16, &.{c.hidden}), .gu = gu, .down = down, .moe = moe, .mixer = mixer };
++        const inside = if (c.mhc) |mh| mh.holds(i) else false;
++        var routers: [2]?Router = .{ null, null };
++        if (inside) {
++            const mh = c.mhc.?;
++            const outs = 2 * mh.streams + mh.streams * mh.streams;
++            const k = mh.streams * c.hidden;
++            routers[0] = .{
++                .weight = try b.tensor(try Name.full(a, prefix, "mhc_attn.weight"), .f32, &.{ outs, k }),
++                .bias = try b.tensor(try Name.full(a, prefix, "mhc_attn.bias"), .f32, &.{outs}),
++            };
++            routers[1] = .{
++                .weight = try b.tensor(try Name.full(a, prefix, "mhc_ffn.weight"), .f32, &.{ outs, k }),
++                .bias = try b.tensor(try Name.full(a, prefix, "mhc_ffn.bias"), .f32, &.{outs}),
++            };
++        }
++        return .{ .norm = try b.tensor(try Name.full(a, prefix, "input_layernorm.weight"), .bf16, &.{c.hidden}), .post_norm = try b.tensor(try Name.full(a, prefix, "post_attention_layernorm.weight"), .bf16, &.{c.hidden}), .gu = gu, .down = down, .moe = moe, .mhc_attn = routers[0], .mhc_ffn = routers[1], .mixer = mixer };
+     }
+ };
+ 
+diff --git a/zig/src/families/qwen27/mhc.zig b/zig/src/families/qwen27/mhc.zig
+new file mode 100644
+index 000000000..99886b850
+--- /dev/null
++++ b/zig/src/families/qwen27/mhc.zig
+@@ -0,0 +1,120 @@
++//! A looped checkpoint's two-stream mHC: the router's branch, the streams' merge and the window boundaries.
++const std = @import("std");
++const mtl = @import("metal");
++const source = @import("qwen_runtime_sources");
++const schedule = @import("loop_schedule");
++const projection = @import("projection.zig");
++const Ref = projection.Ref;
++
++/// qwen27/mhc.metal's argument struct: the widths a boundary reads and the stride between stream planes.
++pub const Params = extern struct { hidden: u32, streams: u32, outs: u32, iters: u32, plane: u32, pre_scale: f32 };
++
++pub const Kernels = struct {
++    br: mtl.Pipeline,
++    mg: mtl.Pipeline,
++    en: mtl.Pipeline,
++    lv: mtl.Pipeline,
++
++    pub fn init(device: mtl.Device) !Kernels {
++        const lib = try mtl.Library.fromSource(device, source.mhc, mtl.CompileOptions.mlx());
++        defer lib.deinit();
++        const br = try mtl.Pipeline.init(device, lib, "tf_mhc_branch", false);
++        errdefer br.deinit();
++        const mg = try mtl.Pipeline.init(device, lib, "tf_mhc_merge", false);
++        errdefer mg.deinit();
++        const en = try mtl.Pipeline.init(device, lib, "tf_mhc_enter", false);
++        errdefer en.deinit();
++        const lv = try mtl.Pipeline.init(device, lib, "tf_mhc_leave", false);
++        return .{ .br = br, .mg = mg, .en = en, .lv = lv };
++    }
++
++    pub fn deinit(k: Kernels) void {
++        inline for (.{ k.br, k.mg, k.en, k.lv }) |p| p.deinit();
++    }
++};
++
++/// The buffers a boundary needs: the streams, the coefficients, and the branch the sublayer reads.
++pub const Buffers = struct {
++    streams: Ref,
++    state: Ref,
++    branch: Ref,
++    /// One row's outputs: pre, post, then the stream-mixing logits.
++    outs: u32,
++    /// Elements between stream planes: `capacity * hidden` (the shader indexes bfloat rows).
++    plane: u32,
++
++    pub fn params(b: Buffers, s: schedule.Mhc, hidden: u32, plane: u32) Params {
++        return .{ .hidden = hidden, .streams = s.streams, .outs = b.outs, .iters = s.iterations, .plane = plane, .pre_scale = s.pre_scale };
++    }
++};
++
++/// Bytes one row of the windows' state takes: the router's outputs as f32.
++pub fn stateBytes(outs: u32, rows: u32) !usize {
++    return std.math.mul(usize, try std.math.mul(usize, outs, rows), @sizeOf(f32));
++}
++
++/// `h` into every stream: the window's first execution, folding the previous layer's pending output when set.
++pub fn enter(e: mtl.ComputeEncoder, k: Kernels, b: Buffers, p: Params, rows: u32, from: Ref, pending: ?Ref) void {
++    e.setPipeline(k.en);
++    e.setBuffer(from.buffer, from.offset, 0);
++    if (pending) |r| e.setBuffer(r.buffer, r.offset, 1) else e.setNullBuffer(1);
++    e.setBuffer(b.streams.buffer, b.streams.offset, 2);
++    e.setValue(p, 3);
++    e.dispatchThreads(mtl.Size.of(p.hidden, rows, 1), mtl.Size.of(threads(p.hidden), 1, 1));
++}
++
++/// Threads a width wants: a whole number of 32-lane groups, at most 256.
++fn threads(width: u32) u32 {
++    return @min(@max(width + 31 & ~@as(u32, 31), 32), 256);
++}
++
++/// The streams' mean into `h`: the window's last execution.
++pub fn leave(e: mtl.ComputeEncoder, k: Kernels, b: Buffers, p: Params, rows: u32, out: Ref) void {
++    e.setPipeline(k.lv);
++    e.setBuffer(b.streams.buffer, b.streams.offset, 0);
++    e.setBuffer(out.buffer, out.offset, 1);
++    e.setValue(p, 2);
++    e.dispatchThreads(mtl.Size.of(p.hidden, rows, 1), mtl.Size.of(threads(p.hidden), 1, 1));
++}
++
++/// A sublayer's branch out of the streams, with its pre/post/mix kept for `merge`.
++pub fn branch(e: mtl.ComputeEncoder, k: Kernels, b: Buffers, p: Params, rows: u32, weight: mtl.Buffer, bias: mtl.Buffer) void {
++    e.setPipeline(k.br);
++    e.setBuffer(b.streams.buffer, b.streams.offset, 0);
++    e.setBuffer(weight, 0, 1);
++    e.setBuffer(bias, 0, 2);
++    e.setBuffer(b.branch.buffer, b.branch.offset, 3);
++    e.setBuffer(b.state.buffer, b.state.offset, 4);
++    e.setValue(p, 5);
++    e.dispatchGroups(mtl.Size.of(rows, 1, 1), mtl.Size.of(32, 1, 1));
++}
++
++/// The sublayer's output back into the streams.
++pub fn merge(e: mtl.ComputeEncoder, k: Kernels, b: Buffers, p: Params, rows: u32, from: Ref) void {
++    e.setPipeline(k.mg);
++    e.setBuffer(from.buffer, from.offset, 0);
++    e.setBuffer(b.state.buffer, b.state.offset, 1);
++    e.setBuffer(b.streams.buffer, b.streams.offset, 2);
++    e.setValue(p, 3);
++    e.dispatchThreads(mtl.Size.of(p.hidden, rows, 1), mtl.Size.of(threads(p.hidden), 1, 1));
++}
++
++test "the mHC argument is 24 bytes and every field sits where the shader reads it" {
++    try std.testing.expectEqual(@as(usize, 24), @sizeOf(Params));
++    try std.testing.expectEqual(@as(usize, 16), @offsetOf(Params, "plane"));
++    try std.testing.expectEqual(@as(usize, 20), @offsetOf(Params, "pre_scale"));
++    try std.testing.expectEqual(@as(usize, 4), @offsetOf(Params, "streams"));
++}
++
++test "a width's thread count is whole 32-lane groups, never above 256" {
++    try std.testing.expectEqual(@as(u32, 32), threads(1));
++    try std.testing.expectEqual(@as(u32, 32), threads(4096 % 32));
++    try std.testing.expectEqual(@as(u32, 128), threads(128));
++    try std.testing.expectEqual(@as(u32, 256), threads(4096));
++    try std.testing.expectEqual(@as(u32, 256), threads(16384));
++}
++
++test "the windows' router state is one f32 an output a row" {
++    try std.testing.expectEqual(@as(usize, 8 * 128 * 4), try stateBytes(8, 128));
++    try std.testing.expectError(error.Overflow, stateBytes(std.math.maxInt(u32), std.math.maxInt(u32)));
++}
+diff --git a/zig/src/families/qwen27/model.zig b/zig/src/families/qwen27/model.zig
+index 91c82ae97..68d729ee8 100644
+--- a/zig/src/families/qwen27/model.zig
++++ b/zig/src/families/qwen27/model.zig
+@@ -12,11 +12,14 @@ const glue = @import("glue_gpu.zig");
+ const moe_gpu = @import("moe_gpu.zig");
+ const Frame = @import("gpu_frame.zig").Frame;
+ const ane_mlp = @import("ane_mlp.zig");
++const mhc_mod = @import("mhc.zig");
+ 
+ const ane_policy = @import("ane_policy.zig");
+ 
+ pub const Model = struct {
+     allocator: std.mem.Allocator,
++    /// A looped checkpoint's mHC pipelines; null unless the config declares a window.
++    mhc: ?mhc_mod.Kernels = null,
+     device: mtl.Device,
+     queue: mtl.Queue,
+     /// This rank's share of the family's weights; `local` shapes are what this graph builds, `global` the file's.
+@@ -136,6 +139,8 @@ pub const Model = struct {
+         errdefer m.glue.deinit();
+         m.moe = if (c.moe()) try moe_gpu.Kernels.init(a, m.device) else null;
+         errdefer if (m.moe) |*k| k.deinit();
++        m.mhc = if (c.mhc != null) try mhc_mod.Kernels.init(m.device) else null;
++        errdefer if (m.mhc) |k| k.deinit();
+         pipelines.end();
+         const allocation = timing.span(.initial_allocation);
+         // Serving defers automatic widening until its context and streams are known; explicit widths stay exact.
+@@ -198,6 +203,7 @@ pub const Model = struct {
+         if (m.ane) |share| share.deinit();
+         m.frame.deinit();
+         if (m.moe) |*k| k.deinit();
++        if (m.mhc) |k| k.deinit();
+         m.glue.deinit();
+         m.kernels.deinit();
+         m.weights.deinit();
+diff --git a/zig/src/families/qwen27/qwen27.zig b/zig/src/families/qwen27/qwen27.zig
+index 0f78d4b52..f4e3f04e5 100644
+--- a/zig/src/families/qwen27/qwen27.zig
++++ b/zig/src/families/qwen27/qwen27.zig
+@@ -2,6 +2,7 @@
+ pub const dflash = @import("dflash/root.zig");
+ pub const gguf = @import("gguf.zig");
+ pub const config = @import("config.zig");
++pub const mhc = @import("mhc.zig");
+ pub const affine = @import("affine.zig");
+ pub const widths = @import("widths.zig");
+ pub const checkpoint = @import("checkpoint.zig");
+diff --git a/zig/src/metal/command.zig b/zig/src/metal/command.zig
+index 769e09956..693233255 100644
+--- a/zig/src/metal/command.zig
++++ b/zig/src/metal/command.zig
+@@ -154,6 +154,11 @@ pub const ComputeEncoder = struct {
+         objc.msg(void, self.id, "setBuffer:offset:atIndex:", .{ buffer.id, offset, index });
+     }
+ 
++    /// Binds no buffer at an index: a shader tests it against nullptr, which a bound buffer never equals.
++    pub fn setNullBuffer(self: ComputeEncoder, index: usize) void {
++        objc.msg(void, self.id, "setBuffer:offset:atIndex:", .{ @as(?*anyopaque, null), @as(usize, 0), index });
++    }
++
+     /// Small constants copied into the command stream (at most 4 KB).
+     pub fn setBytes(self: ComputeEncoder, bytes: []const u8, index: usize) void {
+         objc.msg(void, self.id, "setBytes:length:atIndex:", .{ bytes.ptr, bytes.len, index });
+diff --git a/zig/tests/qwen27/mhc_check.zig b/zig/tests/qwen27/mhc_check.zig
+new file mode 100644
+index 000000000..f3735dcad
+--- /dev/null
++++ b/zig/tests/qwen27/mhc_check.zig
+@@ -0,0 +1,241 @@
++//! The mHC kernels against a CPU reference of the same arithmetic: the gate a new boundary must pass.
++const std = @import("std");
++const mtl = @import("metal");
++const q = @import("qwen27");
++const mhc = q.mhc;
++
++const hidden = 256;
++const streams = 2;
++const outs = 8;
++const iterations = 20;
++const rows = 1;
++
++fn bf(x: f32) f32 {
++    const bits: u32 = @bitCast(x);
++    const rounded = if (std.math.isNan(x)) (bits >> 16) | 0x40 else (bits + 0x7fff + ((bits >> 16) & 1)) >> 16;
++    return @bitCast(@as(u32, rounded) << 16);
++}
++
++fn sigmoid(x: f32) f32 {
++    return 1.0 / (1.0 + @exp(-x));
++}
++
++/// The reference's router: rms over the flattened streams, `outs` dot products, sigmoid/two-sigmoid, Sinkhorn.
++fn reference(hs: []const f32, w: []const f32, b: []const f32, state: *[outs]f32, branch: *[hidden]f32) void {
++    var acc: f32 = 0;
++    for (hs) |x| acc += x * x;
++    const inv = 1.0 / @sqrt(acc / @as(f32, @floatFromInt(streams * hidden)) + 1e-6);
++    var logits: [outs]f32 = undefined;
++    // the kernel reads the stream's bf16 value and its fp32 product
++    for (0..outs) |o| {
++        var s: f32 = 0;
++        for (hs, 0..) |x, i| s += w[o * streams * hidden + i] * (x * inv);
++        logits[o] = s + b[o];
++    }
++    for (0..streams) |s| {
++        state[s] = sigmoid(logits[s]);
++        state[streams + s] = 2.0 * sigmoid(logits[streams + s]);
++    }
++    var m: [16]f32 = undefined;
++    for (0..streams * streams) |i| m[i] = logits[2 * streams + i];
++    for (0..iterations) |_| {
++        for (0..streams) |r| {
++            var mx: f32 = -std.math.inf(f32);
++            for (0..streams) |c| mx = @max(mx, m[r * streams + c]);
++            var sum: f32 = 0;
++            for (0..streams) |c| sum += @exp(m[r * streams + c] - mx);
++            const lz = mx + @log(sum);
++            for (0..streams) |c| m[r * streams + c] -= lz;
++        }
++        for (0..streams) |c| {
++            var mx: f32 = -std.math.inf(f32);
++            for (0..streams) |r| mx = @max(mx, m[r * streams + c]);
++            var sum: f32 = 0;
++            for (0..streams) |r| sum += @exp(m[r * streams + c] - mx);
++            const lz = mx + @log(sum);
++            for (0..streams) |r| m[r * streams + c] -= lz;
++        }
++    }
++    for (0..streams * streams) |i| state[2 * streams + i] = @exp(m[i]);
++    // the branch: the bf16-rounded pre weights times the streams
++    for (0..hidden) |d| {
++        var v: f32 = 0;
++        for (0..streams) |s| v += bf(state[s]) * hs[s * hidden + d];
++        branch[d] = bf(v);
++    }
++}
++
++fn referenceMerge(branch: []const f32, state: []const f32, hs: []f32) void {
++    var ins: [4]f32 = undefined;
++    for (0..streams) |t| for (0..hidden) |d| {
++        _ = d;
++        _ = t;
++    };
++    for (0..hidden) |d| {
++        for (0..streams) |t| ins[t] = hs[t * hidden + d];
++        for (0..streams) |s| {
++            var v: f32 = 0;
++            for (0..streams) |t| v += bf(state[2 * streams + s * streams + t]) * ins[t];
++            hs[s * hidden + d] = bf(v + bf(state[streams + s]) * branch[d]);
++        }
++    }
++}
++
++fn fill(x: []f32, seed: u64) void {
++    var s = seed;
++    for (x) |*v| {
++        s = s *% 6364136223846793005 +% 1442695040888963407;
++        const u: f32 = @floatFromInt((s >> 40) & 0xffff);
++        v.* = (u / 65535.0 - 0.5) * 0.5;
++    }
++}
++
++fn toBf(dst: []u16, src: []const f32) void {
++    for (dst, src) |*d, v| {
++        const bits: u32 = @bitCast(v);
++        d.* = @intCast((bits + 0x7fff + ((bits >> 16) & 1)) >> 16);
++    }
++}
++
++fn ofBf(src: []const u16) f32 {
++    return @bitCast(@as(u32, src[0]) << 16);
++}
++
++pub fn main(init: std.process.Init) !void {
++    const a = init.arena.allocator();
++    const args = try init.minimal.args.toSlice(a);
++    var device = try mtl.Device.init();
++    defer device.deinit();
++    const k = try mhc.Kernels.init(device);
++    defer k.deinit();
++
++    // one row in the fixture: a plane is one hidden row of elements
++    const plane: u32 = hidden;
++    var hs: [streams * hidden]f32 = undefined;
++    fill(&hs, 7);
++    var w: [outs * streams * hidden]f32 = undefined;
++    var b: [outs]f32 = undefined;
++    fill(&w, 11);
++    // a second argument zeroes the weights: the logits are the bias alone, isolating the reduction
++    if (args.len > 1) @memset(&w, 0);
++    fill(&b, 13);
++
++    var hs16: [streams * hidden]u16 = undefined;
++    toBf(&hs16, &hs);
++
++    // a plane is `hidden` bfloat elements: the buffer is bytes, the shader's stride is elements
++    const streams_buf = try device.buffer(@as(usize, streams) * plane * @sizeOf(u16), mtl.ResourceOptions.shared | mtl.ResourceOptions.untracked);
++    defer streams_buf.deinit();
++    const state_buf = try device.buffer(rows * outs * 4, mtl.ResourceOptions.shared | mtl.ResourceOptions.untracked);
++    defer state_buf.deinit();
++    const branch_buf = try device.buffer(rows * hidden * 2, mtl.ResourceOptions.shared | mtl.ResourceOptions.untracked);
++    defer branch_buf.deinit();
++    const w_buf = try device.buffer(w.len * 4, mtl.ResourceOptions.shared | mtl.ResourceOptions.untracked);
++    defer w_buf.deinit();
++    const b_buf = try device.buffer(outs * 4, mtl.ResourceOptions.shared | mtl.ResourceOptions.untracked);
++    defer b_buf.deinit();
++
++    @memcpy(w_buf.slice(f32, w.len), &w);
++    @memcpy(b_buf.slice(f32, outs), &b);
++    // rows: each `rows` slice of the streams is a row; this fixture uses one row for the router and one for the merge
++    const hs_slice = streams_buf.slice(u16, streams * hidden);
++    @memcpy(hs_slice, &hs16);
++    @memset(state_buf.contents()[0 .. rows * outs * 4], 0);
++
++    const q2 = try device.queue();
++    defer q2.deinit();
++    const cb = q2.commandBuffer();
++    const e = cb.compute(.serial);
++    const params = mhc.Params{ .hidden = hidden, .streams = streams, .outs = outs, .iters = iterations, .plane = plane, .pre_scale = 1.0 };
++    const bufs = mhc.Buffers{ .streams = .{ .buffer = streams_buf }, .state = .{ .buffer = state_buf }, .branch = .{ .buffer = branch_buf }, .outs = outs, .plane = plane };
++    mhc.branch(e, k, bufs, params, 1, w_buf, b_buf);
++    e.end();
++    cb.commit();
++    cb.wait();
++    if (cb.failure()) |f| {
++        std.debug.print("branch failed: {s}\n", .{f});
++        return error.GpuFailed;
++    }
++
++    var want_state: [outs]f32 = undefined;
++    var want_branch: [hidden]f32 = undefined;
++    var flat: [streams * hidden]f32 = undefined;
++    for (0..streams) |s| {
++        for (0..hidden) |d| flat[s * hidden + d] = ofBf(hs16[s * hidden + d ..]);
++    }
++    reference(&flat, &w, &b, &want_state, &want_branch);
++
++    const got_state = state_buf.slice(f32, outs);
++    var worst_state: f32 = 0;
++    var worst_branch: f32 = 0;
++    for (0..outs) |i| {
++        worst_state = @max(worst_state, @abs(got_state[i] - want_state[i]));
++    }
++    const got_branch = branch_buf.slice(u16, hidden);
++    for (0..hidden) |i| {
++        worst_branch = @max(worst_branch, @abs(ofBf(got_branch[i..]) - want_branch[i]));
++    }
++    std.debug.print("mhc branch: state max|d| {e:.3}, branch max|d| {e:.3}\n", .{ worst_state, worst_branch });
++    for (0..outs) |i| std.debug.print("  state[{d}] got {d:.6} want {d:.6}\n", .{ i, got_state[i], want_state[i] });
++    std.debug.print("  branch[0..4] bits {d} {d} {d} {d}\n", .{ got_branch[0], got_branch[1], got_branch[2], got_branch[3] });
++    std.debug.print("  branch[0] got {d:.6} want {d:.6}\n", .{ ofBf(got_branch[0..]), want_branch[0] });
++    // the state is a sigmoid of a dot product and the branch a bf16 sum: a permuted fp32 reduction
++    // of 512 terms moves these, and the released router is fp32 with coefficients far from 0 or 1
++    if (worst_state > 2e-3 or worst_branch > 1e-2) return error.MhcBranchMismatch;
++
++    // the merge, from the router's own coefficients
++    const c2 = q2.commandBuffer();
++    const e2 = c2.compute(.serial);
++    mhc.merge(e2, k, bufs, params, 1, .{ .buffer = branch_buf });
++    e2.end();
++    c2.commit();
++    c2.wait();
++    if (c2.failure()) |f| {
++        std.debug.print("merge failed: {s}\n", .{f});
++        return error.GpuFailed;
++    }
++    var want_hs = flat;
++    referenceMerge(&want_branch, &want_state, &want_hs);
++    const got = streams_buf.slice(u16, streams * hidden);
++    var worst: f32 = 0;
++    for (0..streams) |s| {
++        for (0..hidden) |d| worst = @max(worst, @abs(ofBf(got[s * hidden + d ..]) - want_hs[s * hidden + d]));
++    }
++    std.debug.print("mhc merge: max|d| {e:.3}\n", .{worst});
++    if (worst > 1e-3) return error.MhcMergeMismatch;
++    // the boundaries: h into every stream, then the streams' mean back into h
++    const h_buf = try device.buffer(@as(usize, hidden) * @sizeOf(u16), mtl.ResourceOptions.shared | mtl.ResourceOptions.untracked);
++    defer h_buf.deinit();
++    var h16: [hidden]u16 = undefined;
++    toBf(&h16, flat[0..hidden]);
++    @memcpy(h_buf.slice(u16, hidden), &h16);
++    // the fixture's h is bf16, so enter's output is that same bf16 value: compare in bf16
++    var rounded: [hidden]f32 = undefined;
++    for (0..hidden) |d| rounded[d] = ofBf(h16[d..]);
++    const c3 = q2.commandBuffer();
++    const e3 = c3.compute(.serial);
++    mhc.enter(e3, k, bufs, params, 1, .{ .buffer = h_buf }, null);
++    e3.end();
++    c3.commit();
++    c3.wait();
++    const entered = streams_buf.slice(u16, streams * hidden);
++    var worst_enter: f32 = 0;
++    for (0..streams) |s| {
++        for (0..hidden) |d| worst_enter = @max(worst_enter, @abs(ofBf(entered[s * hidden + d ..]) - rounded[d]));
++    }
++    const c4 = q2.commandBuffer();
++    const e4 = c4.compute(.serial);
++    mhc.leave(e4, k, bufs, params, 1, .{ .buffer = h_buf });
++    e4.end();
++    c4.commit();
++    c4.wait();
++    var want_mean: f32 = 0;
++    for (0..hidden) |d| {
++        var sum: f32 = 0;
++        for (0..streams) |s| sum += ofBf(entered[s * hidden + d ..]);
++        want_mean = @max(want_mean, @abs(ofBf(h_buf.slice(u16, hidden)[d..]) - bf(sum / @as(f32, streams))));
++    }
++    std.debug.print("mhc enter: max|d| {e:.3}, leave: max|d| {e:.3}\n", .{ worst_enter, want_mean });
++    if (worst_enter != 0 or want_mean != 0) return error.MhcBoundaryMismatch;
++    std.debug.print("PASS mhc: branch, merge, enter and leave match the CPU reference\n", .{});
++}
+diff --git a/zig/tests/qwen27/run.zig b/zig/tests/qwen27/run.zig
+index 6d452742a..e3e314442 100644
+--- a/zig/tests/qwen27/run.zig
++++ b/zig/tests/qwen27/run.zig
+@@ -205,6 +205,7 @@ pub fn main(init: std.process.Init) !void {
+     }
+     const s = q.session.Session{ .runner = &runner };
+     const load_ns = load_start.durationTo(std.Io.Clock.awake.now(io)).toNanoseconds();
++    if (std.c.getenv("TF_Q27_STEPS") != null) std.debug.print("steps {d} of {d} physical layers, mhc {any}\n", .{ m.config.steps(), m.config.layers, m.config.mhc != null });
+     if (warmup) {
+         try s.prefill(ids[0..@min(ids.len, 128)], 128);
+         try runner.reset(0);

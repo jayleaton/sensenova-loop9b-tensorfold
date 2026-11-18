@@ -1,0 +1,32 @@
+sensenova-loop9b-tensorfold
+Copyright 2026 Jay Leaton (https://x.com/jayleaton)
+
+This project's scripts, configs, patches and documentation are licensed under the Apache License, Version 2.0 (see
+LICENSE). If you redistribute this project or a modified version of it, keep this NOTICE file and the copyright line
+above, and state what you changed (Apache-2.0, section 4).
+
+This project builds on third-party work that keeps its own license:
+
+TensorFold
+  https://github.com/ashhart/TensorFold
+  Fetched at build time at the commits in config/cuda/tensorfold.rev and config/metal/tensorfold.rev; not included
+  here. The files in patches/ are modifications of TensorFold source. The changes are this project's work under
+  Apache-2.0; the TensorFold code they modify, and quote as diff context, stays under TensorFold's license, so keep
+  TensorFold's copyright and permission notices with any copy of a patched tree. TensorFold's NOTICE, reproduced
+  verbatim:
+  ------------------------------------------------------------------------------------------------------------------
+  TensorFold
+  Copyright 2026 TensorFold contributors
+  https://github.com/ashhart/TensorFold
+
+  TensorFold is licensed under the Apache License, Version 2.0 (LICENSE) from 0.6.0.
+  Releases up to 0.5.0 were MIT-licensed, and code written before 0.6.0 keeps its
+  MIT notice in LICENSES/MIT.txt. Third-party code and its licenses are listed in
+  THIRD_PARTY_NOTICES.md.
+  ------------------------------------------------------------------------------------------------------------------
+
+SenseNova-Loop-9B
+  https://huggingface.co/sensenova/SenseNova-Loop-9B (revision 329a65f701ba8c48b73c30d0cbaa6f0449733673)
+  By SenseNova, Apache License 2.0 (https://github.com/OpenSenseNova/SenseNova-Loop/blob/main/LICENSE). Not
+  included: each user downloads the checkpoint under the terms on its model card. The docs describe the model's
+  architecture as published in its config and reference code.

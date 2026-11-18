@@ -1,0 +1,140 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Jay Leaton <58495321+jayleaton@users.noreply.github.com>
+Date: Wed, 18 Nov 2026 03:51:48 +0800
+Subject: [PATCH 12/26] qwen27: fold the window's pending residual in the live
+ buffer
+
+The fold staged into frame.hidden even after the norm's swap had made the live
+residual frame.residual, so it folded pending into a stale row and then let enter
+read that. Folding in place, where s.hidden actually points, and consuming
+pending make the window's input measure 0.125 against the reference, the same
+accuracy the plain path has, instead of 5.94.
+
+Taps now route by seam id at or past seam_base to the narrow tape and a layer id
+to the streams tape, so one hook records both widths.
+---
+ zig/src/families/qwen27/decode_round.zig |  3 +--
+ zig/src/families/qwen27/forward.zig      | 21 ++++++++++-----------
+ zig/src/families/qwen27/taps.zig         | 17 ++++++++++++++---
+ zig/tests/qwen27/run.zig                 |  1 -
+ 4 files changed, 25 insertions(+), 17 deletions(-)
+
+diff --git a/zig/src/families/qwen27/decode_round.zig b/zig/src/families/qwen27/decode_round.zig
+index 76fc38ad6..03620113d 100644
+--- a/zig/src/families/qwen27/decode_round.zig
++++ b/zig/src/families/qwen27/decode_round.zig
+@@ -558,8 +558,7 @@ pub const Runner = struct {
+ 
+     fn tap(ptr: *anyopaque, e: mtl.ComputeEncoder, layer: usize, hidden: @import("projection.zig").Ref, rows: u32) !void {
+         const r: *Runner = @ptrCast(@alignCast(ptr));
+-        try r.taps.record(r.model.glue, e, layer, hidden, rows);
+-        try r.taps.recordHalf(r.model.glue, e, layer, hidden, rows);
++        try r.taps.recordOne(r.model.glue, e, layer, hidden, rows);
+     }
+ };
+ 
+diff --git a/zig/src/families/qwen27/forward.zig b/zig/src/families/qwen27/forward.zig
+index 84578185b..6ad39b53b 100644
+--- a/zig/src/families/qwen27/forward.zig
++++ b/zig/src/families/qwen27/forward.zig
+@@ -71,6 +71,9 @@ pub const normed_tap = 1001;
+ pub const mixer_out_tap = 1002;
+ /// A window layer's branch plane, one layer wide: recorded on the narrow tape beside the streams.
+ pub const branch_tap = 1003;
++/// The residual before the window's fold, and after it: the seam that proves the fold's content.
++pub const hidden_tap = 1004;
++pub const folded_tap = 1005;
+ /// A verified head's dependent readback work stays in its final command buffer.
+ pub const Tail = struct { ptr: *anyopaque, encode: *const fn (*anyopaque, mtl.ComputeEncoder) anyerror!void };
+ pub const Stages = struct {
+@@ -140,19 +143,15 @@ pub const Stages = struct {
+             const b = s.hc(f);
+             // only the window's first layer expands h into the streams; after it the residual is the streams
+             if (m.config.physical(index) == mh.start) {
+-                // the window's input is the layer-3 residual with its pending output folded in exactly once
+-                const from = f.get(.hidden);
++                // the window's input is the residual with its pending output folded in once: fold in place
+                 if (s.pending) |pending| {
+-                    m.glue.residual(e, from, pending, from, h, s.rows);
++                    if (s.hooks.tap) |tap| try tap(s.hooks.ptr, e, hidden_tap, s.hidden, s.rows);
++                    m.glue.residual(e, s.hidden, pending, s.hidden, h, s.rows);
+                     e.barrier();
+-                    if (s.hooks.tap) |tap| try tap(s.hooks.ptr, e, index - 1, from, s.rows);
++                    if (s.hooks.tap) |tap| try tap(s.hooks.ptr, e, folded_tap, s.hidden, s.rows);
++                    s.pending = null;
+                 }
+-                // the norm's residual may have been swapped: stage it so enter reads one buffer
+-                if (s.hidden.buffer.id != from.buffer.id or s.hidden.offset != from.offset) {
+-                    try m.glue.unstack(e, from, s.hidden, .{ .rows = s.rows, .width = h, .stride = h, .offset = 0 });
+-                    e.barrier();
+-                }
+-                mhc_mod.enter(e, m.mhc.?, b, b.params(mh, h), s.rows, from, null);
++                mhc_mod.enter(e, m.mhc.?, b, b.params(mh, h), s.rows, s.hidden, null);
+                 e.barrier();
+                 // from here the window's residual is the flat streams: every stage reads and writes that
+                 s.hidden = s.window;
+@@ -160,7 +159,7 @@ pub const Stages = struct {
+             if (s.hooks.tap) |tap| try tap(s.hooks.ptr, e, index, s.window, s.rows);
+             mhc_mod.branch(e, m.mhc.?, b, b.params(mh, h), s.rows, layer.mhc_attn.?.weight.buffer, layer.mhc_attn.?.bias.buffer);
+             e.barrier();
+-            if (m.config.physical(index) == mh.start) if (s.hooks.half) |half| try half(s.hooks.ptr, e, branch_tap, b.branch, s.rows);
++            if (s.hooks.half) |half| try half(s.hooks.ptr, e, branch_tap, b.branch, s.rows);
+             try m.kernels.norm(e, b.branch, null, wts.ref(layer.norm), f.get(.eps), f.get(.dims), f.get(.input), f.get(.input), f.get(.sums), h, s.rows);
+             e.barrier();
+             return;
+diff --git a/zig/src/families/qwen27/taps.zig b/zig/src/families/qwen27/taps.zig
+index 700279b93..dcd69e8c8 100644
+--- a/zig/src/families/qwen27/taps.zig
++++ b/zig/src/families/qwen27/taps.zig
+@@ -69,7 +69,8 @@ pub const Taps = struct {
+     pub fn recordHalf(t: *Taps, glue: Glue, e: mtl.ComputeEncoder, layer: usize, hidden: Ref, rows: u32) !void {
+         const buf = t.half orelse return;
+         if (rows == 0 or rows > t.capacity) return error.BadTapShape;
+-        const index = std.mem.indexOfScalar(usize, t.ids[0..t.count], layer) orelse return;
++        const index = if (layer >= seam_base) layer - seam_base else std.mem.indexOfScalar(usize, t.ids[0..t.count], layer) orelse return;
++        if (index >= t.count) return;
+         if (t.half_seen != 0 and rows != t.half_rows) return error.BadTapShape;
+         const bit = @as(u16, 1) << @intCast(index);
+         // a loop visits a physical layer twice: the narrow tape keeps the first visit, as a seam to compare
+@@ -80,9 +81,19 @@ pub const Taps = struct {
+         t.half_rows = rows;
+     }
+ 
++    /// A seam id at or past this is one layer wide; a layer id is the carried state, streams wide in a window.
++    pub const seam_base = 1000;
++
++    /// One hook, two tapes: a layer's carried state goes to the streams tape, a seam's plane to the narrow one.
++    pub fn recordOne(t: *Taps, glue: Glue, e: mtl.ComputeEncoder, layer: usize, hidden: Ref, rows: u32) !void {
++        if (t.half != null and (layer >= seam_base or t.width == t.half_width)) return t.recordHalf(glue, e, layer, hidden, rows);
++        return t.record(glue, e, layer, hidden, rows);
++    }
++
+     pub fn record(t: *Taps, glue: Glue, e: mtl.ComputeEncoder, layer: usize, hidden: Ref, rows: u32) !void {
+         if (rows == 0 or rows > t.capacity) return error.BadTapShape;
+-        const index = std.mem.indexOfScalar(usize, t.ids[0..t.count], layer) orelse return;
++        const index = if (layer >= seam_base) layer - seam_base else std.mem.indexOfScalar(usize, t.ids[0..t.count], layer) orelse return;
++        if (index >= t.count) return;
+         if (t.seen != 0 and rows != t.rows) return error.BadTapShape;
+         const bit = @as(u16, 1) << @intCast(index);
+         if (t.seen & bit != 0) return error.DuplicateTap;
+@@ -101,7 +112,7 @@ pub const Taps = struct {
+     pub fn complete(t: Taps) !void {
+         if (t.count == 0 or t.count > t.planes) return error.IncompleteTaps;
+         const all = (@as(u16, 1) << @intCast(t.count)) - 1;
+-        if (t.seen | t.half_seen != all) return error.IncompleteTaps;
++        if (t.seen != all) return error.IncompleteTaps;
+     }
+ 
+     /// The narrow tape is optional, so it completes on its own: every requested plane, or none at all.
+diff --git a/zig/tests/qwen27/run.zig b/zig/tests/qwen27/run.zig
+index 90929e837..38cd50d78 100644
+--- a/zig/tests/qwen27/run.zig
++++ b/zig/tests/qwen27/run.zig
+@@ -224,7 +224,6 @@ pub fn main(init: std.process.Init) !void {
+     }
+     const s = q.session.Session{ .runner = &runner };
+     const load_ns = load_start.durationTo(std.Io.Clock.awake.now(io)).toNanoseconds();
+-    if (std.c.getenv("TF_Q27_STEPS") != null) std.debug.print("steps {d} of {d} physical layers, mhc {any}\n", .{ m.config.steps(), m.config.layers, m.config.mhc != null });
+     if (warmup) {
+         try s.prefill(ids[0..@min(ids.len, 128)], 128);
+         try runner.reset(0);

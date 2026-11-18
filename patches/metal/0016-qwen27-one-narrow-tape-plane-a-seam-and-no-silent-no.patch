@@ -1,0 +1,211 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Jay Leaton <58495321+jayleaton@users.noreply.github.com>
+Date: Wed, 18 Nov 2026 04:06:47 +0800
+Subject: [PATCH 16/26] qwen27: one narrow-tape plane a seam, and no silent
+ no-ops
+
+The narrow tape shared the streams tape's plane count, so a seam id past that
+count was silently dropped and a dump read an unwritten plane. Seams now get
+their own slots from seam_base, a run declares which it wants, and completion
+refuses when one never fired (IncompleteSeams). An unknown or out-of-range id is
+an error rather than a skip.
+
+With the tape trustworthy, the window measures 0.125 / cos 0.999979 at the fold
+(same as the plain path) and 0.2889 rms against 0.2755 after enter, and the gate
+reaches p1 64/64 and p2 64/64, p0 19/64 at a rank-2 near-tie.
+---
+ zig/src/families/qwen27/decode_round.zig |  5 +-
+ zig/src/families/qwen27/forward.zig      |  5 +-
+ zig/src/families/qwen27/taps.zig         | 70 +++++++++++++++---------
+ zig/tests/qwen27/run.zig                 | 11 +++-
+ 4 files changed, 60 insertions(+), 31 deletions(-)
+
+diff --git a/zig/src/families/qwen27/decode_round.zig b/zig/src/families/qwen27/decode_round.zig
+index 03620113d..e7c226f3d 100644
+--- a/zig/src/families/qwen27/decode_round.zig
++++ b/zig/src/families/qwen27/decode_round.zig
+@@ -323,7 +323,10 @@ pub const Runner = struct {
+             r.gpu_seconds += r.last_gpu_seconds + (t.spanned - spanned) + (if (r.model.ane) |share| share.gpu_seconds - handed else 0);
+             t.round();
+         }
+-        if (r.capture_taps) try r.taps.complete();
++        if (r.capture_taps) {
++            try r.taps.complete();
++            try r.taps.completeHalf();
++        }
+         if (accepted) {
+             for (round.slots, round.windows) |slot, window| r.offsets[slot] = window.start + @as(u32, @intCast(window.parents.len));
+         } else r.active = fingerprint(round);
+diff --git a/zig/src/families/qwen27/forward.zig b/zig/src/families/qwen27/forward.zig
+index 809fd580c..62c6e6eb1 100644
+--- a/zig/src/families/qwen27/forward.zig
++++ b/zig/src/families/qwen27/forward.zig
+@@ -17,8 +17,7 @@ pub const Mixer = struct {
+     tap: ?*const fn (*anyopaque, mtl.ComputeEncoder, usize, Ref, u32) anyerror!void = null,
+     /// The narrow tape: a plane one layer wide, inside a window whose state is streams wide.
+     half: ?*const fn (*anyopaque, mtl.ComputeEncoder, usize, Ref, u32) anyerror!void = null,
+-    /// The window's stream plane sliced to `hidden`, for a seam whose source is streams wide.
+-    enter_tap: ?*const fn (*anyopaque, mtl.ComputeEncoder, usize, Ref, u32) anyerror!void = null,
++
+     /// A pass that keeps no row and has no other reader of the last layer: that layer writes keys and values only.
+     keys: ?*const fn (*anyopaque, mtl.ComputeEncoder, usize, wts.Attention, *Frame, u32) anyerror!void = null,
+ };
+@@ -162,7 +161,7 @@ pub const Stages = struct {
+                 s.hidden = s.window;
+             }
+             if (s.hooks.tap) |tap| try tap(s.hooks.ptr, e, index, s.window, s.rows);
+-            if (m.config.physical(index) == mh.start) if (s.hooks.enter_tap) |hook| try hook(s.hooks.ptr, e, entered_tap, s.window, s.rows);
++            if (s.hooks.tap) |tap| try tap(s.hooks.ptr, e, entered_tap, s.window, s.rows);
+             mhc_mod.branch(e, m.mhc.?, b, b.params(mh, h), s.rows, wts.ref(layer.mhc_attn.?.weight), wts.ref(layer.mhc_attn.?.bias));
+             e.barrier();
+             if (s.hooks.half) |half| try half(s.hooks.ptr, e, branch_tap, b.branch, s.rows);
+diff --git a/zig/src/families/qwen27/taps.zig b/zig/src/families/qwen27/taps.zig
+index b96ac5eda..543c2538f 100644
+--- a/zig/src/families/qwen27/taps.zig
++++ b/zig/src/families/qwen27/taps.zig
+@@ -7,6 +7,9 @@ const Glue = @import("glue_gpu.zig").Kernels;
+ /// The 27B drafter's tap layers, the default before a drafter sets its own.
+ pub const layers = [_]usize{ 5, 19, 33, 47, 61 };
+ pub const max_planes = 8;
++/// Seam planes the narrow tape holds: one a seam id, from `seam_base`.
++pub const max_seams = 16;
++pub const seam_base = 1000;
+ 
+ pub const Taps = struct {
+     buffer: mtl.Buffer,
+@@ -23,6 +26,8 @@ pub const Taps = struct {
+     half_width: u32 = 0,
+     half_seen: u16 = 0,
+     half_rows: u32 = 0,
++    /// Seams the run asked for: every one must be recorded, so a no-op cannot pass silently.
++    half_want: u16 = 0,
+ 
+     pub fn init(device: mtl.Device, capacity: u32, width: u32) !Taps {
+         if (capacity == 0 or capacity > @import("gpu_frame.zig").max_rows or width == 0) return error.BadTapShape;
+@@ -58,49 +63,60 @@ pub const Taps = struct {
+         t.half_rows = 0;
+     }
+ 
++    /// Declares that the run will record these seams, so completion can insist on each of them.
++    pub fn wantSeams(t: *Taps, ids: []const usize) !void {
++        t.half_want = 0;
++        for (ids) |id| {
++            if (id < seam_base) continue;
++            const index = try halfPlane(id);
++            t.half_want |= @as(u16, 1) << @intCast(index);
++        }
++    }
++
+     /// The narrower tape, for a plane that is one layer wide inside a streams-wide window.
+     pub fn useHalf(t: *Taps, device: mtl.Device, width: u32) !void {
+         if (width == 0 or width == t.width) return;
+-        t.half = try planesBuffer(device, t.capacity, width, max_planes);
++        t.half = try planesBuffer(device, t.capacity, width, max_seams);
+         t.half_width = width;
+     }
+ 
+-    /// Records `hidden` into the narrow tape, at the same plane index the streams tape uses.
+-    pub fn recordHalfW(t: *Taps, glue: Glue, e: mtl.ComputeEncoder, layer: usize, hidden: Ref, rows: u32, width: u32) !void {
+-        const buf = t.half orelse return;
+-        if (width == 0 or width > t.half_width) return;
+-        const index = if (layer >= seam_base) layer - seam_base else return;
+-        if (index >= t.count) return;
+-        if (t.half_seen != 0 and rows != t.half_rows) return error.BadTapShape;
++    /// The narrow tape's plane for a seam id: one plane a seam, numbered from `seam_base`, never `count` of them.
++    pub fn halfPlane(seam: usize) !usize {
++        if (seam < seam_base) return error.NotASeam;
++        const index = seam - seam_base;
++        if (index >= max_seams) return error.SeamOutOfRange;
++        return index;
++    }
++
++    /// Records a seam's plane at its own slot; an unknown or out-of-range seam is refused, never skipped.
++    pub fn recordHalfW(t: *Taps, glue: Glue, e: mtl.ComputeEncoder, seam: usize, hidden: Ref, rows: u32, width: u32) !void {
++        const buf = t.half orelse return error.NoNarrowTape;
++        if (width == 0 or width > t.half_width) return error.BadSeamWidth;
++        const index = try halfPlane(seam);
++        if (rows == 0 or rows > t.capacity) return error.BadTapShape;
++        if (t.half_rows != 0 and rows != t.half_rows) return error.BadTapShape;
+         const bit = @as(u16, 1) << @intCast(index);
+-        if (t.half_seen & bit != 0) return;
++        if (t.half_seen & bit != 0) return; // a loop revisits a seam: the first visit is the one compared
+         try glue.unstack(e, hidden, .{ .buffer = buf, .offset = index * @as(usize, t.capacity) * t.half_width * 2 }, .{ .rows = rows, .width = width, .stride = width, .offset = 0 });
+         e.barrier();
+         t.half_seen |= bit;
+         t.half_rows = rows;
+     }
+ 
++    /// A layer's plane on the narrow tape, for a model whose state is one layer wide.
+     pub fn recordHalf(t: *Taps, glue: Glue, e: mtl.ComputeEncoder, layer: usize, hidden: Ref, rows: u32) !void {
+-        const buf = t.half orelse return;
+-        if (rows == 0 or rows > t.capacity) return error.BadTapShape;
+-        const index = if (layer >= seam_base) layer - seam_base else std.mem.indexOfScalar(usize, t.ids[0..t.count], layer) orelse return;
+-        if (index >= t.count) return;
+-        if (t.half_seen != 0 and rows != t.half_rows) return error.BadTapShape;
+-        const bit = @as(u16, 1) << @intCast(index);
+-        // a loop visits a physical layer twice: the narrow tape keeps the first visit, as a seam to compare
+-        if (t.half_seen & bit != 0) return;
+-        try glue.unstack(e, hidden, .{ .buffer = buf, .offset = index * @as(usize, t.capacity) * t.half_width * 2 }, .{ .rows = rows, .width = t.half_width, .stride = t.half_width, .offset = 0 });
+-        e.barrier();
+-        t.half_seen |= bit;
+-        t.half_rows = rows;
++        if (layer >= seam_base) return t.recordHalfW(glue, e, layer, hidden, rows, t.half_width);
++        const index = std.mem.indexOfScalar(usize, t.ids[0..t.count], layer) orelse return;
++        return t.recordHalfW(glue, e, seam_base + index, hidden, rows, t.half_width);
+     }
+ 
+-    /// A seam id at or past this is one layer wide; a layer id is the carried state, streams wide in a window.
+-    pub const seam_base = 1000;
+ 
+     /// One hook, two tapes: a layer's carried state goes to the streams tape, a seam's plane to the narrow one.
+     pub fn recordOne(t: *Taps, glue: Glue, e: mtl.ComputeEncoder, layer: usize, hidden: Ref, rows: u32) !void {
+-        if (t.half != null and (layer >= seam_base or t.width == t.half_width)) return t.recordHalf(glue, e, layer, hidden, rows);
++        if (t.half != null and (layer >= seam_base or t.width == t.half_width)) {
++            // a seam over the streams tape's plane is sliced to one layer's width by its own record
++            return t.recordHalfW(glue, e, layer, hidden, rows, if (layer >= seam_base) t.half_width else t.half_width);
++        }
+         return t.record(glue, e, layer, hidden, rows);
+     }
+ 
+@@ -130,8 +146,10 @@ pub const Taps = struct {
+         if (t.seen != all and !(t.seen == 0 and t.half_seen != 0)) return error.IncompleteTaps;
+     }
+ 
+-    /// The narrow tape is optional, so it completes on its own: every requested plane, or none at all.
+-    pub fn completeHalf(_: Taps) !void {}
++    /// Every seam the run asked for must have a plane: a silent no-op is a failed measurement, not a skip.
++    pub fn completeHalf(t: Taps) !void {
++        if (t.half_want != 0 and t.half_seen & t.half_want != t.half_want) return error.IncompleteSeams;
++    }
+ 
+     pub fn accepted(t: Taps, glue: Glue, e: mtl.ComputeEncoder, path: []const u32, kept: Ref, out: Ref) !void {
+         try t.complete();
+diff --git a/zig/tests/qwen27/run.zig b/zig/tests/qwen27/run.zig
+index 38cd50d78..cfa144a41 100644
+--- a/zig/tests/qwen27/run.zig
++++ b/zig/tests/qwen27/run.zig
+@@ -75,7 +75,9 @@ fn dumps(a: std.mem.Allocator, io: std.Io, r: *q.decode_round.Runner, rows: usiz
+         @memcpy(hh[12..16], std.mem.asBytes(&@as(u32, @intCast(t.capacity))));
+         try h2.appendSlice(a, &hh);
+         const rb = @as(usize, r.taps.half_width) * 2;
+-        for (0..t.count) |plane| {
++        // one plane for each requested seam, at its own slot: ids below seam_base are layers
++        for (t.ids[0..t.count]) |id| {
++            const plane = if (id >= q.taps.seam_base) id - q.taps.seam_base else id;
+             const off = plane * @as(usize, t.capacity) * rb;
+             try h2.appendSlice(a, half.contents()[off..][0 .. rows * rb]);
+         }
+@@ -220,6 +222,13 @@ pub fn main(init: std.process.Init) !void {
+     if (dump_layers) |ls| {
+         try runner.taps.use(m.device, ls);
+         try runner.taps.useHalf(m.device, @intCast(m.config.hidden));
++        var wanted: [16]usize = undefined;
++        var nwant: usize = 0;
++        for (ls) |id| if (nwant < wanted.len) {
++            wanted[nwant] = id;
++            nwant += 1;
++        };
++        try runner.taps.wantSeams(wanted[0..nwant]);
+         runner.capture_taps = true;
+     }
+     const s = q.session.Session{ .runner = &runner };

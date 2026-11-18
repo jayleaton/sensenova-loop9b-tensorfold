@@ -1,0 +1,84 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Jay Leaton <58495321+jayleaton@users.noreply.github.com>
+Date: Wed, 18 Nov 2026 09:28:15 +0800
+Subject: [PATCH 24/26] qwen27: the mHC merge with two streams fixed at compile
+ time, bit for bit
+
+---
+ zig/kernels/metal/qwen27/mhc.metal | 10 ++++++++--
+ zig/src/families/qwen27/mhc.zig    |  9 ++++++---
+ 2 files changed, 14 insertions(+), 5 deletions(-)
+
+diff --git a/zig/kernels/metal/qwen27/mhc.metal b/zig/kernels/metal/qwen27/mhc.metal
+index bded41ab5..50aac32fc 100644
+--- a/zig/kernels/metal/qwen27/mhc.metal
++++ b/zig/kernels/metal/qwen27/mhc.metal
+@@ -101,13 +101,14 @@ template [[host_name("tf_mhc_branch2")]] kernel void tf_mhc_branch<2>(device con
+     device const float*, device bfloat*, device float*, constant TfMhc&, uint, uint, uint);
+ 
+ // streams = mix . streams + post * branch, a thread a (row, column): the outputs of a column read its inputs.
++template <uint FS>
+ kernel void tf_mhc_merge(device const bfloat* BRANCH [[buffer(0)]],
+                          device const float* STATE [[buffer(1)]],
+                          device bfloat* HS [[buffer(2)]],
+                          constant TfMhc& a [[buffer(3)]],
+                          uint2 at [[thread_position_in_grid]]) {
+-  const uint row = at.y, d = at.x, S = a.streams, H = a.hidden;
+-  if (d >= H) return;
++  const uint row = at.y, d = at.x, S = FS != 0u ? FS : a.streams, H = a.hidden;
++  if (d >= H || S != a.streams) return;
+   const float* st = STATE + uint64_t(row) * a.outs;
+   const float b = float(BRANCH[row * H + d]);
+   float ins[4];
+@@ -119,6 +120,11 @@ kernel void tf_mhc_merge(device const bfloat* BRANCH [[buffer(0)]],
+   }
+ }
+ 
++template [[host_name("tf_mhc_merge")]] kernel void tf_mhc_merge<0>(device const bfloat*, device const float*, device bfloat*,
++    constant TfMhc&, uint2);
++template [[host_name("tf_mhc_merge2")]] kernel void tf_mhc_merge<2>(device const bfloat*, device const float*, device bfloat*,
++    constant TfMhc&, uint2);
++
+ // h into every stream (a window's first execution); R, when present, is the previous layer's pending output.
+ kernel void tf_mhc_enter(device const bfloat* H [[buffer(0)]],
+                          device const bfloat* R [[buffer(1)]],
+diff --git a/zig/src/families/qwen27/mhc.zig b/zig/src/families/qwen27/mhc.zig
+index d72fb06ca..748a2cd61 100644
+--- a/zig/src/families/qwen27/mhc.zig
++++ b/zig/src/families/qwen27/mhc.zig
+@@ -13,6 +13,7 @@ pub const Kernels = struct {
+     br: mtl.Pipeline,
+     br2: mtl.Pipeline,
+     mg: mtl.Pipeline,
++    mg2: mtl.Pipeline,
+     en: mtl.Pipeline,
+     lv: mtl.Pipeline,
+ 
+@@ -25,14 +26,16 @@ pub const Kernels = struct {
+         errdefer br2.deinit();
+         const mg = try mtl.Pipeline.init(device, lib, "tf_mhc_merge", false);
+         errdefer mg.deinit();
++        const mg2 = try mtl.Pipeline.init(device, lib, "tf_mhc_merge2", false);
++        errdefer mg2.deinit();
+         const en = try mtl.Pipeline.init(device, lib, "tf_mhc_enter", false);
+         errdefer en.deinit();
+         const lv = try mtl.Pipeline.init(device, lib, "tf_mhc_leave", false);
+-        return .{ .br = br, .br2 = br2, .mg = mg, .en = en, .lv = lv };
++        return .{ .br = br, .br2 = br2, .mg = mg, .mg2 = mg2, .en = en, .lv = lv };
+     }
+ 
+     pub fn deinit(k: Kernels) void {
+-        inline for (.{ k.br, k.br2, k.mg, k.en, k.lv }) |p| p.deinit();
++        inline for (.{ k.br, k.br2, k.mg, k.mg2, k.en, k.lv }) |p| p.deinit();
+     }
+ };
+ 
+@@ -99,7 +102,7 @@ pub fn merge(e: mtl.ComputeEncoder, k: Kernels, b: Buffers, p: Params, rows: u32
+ 
+ /// `merge` writing somewhere other than the streams it reads: the in-place pair's A/B.
+ pub fn mergeInto(e: mtl.ComputeEncoder, k: Kernels, b: Buffers, p: Params, rows: u32, from: Ref, out: Ref) void {
+-    e.setPipeline(k.mg);
++    e.setPipeline(if (p.streams == 2) k.mg2 else k.mg);
+     e.setBuffer(from.buffer, from.offset, 0);
+     e.setBuffer(b.state.buffer, b.state.offset, 1);
+     e.setBuffer(out.buffer, out.offset, 2);

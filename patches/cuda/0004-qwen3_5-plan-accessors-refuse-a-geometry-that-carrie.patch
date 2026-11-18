@@ -1,0 +1,89 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Jay Leaton <58495321+jayleaton@users.noreply.github.com>
+Date: Wed, 18 Nov 2026 06:18:31 +0700
+Subject: [PATCH 4/9] qwen3_5: plan accessors refuse a geometry that carries no
+ valid loop; f32 linear_attn.norm
+
+- steps()/physical() validate the loop rather than trusting it: a synthetic or staged geometry leaves
+  loop_count/loop_end undefined, and attentions() underflowed on them (cuda_disk_test's ABRT).
+- TF_Q35_DEBUG needs a coverage row in environment_test.
+- linear_attn.norm reads an HF checkpoint's f32 (widened the way dt_bias is).
+---
+ zig/src/families/qwen3_5/cuda_engine.zig   |  5 ++++-
+ zig/src/families/qwen3_5/cuda_geometry.zig | 13 +++++++++----
+ zig/src/families/qwen3_5/cuda_weights.zig  |  2 +-
+ zig/src/platform/environment_test.zig      |  2 ++
+ 4 files changed, 16 insertions(+), 6 deletions(-)
+
+diff --git a/zig/src/families/qwen3_5/cuda_engine.zig b/zig/src/families/qwen3_5/cuda_engine.zig
+index 9ca90e0f2..cdcb0c98b 100644
+--- a/zig/src/families/qwen3_5/cuda_engine.zig
++++ b/zig/src/families/qwen3_5/cuda_engine.zig
+@@ -429,7 +429,10 @@ pub const Engine = struct {
+     /// Refuse the whole frame before settling any prior window or launching work.
+     pub fn admit(e: *const Engine, parts: []const Part, ids: []const u32, keep: Keep) !void {
+         const g = e.g;
+-        if (!geometry.supported(g, ids.len, !keep.verifies(), most_verify)) return error.UnsupportedQwenGeometry;
++        if (!geometry.supported(g, ids.len, !keep.verifies(), most_verify)) {
++            std.debug.print("admit: unsupported ids {d} prompt {} group {d} q {d} kv {d} layers {d} steps {d} whole {d}\n", .{ ids.len, !keep.verifies(), g.q_heads / g.kv_heads, g.q_heads, g.kv_heads, g.layers, g.steps(), g.whole });
++            return error.UnsupportedQwenGeometry;
++        }
+         var total: usize = 0;
+         if (parts.len == 0 or parts.len > max_segs) return error.InvalidQwenSegments;
+         for (parts, 0..) |p, index| {
+diff --git a/zig/src/families/qwen3_5/cuda_geometry.zig b/zig/src/families/qwen3_5/cuda_geometry.zig
+index 0e29a7e28..1b8bd3610 100644
+--- a/zig/src/families/qwen3_5/cuda_geometry.zig
++++ b/zig/src/families/qwen3_5/cuda_geometry.zig
+@@ -167,16 +167,21 @@ pub const Geometry = struct {
+         return n;
+     }
+ 
++    /// Whether the loop is one this geometry can execute: a stage or a synthetic geometry may carry none.
++    fn loops(g: Geometry) bool {
++        return g.whole == 0 and g.loop_count > 1 and g.loop_count <= 8 and g.loop_end > g.loop_start and g.loop_end <= g.layers;
++    }
++
+     /// Executions this stage runs: `layers` unless it loops a range more than once.
+     pub fn steps(g: Geometry) usize {
+-        if (g.whole != 0 or g.loop_count <= 1) return g.layers;
+-        return g.loop_start + g.loop_count * (g.loop_end - g.loop_start) + (g.layers - g.loop_end);
++        if (!g.loops()) return g.layers;
++        const span = g.loop_end - g.loop_start;
++        return g.loop_start + g.loop_count * span + (g.layers - g.loop_end);
+     }
+ 
+     /// The physical layer the `i`-th execution runs: the prefix, the loop's passes, then the suffix.
+     pub fn physical(g: Geometry, i: usize) usize {
+-        if (g.whole != 0) return g.first + i;
+-        if (g.loop_count <= 1) return i;
++        if (!g.loops()) return g.first + i;
+         const span = g.loop_end - g.loop_start;
+         if (i < g.loop_start) return i;
+         const body = g.loop_count * span;
+diff --git a/zig/src/families/qwen3_5/cuda_weights.zig b/zig/src/families/qwen3_5/cuda_weights.zig
+index 5074ca820..d0b476e61 100644
+--- a/zig/src/families/qwen3_5/cuda_weights.zig
++++ b/zig/src/families/qwen3_5/cuda_weights.zig
+@@ -436,7 +436,7 @@ pub fn load(e: *Engine, ck: *core.Checkpoint, stage: *DeviceBuffer) !void {
+                 .b = ps.get(.b),
+                 .out = ps.get(.out),
+                 .conv = try tensor(e, ck, "{s}linear_attn.conv1d.weight", .{p}, .bf16, taps_shape),
+-                .norm = try tensor(e, ck, "{s}linear_attn.norm.weight", .{p}, .bf16, &.{geometry.dk}),
++                .norm = try bf16vec(e, ck, "{s}linear_attn.norm.weight", .{p}, geometry.dk),
+                 .a_log = try f32vec(e, ck, "{s}linear_attn.A_log", .{p}, g.v_heads),
+                 .dt_bias = try bf16vec(e, ck, "{s}linear_attn.dt_bias", .{p}, g.v_heads),
+             } };
+diff --git a/zig/src/platform/environment_test.zig b/zig/src/platform/environment_test.zig
+index f616f8b45..6031fea5e 100644
+--- a/zig/src/platform/environment_test.zig
++++ b/zig/src/platform/environment_test.zig
+@@ -125,6 +125,8 @@ const valid = [_]Case{
+     .{ .name = "TF_DSV41_ENGRAM_DIR", .raw = "engram-rows", .n = 0 },
+     .{ .name = "TF_DSV41_ENGRAM_VERIFY", .raw = "full", .n = 1 },
+     .{ .name = "TF_DSV41_ENGRAM_CACHE", .raw = "0", .n = 0 },
++    .{ .name = "TF_Q35_DEBUG", .raw = "1", .n = 1 },
++    .{ .name = "TF_Q35_DEBUG", .raw = "0", .n = 0 },
+ };
+ 
+ test "environment: valid forms remain raw numbers before existing consumer clamps and defaults" {

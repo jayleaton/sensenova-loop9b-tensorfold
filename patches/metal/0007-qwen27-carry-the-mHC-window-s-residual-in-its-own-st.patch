@@ -1,0 +1,271 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Jay Leaton <58495321+jayleaton@users.noreply.github.com>
+Date: Wed, 18 Nov 2026 02:45:52 +0800
+Subject: [PATCH 07/26] qwen27: carry the mHC window's residual in its own
+ stream planes
+
+The reference keeps a window's residual as the flattened streams between
+boundaries, and its hidden states show it: after the first mHC layer they are
+8192 wide, and the two halves genuinely differ. The engine's norm and every
+projection row-stride by , so the window gets its own buffer and the
+boundary kernels read and write it stream-major.
+
+With this the looped checkpoint runs 56 executions with per-visit caches and
+reproduces the first token on all three prompts, and two prompts agree for 22
+and 33 of 64 greedy tokens against the reference run on the same 4-bit values. A
+seam-level mismatch remains inside the window and is recorded in STATUS.md.
+---
+ zig/kernels/metal/qwen27/mhc.metal  | 19 ++++++-------
+ zig/src/families/qwen27/forward.zig | 41 ++++++++++++++---------------
+ zig/src/families/qwen27/mhc.zig     | 18 ++++++-------
+ zig/tests/qwen27/mhc_check.zig      |  9 +++----
+ 4 files changed, 42 insertions(+), 45 deletions(-)
+
+diff --git a/zig/kernels/metal/qwen27/mhc.metal b/zig/kernels/metal/qwen27/mhc.metal
+index 315543565..4555e5248 100644
+--- a/zig/kernels/metal/qwen27/mhc.metal
++++ b/zig/kernels/metal/qwen27/mhc.metal
+@@ -1,7 +1,8 @@
+ using namespace metal;
+-// Hyper-connections (mHC): the router's branch, the streams' merge and the two window boundaries, stream-major planes.
++// Hyper-connections (mHC): the router's branch, the streams' merge and the two window boundaries.
++// A row's streams are interleaved, `row * streams * hidden + stream * hidden + column`, as the reference flattens them.
+ 
+-struct TfMhc { uint hidden, streams, outs, iters, plane; float pre_scale; };
++struct TfMhc { uint hidden, streams, outs, iters; float pre_scale; };
+ 
+ // A coefficient rounded to bf16 before use, as the reference casts it.
+ static inline float tf_mhc_rbf(float v) {
+@@ -23,7 +24,7 @@ static inline float tf_mhc_rbf(float v) {
+   // the row's mean square over the flattened streams, then one simdgroup an output's dot product
+   float acc = 0.f;
+   for (uint s = 0; s < S; ++s) for (uint i = lane; i < H; i += 32u) {
+-    const float x = float(HS[s * a.plane + row * H + i]);
++    const float x = float(HS[row * S * H + s * H + i]);
+     acc += x * x;
+   }
+   acc = simd_sum(acc);
+@@ -36,7 +37,7 @@ static inline float tf_mhc_rbf(float v) {
+     const device float* w = W + uint64_t(o) * D;
+     float s = 0.f;
+     for (uint t = 0; t < S; ++t) for (uint i = lane; i < H; i += 32u) {
+-      s += w[t * H + i] * (float(HS[t * a.plane + row * H + i]) * inv);
++      s += w[t * H + i] * (float(HS[row * S * H + t * H + i]) * inv);
+     }
+     s = simd_sum(s);
+     logits[o] = s + (B == nullptr ? 0.f : B[o]);
+@@ -73,7 +74,7 @@ static inline float tf_mhc_rbf(float v) {
+   threadgroup_barrier(mem_flags::mem_threadgroup);
+   for (uint d = lane; d < H; d += 32u) {
+     float b = 0.f;
+-    for (uint s = 0; s < S; ++s) b += tf_mhc_rbf(st[s]) * float(HS[s * a.plane + row * H + d]);
++    for (uint s = 0; s < S; ++s) b += tf_mhc_rbf(st[s]) * float(HS[row * S * H + s * H + d]);
+     if (a.pre_scale != 1.f) b *= a.pre_scale;
+     BRANCH[row * H + d] = bfloat(b);
+   }
+@@ -90,11 +91,11 @@ kernel void tf_mhc_merge(device const bfloat* BRANCH [[buffer(0)]],
+   const float* st = STATE + uint64_t(row) * a.outs;
+   const float b = float(BRANCH[row * H + d]);
+   float ins[4];
+-  for (uint t = 0; t < S; ++t) ins[t] = float(HS[t * a.plane + row * H + d]);
++  for (uint t = 0; t < S; ++t) ins[t] = float(HS[row * S * H + t * H + d]);
+   for (uint s = 0; s < S; ++s) {
+     float v = 0.f;
+     for (uint t = 0; t < S; ++t) v += tf_mhc_rbf(st[2 * S + s * S + t]) * ins[t];
+-    HS[s * a.plane + row * H + d] = bfloat(v + tf_mhc_rbf(st[S + s]) * b);
++    HS[row * S * H + s * H + d] = bfloat(v + tf_mhc_rbf(st[S + s]) * b);
+   }
+ }
+ 
+@@ -109,7 +110,7 @@ kernel void tf_mhc_enter(device const bfloat* H [[buffer(0)]],
+   const uint out = row * Hd + d;
+   const float v = float(H[out]) + (R == nullptr ? 0.f : float(R[out]));
+   const bfloat o = bfloat(v);
+-  for (uint s = 0; s < a.streams; ++s) HS[s * a.plane + out] = o;
++  for (uint s = 0; s < a.streams; ++s) HS[row * a.streams * Hd + s * Hd + d] = o;
+ }
+ 
+ // The streams' mean back into h: a window's last execution.
+@@ -120,6 +121,6 @@ kernel void tf_mhc_leave(device const bfloat* HS [[buffer(0)]],
+   const uint d = at.x, row = at.y, Hd = a.hidden;
+   if (d >= Hd) return;
+   float s = 0.f;
+-  for (uint i = 0; i < a.streams; ++i) s += float(HS[i * a.plane + row * Hd + d]);
++  for (uint i = 0; i < a.streams; ++i) s += float(HS[row * a.streams * Hd + i * Hd + d]);
+   H[row * Hd + d] = bfloat(s / float(a.streams));
+ }
+diff --git a/zig/src/families/qwen27/forward.zig b/zig/src/families/qwen27/forward.zig
+index 9bfd52782..d2d02a398 100644
+--- a/zig/src/families/qwen27/forward.zig
++++ b/zig/src/families/qwen27/forward.zig
+@@ -82,10 +82,10 @@ pub const Stages = struct {
+     images: ?Ref = null,
+     /// A tensor-parallel rank's all-reduce: null on one Mac, and then every seam is compiled out of the program.
+     reduce: ?Reduce = null,
++    /// The mHC window's residual while its streams are open: stream-major planes, each `hidden` wide.
++    window: Ref = undefined,
+     /// Head seam picks (one u32 a row), required with `Reduce.argmax`: the ranks must pick the same token.
+     picks: ?Ref = null,
+-    /// Whether the mHC window's streams have been entered, and not yet collapsed.
+-    entered: bool = false,
+     /// Whether the execution's physical layer carries the mHC wrapping, and whether the one before it did.
+     fn holds(m: *Model, index: usize) bool {
+         const mh = m.config.mhc orelse return false;
+@@ -104,7 +104,6 @@ pub const Stages = struct {
+             .state = f.get(.mhc_state),
+             .branch = f.get(.mhc_branch),
+             .outs = 2 * @as(u32, mh.streams) + @as(u32, mh.streams) * mh.streams,
+-            .plane = @intCast(@as(usize, f.capacity) * s.model.config.hidden), // elements: the shader's bfloat stride
+         };
+     }
+ 
+@@ -113,6 +112,7 @@ pub const Stages = struct {
+         if (s.rows == 0 or s.rows > m.frame.capacity or lane.k != 0) return error.BadFrameRows;
+         s.hidden = m.frame.get(.hidden);
+         s.residual = m.frame.get(.residual);
++        s.window = m.frame.get(.streams);
+         try m.glue.embedding(lane.enc, m.config, m.weights.embed, m.frame.get(.ids), s.hidden, s.rows);
+         lane.enc.barrier();
+         if (s.hooks.tap) |tap| try tap(s.hooks.ptr, lane.enc, embedding_tap, s.hidden, s.rows);
+@@ -134,20 +134,21 @@ pub const Stages = struct {
+         if (holds(m, index)) {
+             const mh = m.config.mhc.?;
+             const b = s.hc(f);
+-            if (!s.entered) {
+-                // the window's first execution: h into every stream, folding the previous layer's pending output
+-                const from = s.hidden;
+-                if (index != 0 and !held(m, index)) {
+-                    // the previous layer's output is still pending: fold it into h here, as a norm would
+-                    if (s.pending) |pending| m.glue.residual(e, s.hidden, pending, s.hidden, h, s.rows);
++            // the reference expands h into the streams only at the window's first layer; after it the residual
++            // *is* the flattened streams, which the next layer takes as they are
++            if (m.config.physical(index) == mh.start) {
++                if (s.pending) |pending| {
++                    // the previous layer's output is still pending: fold it in, as the norm that would run here does
++                    m.glue.residual(e, s.hidden, pending, s.hidden, h, s.rows);
+                     e.barrier();
+                     if (s.hooks.tap) |tap| try tap(s.hooks.ptr, e, index - 1, s.hidden, s.rows);
+                 }
+-                mhc_mod.enter(e, m.mhc.?, b, b.params(mh, h, f.capacity), s.rows, from, null);
++                mhc_mod.enter(e, m.mhc.?, b, b.params(mh, h), s.rows, s.hidden, null);
+                 e.barrier();
+-                s.entered = true;
++                // from here the window's residual is the flat streams: every stage reads and writes that
++                s.hidden = s.window;
+             }
+-            mhc_mod.branch(e, m.mhc.?, b, b.params(mh, h, f.capacity), s.rows, layer.mhc_attn.?.weight.buffer, layer.mhc_attn.?.bias.buffer);
++            mhc_mod.branch(e, m.mhc.?, b, b.params(mh, h), s.rows, layer.mhc_attn.?.weight.buffer, layer.mhc_attn.?.bias.buffer);
+             e.barrier();
+             try m.kernels.norm(e, b.branch, null, wts.ref(layer.norm), f.get(.eps), f.get(.dims), f.get(.input), f.get(.input), f.get(.sums), h, s.rows);
+             e.barrier();
+@@ -216,9 +217,9 @@ pub const Stages = struct {
+         if (holds(m, index)) {
+             const mh = m.config.mhc.?;
+             const b = s.hc(f);
+-            mhc_mod.merge(e, m.mhc.?, b, b.params(mh, h, f.capacity), s.rows, f.get(.output));
++            mhc_mod.merge(e, m.mhc.?, b, b.params(mh, h), s.rows, f.get(.output));
+             e.barrier();
+-            mhc_mod.branch(e, m.mhc.?, b, b.params(mh, h, f.capacity), s.rows, layer.mhc_ffn.?.weight.buffer, layer.mhc_ffn.?.bias.buffer);
++            mhc_mod.branch(e, m.mhc.?, b, b.params(mh, h), s.rows, layer.mhc_ffn.?.weight.buffer, layer.mhc_ffn.?.bias.buffer);
+             e.barrier();
+             try m.kernels.norm(e, b.branch, null, wts.ref(layer.post_norm), f.get(.eps), f.get(.dims), f.get(.input), f.get(.input), f.get(.sums), h, s.rows);
+         } else try m.kernels.norm(e, s.hidden, f.get(.output), wts.ref(layer.post_norm), f.get(.eps), f.get(.dims), s.residual, f.get(.input), f.get(.sums), h, s.rows);
+@@ -300,15 +301,13 @@ pub const Stages = struct {
+         if (holds(m, index)) {
+             const mh = m.config.mhc.?;
+             const b = s.hc(f);
+-            mhc_mod.merge(e, m.mhc.?, b, b.params(mh, h, f.capacity), s.rows, f.get(.output));
++            mhc_mod.merge(e, m.mhc.?, b, b.params(mh, h), s.rows, f.get(.output));
+             e.barrier();
+-            // the window's last execution: the next one leaves it, so the streams collapse back into h
+-            if (!(index + 1 < m.config.steps() and holds(m, index + 1))) {
+-                mhc_mod.leave(e, m.mhc.?, b, b.params(mh, h, f.capacity), s.rows, s.hidden);
++            // the reference collapses when the physical layer is the window's last, `physical == end - 1`
++            if (m.config.physical(index) + 1 == mh.end) {
++                mhc_mod.leave(e, m.mhc.?, b, b.params(mh, h), s.rows, f.get(.hidden));
+                 e.barrier();
+-                s.entered = false;
+-                s.pending = null;
+-                return;
++                s.hidden = f.get(.hidden);
+             }
+             s.pending = null;
+             return;
+diff --git a/zig/src/families/qwen27/mhc.zig b/zig/src/families/qwen27/mhc.zig
+index 99886b850..d3486b899 100644
+--- a/zig/src/families/qwen27/mhc.zig
++++ b/zig/src/families/qwen27/mhc.zig
+@@ -6,8 +6,8 @@ const schedule = @import("loop_schedule");
+ const projection = @import("projection.zig");
+ const Ref = projection.Ref;
+ 
+-/// qwen27/mhc.metal's argument struct: the widths a boundary reads and the stride between stream planes.
+-pub const Params = extern struct { hidden: u32, streams: u32, outs: u32, iters: u32, plane: u32, pre_scale: f32 };
++/// qwen27/mhc.metal's argument struct: the widths a boundary reads.
++pub const Params = extern struct { hidden: u32, streams: u32, outs: u32, iters: u32, pre_scale: f32 };
+ 
+ pub const Kernels = struct {
+     br: mtl.Pipeline,
+@@ -40,11 +40,10 @@ pub const Buffers = struct {
+     branch: Ref,
+     /// One row's outputs: pre, post, then the stream-mixing logits.
+     outs: u32,
+-    /// Elements between stream planes: `capacity * hidden` (the shader indexes bfloat rows).
+-    plane: u32,
+ 
+-    pub fn params(b: Buffers, s: schedule.Mhc, hidden: u32, plane: u32) Params {
+-        return .{ .hidden = hidden, .streams = s.streams, .outs = b.outs, .iters = s.iterations, .plane = plane, .pre_scale = s.pre_scale };
++
++    pub fn params(b: Buffers, s: schedule.Mhc, hidden: u32) Params {
++        return .{ .hidden = hidden, .streams = s.streams, .outs = b.outs, .iters = s.iterations, .pre_scale = s.pre_scale };
+     }
+ };
+ 
+@@ -99,10 +98,9 @@ pub fn merge(e: mtl.ComputeEncoder, k: Kernels, b: Buffers, p: Params, rows: u32
+     e.dispatchThreads(mtl.Size.of(p.hidden, rows, 1), mtl.Size.of(threads(p.hidden), 1, 1));
+ }
+ 
+-test "the mHC argument is 24 bytes and every field sits where the shader reads it" {
+-    try std.testing.expectEqual(@as(usize, 24), @sizeOf(Params));
+-    try std.testing.expectEqual(@as(usize, 16), @offsetOf(Params, "plane"));
+-    try std.testing.expectEqual(@as(usize, 20), @offsetOf(Params, "pre_scale"));
++test "the mHC argument is 20 bytes and every field sits where the shader reads it" {
++    try std.testing.expectEqual(@as(usize, 20), @sizeOf(Params));
++    try std.testing.expectEqual(@as(usize, 16), @offsetOf(Params, "pre_scale"));
+     try std.testing.expectEqual(@as(usize, 4), @offsetOf(Params, "streams"));
+ }
+ 
+diff --git a/zig/tests/qwen27/mhc_check.zig b/zig/tests/qwen27/mhc_check.zig
+index 7f248f768..80b66eaec 100644
+--- a/zig/tests/qwen27/mhc_check.zig
++++ b/zig/tests/qwen27/mhc_check.zig
+@@ -109,8 +109,7 @@ pub fn main(init: std.process.Init) !void {
+     const k = try mhc.Kernels.init(device);
+     defer k.deinit();
+ 
+-    // one row in the fixture: a plane is one hidden row of elements
+-    const plane: u32 = hidden;
++
+     var hs: [streams * hidden]f32 = undefined;
+     fill(&hs, 7);
+     var w: [outs * streams * hidden]f32 = undefined;
+@@ -124,7 +123,7 @@ pub fn main(init: std.process.Init) !void {
+     toBf(&hs16, &hs);
+ 
+     // a plane is `hidden` bfloat elements: the buffer is bytes, the shader's stride is elements
+-    const streams_buf = try device.buffer(@as(usize, streams) * plane * @sizeOf(u16), mtl.ResourceOptions.shared | mtl.ResourceOptions.untracked);
++    const streams_buf = try device.buffer(@as(usize, streams) * hidden * @sizeOf(u16), mtl.ResourceOptions.shared | mtl.ResourceOptions.untracked);
+     defer streams_buf.deinit();
+     const state_buf = try device.buffer(rows * outs * 4, mtl.ResourceOptions.shared | mtl.ResourceOptions.untracked);
+     defer state_buf.deinit();
+@@ -146,8 +145,8 @@ pub fn main(init: std.process.Init) !void {
+     defer q2.deinit();
+     const cb = q2.commandBuffer();
+     const e = cb.compute(.serial);
+-    const params = mhc.Params{ .hidden = hidden, .streams = streams, .outs = outs, .iters = iterations, .plane = plane, .pre_scale = 1.0 };
+-    const bufs = mhc.Buffers{ .streams = .{ .buffer = streams_buf }, .state = .{ .buffer = state_buf }, .branch = .{ .buffer = branch_buf }, .outs = outs, .plane = plane };
++    const params = mhc.Params{ .hidden = hidden, .streams = streams, .outs = outs, .iters = iterations, .pre_scale = 1.0 };
++    const bufs = mhc.Buffers{ .streams = .{ .buffer = streams_buf }, .state = .{ .buffer = state_buf }, .branch = .{ .buffer = branch_buf }, .outs = outs };
+     mhc.branch(e, k, bufs, params, 1, w_buf, b_buf);
+     e.end();
+     cb.commit();

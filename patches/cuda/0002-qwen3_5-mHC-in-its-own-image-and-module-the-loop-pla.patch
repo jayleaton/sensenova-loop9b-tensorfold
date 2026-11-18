@@ -1,0 +1,845 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Jay Leaton <58495321+jayleaton@users.noreply.github.com>
+Date: Wed, 18 Nov 2026 01:34:35 +0700
+Subject: [PATCH 2/9] qwen3_5: mHC in its own image and module; the loop plan
+ in its own
+
+The forward, geometry and engine were at or past the 600-line cap and the mHC
+kernels pushed qwen35.cu over it, so they move rather than grow:
+
+- zig/kernels/cuda/qwen35_mhc.cu: the four mHC kernels, their own fatbin
+  (catalog entry, kernels.zig blob, engine module 19), launched through the
+  checked launch() so the host signature scanner still sees them.
+- cuda_mhc.zig: the image's install and the four launches the forward makes.
+- cuda_loop_plan.zig: loop_settings and mhc, read from the root config;
+  cuda_loop_plan_test.zig pins this checkpoint's 56 executions, 14 attention and
+  42 delta slots at SenseNova-Loop-9B's own shape.
+- TF_Q35_DEBUG is a declared setting (platform/environment.zig), not a raw getenv.
+
+zig fmt --check clean; lean_check 221 problems at base and head (zero new).
+---
+ zig/build/cuda_kernels.zig                    |   1 +
+ zig/kernels/cuda/qwen35.cu                    | 127 ------------------
+ zig/kernels/cuda/qwen35_mhc.cu                | 126 +++++++++++++++++
+ zig/src/cuda/kernels.zig                      |   1 +
+ zig/src/families/qwen3_5/cuda.zig             |   2 +
+ zig/src/families/qwen3_5/cuda_engine.zig      |  13 +-
+ .../families/qwen3_5/cuda_engine_suite.zig    |   7 +
+ zig/src/families/qwen3_5/cuda_forward.zig     |  49 ++-----
+ zig/src/families/qwen3_5/cuda_geometry.zig    |  93 +------------
+ zig/src/families/qwen3_5/cuda_loop_plan.zig   |  83 ++++++++++++
+ .../families/qwen3_5/cuda_loop_plan_test.zig  |  38 ++++++
+ zig/src/families/qwen3_5/cuda_mhc.zig         |  40 ++++++
+ zig/src/platform/environment.zig              |   1 +
+ 13 files changed, 319 insertions(+), 262 deletions(-)
+ create mode 100644 zig/kernels/cuda/qwen35_mhc.cu
+ create mode 100644 zig/src/families/qwen3_5/cuda_engine_suite.zig
+ create mode 100644 zig/src/families/qwen3_5/cuda_loop_plan.zig
+ create mode 100644 zig/src/families/qwen3_5/cuda_loop_plan_test.zig
+ create mode 100644 zig/src/families/qwen3_5/cuda_mhc.zig
+
+diff --git a/zig/build/cuda_kernels.zig b/zig/build/cuda_kernels.zig
+index 63519848f..df9c5803e 100644
+--- a/zig/build/cuda_kernels.zig
++++ b/zig/build/cuda_kernels.zig
+@@ -105,6 +105,7 @@ pub const kernels = [_]Kernel{
+     .{ .name = "sample", .flags = &.{ "-O3", "--fmad=false", "--ftz=false" } }, // ours: the Metal engine's keyed draws
+     .{ .name = "train", .flags = &.{"-O3"} }, // ours: Sliding Weights' learning step (train.metal's kernels)
+     .{ .name = "qwen35", .flags = &.{"-O3"} }, // ours: the Qwen3.5 hybrids' glue, the Metal kernels' rounding points
++    .{ .name = "qwen35_mhc", .flags = &.{"-O3"} }, // ours: SenseNova-Loop's two-stream mHC (qwen3_5/cuda_forward.zig)
+     .{ .name = "qwen35_draft", .flags = &.{"-O3"} }, // ours: the DFlash2 drafter's glue (draft_ops.metal's rounding)
+     .{ .name = "qwen35_keep", .flags = &.{"-O3"} }, // ours: a verified window's kept path applied to its stream's state
+     .{ .name = "qwen_vision", .flags = &.{ "-O3", "--fmad=false" } }, // ours: the Qwen3.5 vision tower's glue and attention
+diff --git a/zig/kernels/cuda/qwen35.cu b/zig/kernels/cuda/qwen35.cu
+index e26e29b82..3412166b1 100644
+--- a/zig/kernels/cuda/qwen35.cu
++++ b/zig/kernels/cuda/qwen35.cu
+@@ -574,130 +574,3 @@ extern "C" __global__ void __launch_bounds__(256) tf_q35_attn_rows_whole(Geo geo
+     extern __shared__ __align__(16) uint4 attn_tiles[];
+     tf_q35_tc::attn_rows<4, tf_q35_tc::WholeBf16Tiles<256>>({attn_tiles, nullptr, nullptr, nullptr}, geo, Q, segs, rowseg, rowanc, layer, P, scale, total, PM, PL, PO);
+ }
+-
+-// ---- mHC: manifold-constrained hyper-connections over a looped range. Two (or four) residual streams; a router
+-// reads their row-normalised flattening, and a Sinkhorn-normalised map mixes them at each sublayer boundary. ----
+-
+-__device__ __forceinline__ float mhc_block_sum(float v, float* red) {
+-    red[threadIdx.x] = v;
+-    __syncthreads();
+-    for (int s = 128; s > 0; s >>= 1) {
+-        if (threadIdx.x < s) red[threadIdx.x] += red[threadIdx.x + s];
+-        __syncthreads();
+-    }
+-    return red[0];
+-}
+-
+-// The router: pre/post/mix from the streams, and the single branch (pre . streams) the sublayer then runs on.
+-// STATE holds a row's S pre, S post and S*S mix logits as f32; it is the merge kernels' input.
+-extern "C" __global__ void __launch_bounds__(256) tf_q35_mhc_branch(Geo geo, const __nv_bfloat16* __restrict__ HS,
+-                                                                  const float* __restrict__ W, const float* __restrict__ B,
+-                                                                  __nv_bfloat16* __restrict__ BRANCH, float* __restrict__ STATE,
+-                                                                  int rows, int streams, int iters, float pre_scale) {
+-    const int r = (int)blockIdx.x;
+-    if (r >= rows) return;
+-    const int H = geo.hid, S = streams, D = S * H, N = 2 * S + S * S;
+-    const size_t base = (size_t)r * D;
+-    __shared__ float red[256];
+-    __shared__ float logits[24];
+-    float acc = 0.f;
+-    for (int i = threadIdx.x; i < D; i += blockDim.x) {
+-        const float x = bf(HS[base + i]);
+-        acc += x * x;
+-    }
+-    const float inv = rsqrtf(mhc_block_sum(acc, red) / (float)D + 1e-6f);
+-    for (int n = 0; n < N; n++) {
+-        const float* w = W + (size_t)n * D;
+-        float a = 0.f;
+-        for (int i = threadIdx.x; i < D; i += blockDim.x) a += w[i] * (bf(HS[base + i]) * inv);
+-        a = mhc_block_sum(a, red);
+-        if (threadIdx.x == 0) logits[n] = a + (B == nullptr ? 0.f : B[n]);
+-        __syncthreads();
+-    }
+-    if (threadIdx.x == 0) {
+-        float* st = STATE + (size_t)r * N;
+-        for (int s = 0; s < S; s++) {
+-            st[s] = 1.f / (1.f + expf(-logits[s]));
+-            st[S + s] = 2.f / (1.f + expf(-logits[S + s]));
+-        }
+-        float m[16];
+-        for (int i = 0; i < S * S; i++) m[i] = logits[2 * S + i];
+-        for (int it = 0; it < iters; it++) {
+-            for (int row = 0; row < S; row++) {
+-                float mx = -INFINITY;
+-                for (int c = 0; c < S; c++) mx = fmaxf(mx, m[row * S + c]);
+-                float sum = 0.f;
+-                for (int c = 0; c < S; c++) sum += expf(m[row * S + c] - mx);
+-                const float lz = mx + logf(sum);
+-                for (int c = 0; c < S; c++) m[row * S + c] -= lz;
+-            }
+-            for (int c = 0; c < S; c++) {
+-                float mx = -INFINITY;
+-                for (int row = 0; row < S; row++) mx = fmaxf(mx, m[row * S + c]);
+-                float sum = 0.f;
+-                for (int row = 0; row < S; row++) sum += expf(m[row * S + c] - mx);
+-                const float lz = mx + logf(sum);
+-                for (int row = 0; row < S; row++) m[row * S + c] -= lz;
+-            }
+-        }
+-        for (int i = 0; i < S * S; i++) st[2 * S + i] = expf(m[i]);
+-    }
+-    __syncthreads();
+-    const float* st = STATE + (size_t)r * N;
+-    for (int d = threadIdx.x; d < H; d += blockDim.x) {
+-        float b = 0.f;
+-        for (int s = 0; s < S; s++) b += rbf(st[s]) * bf(HS[base + (size_t)s * H + d]);
+-        if (pre_scale != 1.f) b *= pre_scale;
+-        BRANCH[(size_t)r * H + d] = __float2bfloat16_rn(b);
+-    }
+-}
+-
+-// streams = mix @ streams + post * branch, one thread a (row, column): the S outputs of a column read the same
+-// S inputs, so no thread writes a value another still has to read.
+-extern "C" __global__ void __launch_bounds__(256) tf_q35_mhc_merge(Geo geo, const __nv_bfloat16* __restrict__ BRANCH,
+-                                                                 const float* __restrict__ STATE, __nv_bfloat16* __restrict__ HS,
+-                                                                 int rows, int streams) {
+-    const int H = geo.hid, S = streams, N = 2 * S + S * S;
+-    const size_t work = (size_t)rows * H;
+-    for (size_t i = (size_t)blockIdx.x * blockDim.x + threadIdx.x; i < work; i += (size_t)gridDim.x * blockDim.x) {
+-        const int r = (int)(i / H), d = (int)(i % H);
+-        const float* st = STATE + (size_t)r * N;
+-        const __nv_bfloat16* row = HS + (size_t)r * S * H + d;
+-        const float b = bf(BRANCH[(size_t)r * H + d]);
+-        float out[4];
+-        for (int s = 0; s < S; s++) {
+-            float a = 0.f;
+-            for (int t = 0; t < S; t++) a += rbf(st[2 * S + s * S + t]) * bf(row[(size_t)t * H]);
+-            out[s] = a + rbf(st[S + s]) * b;
+-        }
+-        for (int s = 0; s < S; s++) HS[(size_t)r * S * H + (size_t)s * H + d] = __float2bfloat16_rn(out[s]);
+-    }
+-}
+-
+-// h into every stream (the window's first execution), and the streams' mean back into h (its last).
+-// R (may be null) is the previous layer's output, still unfolded: the window's first execution folds it in, as the
+-// norm that would have run there does.
+-extern "C" __global__ void __launch_bounds__(256) tf_q35_mhc_enter(Geo geo, const __nv_bfloat16* __restrict__ H,
+-                                                                 const __nv_bfloat16* __restrict__ R, __nv_bfloat16* __restrict__ HS,
+-                                                                 int rows, int streams) {
+-    const int Hd = geo.hid, S = streams;
+-    const size_t work = (size_t)rows * Hd;
+-    for (size_t i = (size_t)blockIdx.x * blockDim.x + threadIdx.x; i < work; i += (size_t)gridDim.x * blockDim.x) {
+-        const int r = (int)(i / Hd), d = (int)(i % Hd);
+-        const float v = bf(H[i]) + (R == nullptr ? 0.f : bf(R[i]));
+-        const __nv_bfloat16 o = __float2bfloat16_rn(v);
+-        for (int s = 0; s < S; s++) HS[(size_t)r * S * Hd + (size_t)s * Hd + d] = o;
+-    }
+-}
+-
+-extern "C" __global__ void __launch_bounds__(256) tf_q35_mhc_leave(Geo geo, const __nv_bfloat16* __restrict__ HS,
+-                                                                 __nv_bfloat16* __restrict__ H, int rows, int streams) {
+-    const int Hd = geo.hid, S = streams;
+-    const size_t work = (size_t)rows * Hd;
+-    for (size_t i = (size_t)blockIdx.x * blockDim.x + threadIdx.x; i < work; i += (size_t)gridDim.x * blockDim.x) {
+-        const int r = (int)(i / Hd), d = (int)(i % Hd);
+-        float a = 0.f;
+-        for (int s = 0; s < S; s++) a += bf(HS[(size_t)r * S * Hd + (size_t)s * Hd + d]);
+-        H[i] = __float2bfloat16_rn(a / (float)S);
+-    }
+-}
+diff --git a/zig/kernels/cuda/qwen35_mhc.cu b/zig/kernels/cuda/qwen35_mhc.cu
+new file mode 100644
+index 000000000..c063fb494
+--- /dev/null
++++ b/zig/kernels/cuda/qwen35_mhc.cu
+@@ -0,0 +1,126 @@
++//! SenseNova-Loop's mHC kernels: the streams' entry and exit, the router's branch, and the merge back.
++#include "qwen35.cuh"
++
++using namespace tf_q35;
++
++// SenseNova-Loop's manifold-constrained hyper-connections: two (or four) residual streams over a looped range.
++
++__device__ __forceinline__ float mhc_block_sum(float v, float* red) {
++    red[threadIdx.x] = v;
++    __syncthreads();
++    for (int s = 128; s > 0; s >>= 1) {
++        if (threadIdx.x < s) red[threadIdx.x] += red[threadIdx.x + s];
++        __syncthreads();
++    }
++    return red[0];
++}
++
++// The router: STATE holds a row's S pre, S post and S*S mix logits as f32, and h the branch the sublayer runs on.
++extern "C" __global__ void __launch_bounds__(256) tf_q35_mhc_branch(Geo geo, const __nv_bfloat16* __restrict__ HS,
++                                                                  const float* __restrict__ W, const float* __restrict__ B,
++                                                                  __nv_bfloat16* __restrict__ BRANCH, float* __restrict__ STATE,
++                                                                  int rows, int streams, int iters, float pre_scale) {
++    const int r = (int)blockIdx.x;
++    if (r >= rows) return;
++    const int H = geo.hid, S = streams, D = S * H, N = 2 * S + S * S;
++    const size_t base = (size_t)r * D;
++    __shared__ float red[256];
++    __shared__ float logits[24];
++    float acc = 0.f;
++    for (int i = threadIdx.x; i < D; i += blockDim.x) {
++        const float x = bf(HS[base + i]);
++        acc += x * x;
++    }
++    const float inv = rsqrtf(mhc_block_sum(acc, red) / (float)D + 1e-6f);
++    for (int n = 0; n < N; n++) {
++        const float* w = W + (size_t)n * D;
++        float a = 0.f;
++        for (int i = threadIdx.x; i < D; i += blockDim.x) a += w[i] * (bf(HS[base + i]) * inv);
++        a = mhc_block_sum(a, red);
++        if (threadIdx.x == 0) logits[n] = a + (B == nullptr ? 0.f : B[n]);
++        __syncthreads();
++    }
++    if (threadIdx.x == 0) {
++        float* st = STATE + (size_t)r * N;
++        for (int s = 0; s < S; s++) {
++            st[s] = 1.f / (1.f + expf(-logits[s]));
++            st[S + s] = 2.f / (1.f + expf(-logits[S + s]));
++        }
++        float m[16];
++        for (int i = 0; i < S * S; i++) m[i] = logits[2 * S + i];
++        for (int it = 0; it < iters; it++) {
++            for (int row = 0; row < S; row++) {
++                float mx = -INFINITY;
++                for (int c = 0; c < S; c++) mx = fmaxf(mx, m[row * S + c]);
++                float sum = 0.f;
++                for (int c = 0; c < S; c++) sum += expf(m[row * S + c] - mx);
++                const float lz = mx + logf(sum);
++                for (int c = 0; c < S; c++) m[row * S + c] -= lz;
++            }
++            for (int c = 0; c < S; c++) {
++                float mx = -INFINITY;
++                for (int row = 0; row < S; row++) mx = fmaxf(mx, m[row * S + c]);
++                float sum = 0.f;
++                for (int row = 0; row < S; row++) sum += expf(m[row * S + c] - mx);
++                const float lz = mx + logf(sum);
++                for (int row = 0; row < S; row++) m[row * S + c] -= lz;
++            }
++        }
++        for (int i = 0; i < S * S; i++) st[2 * S + i] = expf(m[i]);
++    }
++    __syncthreads();
++    const float* st = STATE + (size_t)r * N;
++    for (int d = threadIdx.x; d < H; d += blockDim.x) {
++        float b = 0.f;
++        for (int s = 0; s < S; s++) b += rbf(st[s]) * bf(HS[base + (size_t)s * H + d]);
++        if (pre_scale != 1.f) b *= pre_scale;
++        BRANCH[(size_t)r * H + d] = __float2bfloat16_rn(b);
++    }
++}
++
++// streams = mix @ streams + post * branch, a thread a (row, column), so no row reads what another thread rewrote.
++extern "C" __global__ void __launch_bounds__(256) tf_q35_mhc_merge(Geo geo, const __nv_bfloat16* __restrict__ BRANCH,
++                                                                 const float* __restrict__ STATE, __nv_bfloat16* __restrict__ HS,
++                                                                 int rows, int streams) {
++    const int H = geo.hid, S = streams, N = 2 * S + S * S;
++    const size_t work = (size_t)rows * H;
++    for (size_t i = (size_t)blockIdx.x * blockDim.x + threadIdx.x; i < work; i += (size_t)gridDim.x * blockDim.x) {
++        const int r = (int)(i / H), d = (int)(i % H);
++        const float* st = STATE + (size_t)r * N;
++        const __nv_bfloat16* row = HS + (size_t)r * S * H + d;
++        const float b = bf(BRANCH[(size_t)r * H + d]);
++        float out[4];
++        for (int s = 0; s < S; s++) {
++            float a = 0.f;
++            for (int t = 0; t < S; t++) a += rbf(st[2 * S + s * S + t]) * bf(row[(size_t)t * H]);
++            out[s] = a + rbf(st[S + s]) * b;
++        }
++        for (int s = 0; s < S; s++) HS[(size_t)r * S * H + (size_t)s * H + d] = __float2bfloat16_rn(out[s]);
++    }
++}
++
++// h into every stream at the window's entry (folding the previous layer's pending output), and its exit.
++extern "C" __global__ void __launch_bounds__(256) tf_q35_mhc_enter(Geo geo, const __nv_bfloat16* __restrict__ H,
++                                                                 const __nv_bfloat16* __restrict__ R, __nv_bfloat16* __restrict__ HS,
++                                                                 int rows, int streams) {
++    const int Hd = geo.hid, S = streams;
++    const size_t work = (size_t)rows * Hd;
++    for (size_t i = (size_t)blockIdx.x * blockDim.x + threadIdx.x; i < work; i += (size_t)gridDim.x * blockDim.x) {
++        const int r = (int)(i / Hd), d = (int)(i % Hd);
++        const float v = bf(H[i]) + (R == nullptr ? 0.f : bf(R[i]));
++        const __nv_bfloat16 o = __float2bfloat16_rn(v);
++        for (int s = 0; s < S; s++) HS[(size_t)r * S * Hd + (size_t)s * Hd + d] = o;
++    }
++}
++
++extern "C" __global__ void __launch_bounds__(256) tf_q35_mhc_leave(Geo geo, const __nv_bfloat16* __restrict__ HS,
++                                                                 __nv_bfloat16* __restrict__ H, int rows, int streams) {
++    const int Hd = geo.hid, S = streams;
++    const size_t work = (size_t)rows * Hd;
++    for (size_t i = (size_t)blockIdx.x * blockDim.x + threadIdx.x; i < work; i += (size_t)gridDim.x * blockDim.x) {
++        const int r = (int)(i / Hd), d = (int)(i % Hd);
++        float a = 0.f;
++        for (int s = 0; s < S; s++) a += bf(HS[(size_t)r * S * Hd + (size_t)s * Hd + d]);
++        H[i] = __float2bfloat16_rn(a / (float)S);
++    }
++}
+diff --git a/zig/src/cuda/kernels.zig b/zig/src/cuda/kernels.zig
+index 58512acd7..eb6762bb2 100644
+--- a/zig/src/cuda/kernels.zig
++++ b/zig/src/cuda/kernels.zig
+@@ -77,6 +77,7 @@ pub const train: []const u8 = if (available) &Blob("fatbin_train").bytes else &.
+ pub const qwen35: []const u8 = if (available) &Blob("fatbin_qwen35").bytes else &.{};
+ pub const qwen35_draft: []const u8 = if (available) &Blob("fatbin_qwen35_draft").bytes else &.{};
+ pub const qwen35_keep: []const u8 = if (available) &Blob("fatbin_qwen35_keep").bytes else &.{};
++pub const qwen35_mhc: []const u8 = if (available) &Blob("fatbin_qwen35_mhc").bytes else &.{};
+ pub const joint_schema: []const u8 = if (available) &Blob("fatbin_joint_schema").bytes else &.{};
+ pub const qwen_vision: []const u8 = if (available) &Blob("fatbin_qwen_vision").bytes else &.{};
+ pub const qwen35_kv8: []const u8 = if (available) &Blob("fatbin_qwen35_kv8").bytes else &.{};
+diff --git a/zig/src/families/qwen3_5/cuda.zig b/zig/src/families/qwen3_5/cuda.zig
+index 2b6b8c30e..87e8c715d 100644
+--- a/zig/src/families/qwen3_5/cuda.zig
++++ b/zig/src/families/qwen3_5/cuda.zig
+@@ -1,6 +1,7 @@
+ //! The Qwen3.5 hybrids on CUDA (2B, Qwen3.8-27B): the engine and its native family entry; Metal's 2B is qwen3_5.zig.
+ pub const config = @import("config.zig");
+ pub const geometry = @import("cuda_geometry.zig");
++pub const loop_plan = @import("cuda_loop_plan.zig");
+ pub const round = @import("cuda_round.zig");
+ pub const prompt_int8 = @import("cuda_prompt_int8.zig");
+ pub const modelopt = @import("cuda_modelopt.zig");
+@@ -36,6 +37,7 @@ test {
+     _ = @import("cuda_mtp_batch.zig");
+     _ = config;
+     _ = geometry;
++    _ = @import("cuda_loop_plan_test.zig");
+     _ = @import("draw.zig");
+     _ = @import("cuda_draft_weights.zig");
+     _ = @import("cuda_draft_config.zig");
+diff --git a/zig/src/families/qwen3_5/cuda_engine.zig b/zig/src/families/qwen3_5/cuda_engine.zig
+index 0710df60e..4740225ae 100644
+--- a/zig/src/families/qwen3_5/cuda_engine.zig
++++ b/zig/src/families/qwen3_5/cuda_engine.zig
+@@ -34,6 +34,7 @@ pub const aligned = scratch_memory.aligned; // Device allocations are 256-byte a
+ 
+ /// qwen35.cuh's Geo.
+ pub const Geo = extern struct { hid: c_int, nk: c_int, nv: c_int, qh: c_int, kvh: c_int, nl: c_int };
++const mhc_kernels = @import("cuda_mhc.zig").resolve;
+ 
+ const layers = @import("cuda_layers.zig");
+ pub const Proj = layers.Proj;
+@@ -80,7 +81,7 @@ pub const Engine = struct {
+     g: Geometry,
+     geo: Geo,
+     stream: cuda.Stream,
+-    mods: [19]cuda.Module,
++    mods: [20]cuda.Module,
+     kv8: bool, // attention caches as e4m3 rows with a scale each
+     rope_table: u64 = 0, // YaRN's attention factor and 32 frequencies on the device (cuda_rope.zig); 0: plain rope
+     rope_buf: ?cuda.DeviceBuffer = null, // the table's buffer (cuda_rope_table.zig)
+@@ -146,8 +147,7 @@ pub const Engine = struct {
+     pl: u64,
+     po: u64,
+     logits: u64,
+-    /// mHC: the residual streams (rows, streams, hidden) and each row's router state (pre, post, mix).
+-    hs: u64,
++    hs: u64, // the residual streams (rows, streams, hidden), and each row's router state
+     mhc_state: u64,
+     mt2: @import("cuda_mt2.zig").Mt2,
+     routed: routed.Scratch = .{}, // qwen3_5_moe's routed rows
+@@ -242,7 +242,7 @@ pub const Engine = struct {
+         errdefer hosted.release(e);
+         try e.arena.fill8(0, null); // touched once now: the driver commits memory on first touch, slowly
+         const kk = cuda.kernels;
+-        const images = [_][]const u8{ kk.qmm_group, kk.qmm_prefill, kk.lane_gemv, kk.affine4_pack, kk.qwen35, kk.sample, kk.qwen35_keep, kk.affine8, kk.affine_prefill, kk.qwen35_kv8, kk.experts, kk.experts_prefill, kk.experts_pack, kk.moe, kk.experts3, kk.experts3_prefill, kk.prefill_attention, kk.gdn_prefill, kk.w4a8_prefill };
++        const images = [_][]const u8{ kk.qmm_group, kk.qmm_prefill, kk.lane_gemv, kk.affine4_pack, kk.qwen35, kk.sample, kk.qwen35_keep, kk.affine8, kk.affine_prefill, kk.qwen35_kv8, kk.experts, kk.experts_prefill, kk.experts_pack, kk.moe, kk.experts3, kk.experts3_prefill, kk.prefill_attention, kk.gdn_prefill, kk.w4a8_prefill, kk.qwen35_mhc };
+         var loaded: usize = 0;
+         errdefer for (e.mods[0..loaded]) |*m| m.unload();
+         for (images, 0..) |img, i| {
+@@ -268,8 +268,7 @@ pub const Engine = struct {
+         e.plan = try cuda.grouped.Router.resolve(e.mods[10]);
+         e.moe = try cuda.moe.Fns.resolve(e.mods[13]);
+         inline for (@typeInfo(Fns).@"struct".field_names) |name| @field(e.fns, name) = try e.mods[4].function("tf_q35_" ++ name);
+-        // bf16 tiles' two buffers
+-        for ([_]cuda.Function{ e.fns.attn_partial, e.fns.attn_rows, e.fns.attn_rows_join, e.fns.attn_partial_whole, e.fns.attn_rows_whole }) |f| try f.allowDynamicShared(@import("cuda_forward.zig").attn_tiles);
++        try @import("cuda_mhc.zig").install(e); // SenseNova-Loop's own image
+         inline for (@typeInfo(Keeps).@"struct".field_names) |name| @field(e.keeps, name) = try e.mods[6].function("tf_q35k_" ++ name);
+         e.prompt_attn = try @import("cuda_prompt.zig").resolve(e.mods[16], e.mods[17]);
+         try e.int8.resolve(e.mods[18]);
+@@ -597,5 +596,5 @@ pub const Engine = struct {
+ };
+ 
+ test {
+-    _ = @import("cuda_engine_test.zig");
++    _ = @import("cuda_engine_suite.zig");
+ }
+diff --git a/zig/src/families/qwen3_5/cuda_engine_suite.zig b/zig/src/families/qwen3_5/cuda_engine_suite.zig
+new file mode 100644
+index 000000000..1fee3adb8
+--- /dev/null
++++ b/zig/src/families/qwen3_5/cuda_engine_suite.zig
+@@ -0,0 +1,7 @@
++//! The engine's own tests, a module of their own so the engine stays under the line cap.
++const std = @import("std");
++
++test {
++    _ = std;
++    _ = @import("cuda_engine_test.zig");
++}
+diff --git a/zig/src/families/qwen3_5/cuda_forward.zig b/zig/src/families/qwen3_5/cuda_forward.zig
+index 76c44d097..f830977ed 100644
+--- a/zig/src/families/qwen3_5/cuda_forward.zig
++++ b/zig/src/families/qwen3_5/cuda_forward.zig
+@@ -5,6 +5,7 @@ const cuda = @import("cuda");
+ const sig = @import("cuda_signatures.zig");
+ const hooks = @import("cuda_learn_hooks.zig");
+ const geometry = @import("cuda_geometry.zig");
++const hyper = @import("cuda_mhc.zig");
+ const head_dim = geometry.head_dim;
+ const max_chunks = 64;
+ /// Prompt experts keep the shipped arithmetic boundary, independently of verification capacity.
+@@ -53,11 +54,10 @@ pub fn body(e: *E.Engine, shape: anytype) !void {
+     // a prompt chunk keeps its last row: past the last layer's keys and values, the kept row's tile runs alone
+     const ends = g.whole == 0 or g.first + g.layers == g.whole; // an earlier stage sends every row on: no tail
+     const tail_at: ?usize = if (prompt and ends) @import("cuda_prompt_tail.zig").first(e, total, nseg, shape.hidden or shape.rows) else null;
+-    // the execution plan: a looped checkpoint runs a range of physical layers more than once, each visit with its
+-    // own cache slot (the di/ai ordinals below), and its residual held in `streams` between the mHC boundaries.
++    // a looped checkpoint runs a range of physical layers more than once: each visit takes its own cache slot
+     const steps = g.steps();
+-    if (std.c.getenv("TF_Q35_DEBUG") != null) std.debug.print("q35 debug: steps {d}, layers {d} (g {d}..{d} of {d}), loop {d} of [{d},{d}), deltas {d}, attentions {d}, mhc {any}\n", .{ steps, e.layers.len, g.first, g.layers, g.whole, g.loop_count, g.loop_start, g.loop_end, g.deltas(), g.attentions(), g.mhc });
+-    // the forward's own contract: every execution names a physical layer the engine loaded
++    if (try @import("sys").environment.read(bool, "TF_Q35_DEBUG", false)) std.debug.print("q35 debug: steps {d}, layers {d} (g {d}..{d} of {d}), loop {d} of [{d},{d}), deltas {d}, attentions {d}, mhc {any}\n", .{ steps, e.layers.len, g.first, g.layers, g.whole, g.loop_count, g.loop_start, g.loop_end, g.deltas(), g.attentions(), g.mhc });
++    // every execution names a physical layer the engine loaded
+     for (0..steps) |i| if (g.physical(i) >= e.layers.len) return error.BadQwenPlan;
+     const mhc = g.mhc;
+     var entered = false;
+@@ -69,15 +69,15 @@ pub fn body(e: *E.Engine, shape: anytype) !void {
+         const rows: usize = total - t0;
+         const hc = if (mhc) |m| m.holds(ph) else false;
+         const prev_hc = if (mhc) |m| i > 0 and m.holds(g.physical(i - 1)) else false;
+-        // inside the window the streams hold the residual, so a layer reads a branch of them, never h itself
++        // inside the window the streams hold the residual: the layer reads a branch of them, never h itself
+         if (hc) {
+             const m = mhc.?;
+             if (!entered) {
+                 // the previous layer's output is still pending: the norm that would have folded it runs here
+-                try mhcEnter(e, total, m.streams, i != 0 and !prev_hc);
++                try hyper.enter(e, total, m, i != 0 and !prev_hc);
+                 entered = true;
+             }
+-            try mhcBranch(e, l.mhc_attn, l.mhc_attn_b, total, m);
++            try hyper.branch(e, l.mhc_attn, l.mhc_attn_b, total, m);
+             try e.norm(false, l.input_norm, total);
+         } else try e.norm(i != 0 and !prev_hc, l.input_norm, total);
+         if (e.learning) |k| try k.input(ph, e.h, total);
+@@ -137,8 +137,8 @@ pub fn body(e: *E.Engine, shape: anytype) !void {
+         }
+         if (hc) {
+             const m = mhc.?;
+-            try mhcMerge(e, total, m.streams); // the mixer's r into the streams
+-            try mhcBranch(e, l.mhc_ffn, l.mhc_ffn_b, total, m); // the FFN runs on the streams' second branch
++            try hyper.merge(e, total, m); // the mixer's r into the streams
++            try hyper.branch(e, l.mhc_ffn, l.mhc_ffn_b, total, m); // the FFN runs on the streams' second branch
+             try e.norm(false, l.post_norm, total);
+         } else try e.norm(!prev_hc, l.post_norm, total);
+         if (e.learning) |k| try k.post(ph, e.h, e.x, total);
+@@ -170,11 +170,10 @@ pub fn body(e: *E.Engine, shape: anytype) !void {
+         };
+         if (hc) {
+             const m = mhc.?;
+-            try mhcMerge(e, total, m.streams); // the FFN's r into the streams
+-            // the window's last execution: the next one leaves it, so the streams collapse back into h
++            try hyper.merge(e, total, m); // the FFN's r into the streams
+             const next: usize = if (i + 1 < steps) g.physical(i + 1) else g.layers;
+             if (!m.holds(next)) {
+-                try mhcLeave(e, total, m.streams);
++                try hyper.leave(e, total, m);
+                 entered = false;
+             }
+         }
+@@ -184,35 +183,11 @@ pub fn body(e: *E.Engine, shape: anytype) !void {
+ }
+ 
+ /// A launch whose arguments are checked against the kernel's .cu signature: a wrong count or kind does not build.
+-fn launch(e: *E.Engine, f: cuda.Function, comptime s: sig.Sig, grid: [3]usize, block: [3]usize, args: anytype) !void {
++pub fn launch(e: *E.Engine, f: cuda.Function, comptime s: sig.Sig, grid: [3]usize, block: [3]usize, args: anytype) !void {
+     sig.check(s, @TypeOf(args));
+     return e.run(f, grid, block, args);
+ }
+ 
+-/// h into every stream: the mHC window's first execution.
+-fn mhcEnter(e: *E.Engine, rows: usize, streams: usize, fold: bool) !void {
+-    const geo = e.geo;
+-    try launch(e, e.fns.mhc_enter, sig.mhc_enter, .{ (rows * e.g.hidden + 255) / 256, 1, 1 }, .{ 256, 1, 1 }, .{ geo, e.h, if (fold) e.r else @as(u64, 0), e.hs, @as(c_int, @intCast(rows)), @as(c_int, @intCast(streams)) });
+-}
+-
+-/// The streams' mean into h: the window's last execution.
+-fn mhcLeave(e: *E.Engine, rows: usize, streams: usize) !void {
+-    const geo = e.geo;
+-    try launch(e, e.fns.mhc_leave, sig.mhc_leave, .{ (rows * e.g.hidden + 255) / 256, 1, 1 }, .{ 256, 1, 1 }, .{ geo, e.hs, e.h, @as(c_int, @intCast(rows)), @as(c_int, @intCast(streams)) });
+-}
+-
+-/// A sublayer's branch out of the streams (into h), with its pre/post/mix kept for the merge.
+-fn mhcBranch(e: *E.Engine, w: u64, b: u64, rows: usize, m: geometry.Mhc) !void {
+-    const geo = e.geo;
+-    try launch(e, e.fns.mhc_branch, sig.mhc_branch, .{ rows, 1, 1 }, .{ 256, 1, 1 }, .{ geo, e.hs, w, b, e.h, e.mhc_state, @as(c_int, @intCast(rows)), @as(c_int, @intCast(m.streams)), @as(c_int, @intCast(m.iterations)), @as(f32, m.pre_scale) });
+-}
+-
+-/// The sublayer's output (r) back into the streams.
+-fn mhcMerge(e: *E.Engine, rows: usize, streams: usize) !void {
+-    const geo = e.geo;
+-    try launch(e, e.fns.mhc_merge, sig.mhc_merge, .{ (rows * e.g.hidden + 255) / 256, 1, 1 }, .{ 256, 1, 1 }, .{ geo, e.r, e.mhc_state, e.hs, @as(c_int, @intCast(rows)), @as(c_int, @intCast(streams)) });
+-}
+-
+ /// A bf16 decode attention launch with its two tile buffers of dynamic shared memory.
+ fn shared(e: *E.Engine, f: cuda.Function, comptime s: sig.Sig, grid: [3]usize, threads: u32, args: anytype) !void {
+     sig.check(s, @TypeOf(args));
+diff --git a/zig/src/families/qwen3_5/cuda_geometry.zig b/zig/src/families/qwen3_5/cuda_geometry.zig
+index 95d05c453..0e29a7e28 100644
+--- a/zig/src/families/qwen3_5/cuda_geometry.zig
++++ b/zig/src/families/qwen3_5/cuda_geometry.zig
+@@ -69,8 +69,7 @@ pub const Kinds = struct {
+     }
+ };
+ 
+-/// A model's manifold-constrained hyper-connections: `streams` residual streams over [start, end), mixed by a
+-/// router whose S×S map is Sinkhorn-normalised over `iterations` (log space, as the reference computes it).
++/// A model's mHC: `streams` residual streams over [start, end), mixed by a Sinkhorn map.
+ pub const Mhc = struct {
+     start: usize,
+     end: usize,
+@@ -294,59 +293,6 @@ fn expertBits(q: std.json.ObjectMap, layers: usize) !struct { bits: u8, count: u
+     return .{ .bits = @intCast(bits orelse 4), .count = count };
+ }
+ 
+-/// `loop_settings`: the shared-weight loop, as the reference's `execution_plan` reads it. Absent: every layer once.
+-fn loopPlan(g: *Geometry, root: std.json.ObjectMap) !void {
+-    const v = root.get("loop_settings") orelse return;
+-    const o = try object(v);
+-    const start = try integer(o, "start");
+-    const end = try integer(o, "end");
+-    const count = try integer(o, "eval_count");
+-    if (start >= end or end > g.layers or count < 1) return error.UnsupportedQwenGeometry;
+-    // the reference runs fixed-count loop checkpoints only: `counts` is exactly [eval_count] when present
+-    if (o.get("counts")) |c| {
+-        if (c != .array or c.array.items.len != 1) return error.UnsupportedQwenGeometry;
+-        if (c.array.items[0] != .integer or c.array.items[0].integer != @as(i64, @intCast(count))) return error.UnsupportedQwenGeometry;
+-    }
+-    const steps = start + count * (end - start) + (g.layers - end);
+-    if (steps > max_steps) return error.UnsupportedQwenGeometry;
+-    g.loop_start = start;
+-    g.loop_end = end;
+-    g.loop_count = count;
+-}
+-
+-/// `mhc`: manifold-constrained hyper-connections over one loop phase, as the reference's plan validator reads them.
+-fn mhcSettings(g: *Geometry, root: std.json.ObjectMap) !void {
+-    const v = root.get("mhc") orelse return;
+-    const o = try object(v);
+-    const start = try integer(o, "start");
+-    const end = try integer(o, "end");
+-    const streams = try integer(o, "streams");
+-    const iterations = try integer(o, "iterations");
+-    if (start >= end or end > g.layers or (streams != 2 and streams != 4) or iterations < 1 or iterations > 64)
+-        return error.UnsupportedQwenGeometry;
+-    var fixed = false;
+-    if (o.get("fixed_identity")) |f| {
+-        if (f != .bool) return error.UnsupportedQwenGeometry;
+-        fixed = f.bool;
+-    }
+-    var pre: f32 = 1;
+-    if (o.get("pre_scale")) |s| {
+-        _ = s;
+-        pre = @floatCast(try number(o, "pre_scale"));
+-        if (!std.math.isFinite(pre) or pre <= 0) return error.UnsupportedQwenGeometry;
+-    }
+-    // the window cannot cross a loop phase boundary: the streams would have to survive a collapse
+-    const phases = [_][2]usize{ .{ 0, g.loop_start }, .{ g.loop_start, g.loop_end }, .{ g.loop_end, g.layers } };
+-    var inside = false;
+-    for (phases) |p| if (p[0] <= start and end <= p[1]) {
+-        inside = true;
+-    };
+-    if (!inside) return error.UnsupportedQwenGeometry;
+-    // the kernels mix with the learned map only: an identity map would have to skip the Sinkhorn
+-    if (fixed) return error.UnsupportedQwenGeometry;
+-    g.mhc = .{ .start = start, .end = end, .streams = streams, .iterations = iterations, .fixed_identity = fixed, .pre_scale = pre };
+-}
+-
+ /// Whether config.json's quantization_config says quant_method "exl3" (Mia-AiLab's HF-layout checkpoints).
+ fn isExl3(root: std.json.ObjectMap) bool {
+     return quantMethod(root, "exl3");
+@@ -462,8 +408,7 @@ pub fn parse(gpa: std.mem.Allocator, bytes: []const u8) !Geometry {
+     var full: [max_layers]bool = undefined;
+     try layer_pattern.read(full[0..g.layers], t);
+     for (g.linear[0..g.layers], full[0..g.layers]) |*l, f| l.* = !f;
+-    try loopPlan(&g, root);
+-    try mhcSettings(&g, root);
++    try @import("cuda_loop_plan.zig").read(&g, root);
+     if (modelopt or bf16) {
+         if (g.pocket > 0) return error.UnsupportedLearningFormat;
+         const mo = @import("cuda_modelopt.zig");
+@@ -639,40 +584,6 @@ test "fp8 caches take e4m3 rows and a scale each: 520 bytes a position and head
+     try std.testing.expectEqual(@as(usize, 2 * 2 * 1000 * 260), g.kvBytes(1000, true));
+ }
+ 
+-test "SenseNova-Loop-9B: [4,28) twice over 32 layers is 56 executions, 14 attention slots and 42 delta slots" {
+-    const a = std.testing.allocator;
+-    var json: std.ArrayList(u8) = .empty;
+-    defer json.deinit(a);
+-    try json.appendSlice(a, "{\"model_type\":\"sensenova_loop\",\"quantization\":{\"group_size\":64,\"bits\":8,\"mode\":\"affine\"},\"tie_word_embeddings\":false,\"loop_settings\":{\"counts\":[2],\"end\":28,\"eval_count\":2,\"start\":4},\"mhc\":{\"end\":28,\"fixed_identity\":false,\"iterations\":20,\"pre_scale\":1.0,\"start\":4,\"streams\":2},\"text_config\":{\"model_type\":\"qwen3_5_text\",\"attention_bias\":false,\"attn_output_gate\":true,\"hidden_act\":\"silu\",\"head_dim\":256,\"linear_key_head_dim\":128,\"linear_value_head_dim\":128,\"linear_conv_kernel_dim\":4,\"hidden_size\":4096,\"intermediate_size\":12288,\"num_hidden_layers\":32,\"vocab_size\":248320,\"linear_num_key_heads\":16,\"linear_num_value_heads\":32,\"num_attention_heads\":16,\"num_key_value_heads\":4,\"rms_norm_eps\":1e-06,\"max_position_embeddings\":524288,\"layer_types\":[");
+-    for (0..32) |i| {
+-        if (i != 0) try json.append(a, ',');
+-        try json.appendSlice(a, if ((i + 1) % 4 == 0) "\"full_attention\"" else "\"linear_attention\"");
+-    }
+-    try json.appendSlice(a, "],\"rope_parameters\":{\"rope_type\":\"yarn\",\"rope_theta\":10000000,\"partial_rotary_factor\":0.25,\"factor\":2.0,\"original_max_position_embeddings\":262144}}}");
+-    const g = try parse(a, json.items);
+-    try std.testing.expectEqual(@as(usize, 56), g.steps());
+-    try std.testing.expectEqual(@as(usize, 14), g.attentions());
+-    try std.testing.expectEqual(@as(usize, 42), g.deltas());
+-    try std.testing.expectEqual(@as(usize, 3), g.physical(3));
+-    try std.testing.expectEqual(@as(usize, 4), g.physical(4));
+-    try std.testing.expectEqual(@as(usize, 27), g.physical(27));
+-    try std.testing.expectEqual(@as(usize, 4), g.physical(28)); // the loop's second pass restarts at 4
+-    try std.testing.expectEqual(@as(usize, 27), g.physical(51));
+-    try std.testing.expectEqual(@as(usize, 28), g.physical(52));
+-    try std.testing.expectEqual(@as(usize, 31), g.physical(55));
+-    // a token's keys and values: 14 executions of 4 KV heads of 256, K and V, bf16
+-    try std.testing.expectEqual(@as(usize, 14 * 4096), g.kvBytes(1, false));
+-    try std.testing.expectEqual(@as(usize, 42 * (32 * 128 * 128 * 4 + 3 * 8192 * 2)), g.stateBytes());
+-    const m = g.mhc.?;
+-    try std.testing.expectEqual(@as(usize, 8), m.outputs());
+-    try std.testing.expect(m.holds(4) and m.holds(27) and !m.holds(3) and !m.holds(28));
+-    // a looped model has no physical stage slice, and a learned identity map is not what the kernels run
+-    try std.testing.expectError(error.BadStageRange, g.stage(0, 16, false));
+-    const fixed = try std.mem.replaceOwned(u8, a, json.items, "\"fixed_identity\":false", "\"fixed_identity\":true");
+-    defer a.free(fixed);
+-    try std.testing.expectError(error.UnsupportedQwenGeometry, parse(a, fixed));
+-}
+-
+ test {
+     _ = @import("cuda_quant_admission_test.zig");
+     _ = @import("cuda_modelopt_moe_test.zig");
+diff --git a/zig/src/families/qwen3_5/cuda_loop_plan.zig b/zig/src/families/qwen3_5/cuda_loop_plan.zig
+new file mode 100644
+index 000000000..e1285c6e9
+--- /dev/null
++++ b/zig/src/families/qwen3_5/cuda_loop_plan.zig
+@@ -0,0 +1,83 @@
++//! A Qwen3.5 looped checkpoint's root blocks: the shared-weight loop and its manifold-constrained streams.
++const std = @import("std");
++const geometry = @import("cuda_geometry.zig");
++
++/// A JSON object, or the refusal every one of these blocks shares.
++fn object(v: std.json.Value) !std.json.ObjectMap {
++    return if (v == .object) v.object else error.UnsupportedQwenGeometry;
++}
++
++/// A positive whole field.
++fn integer(o: std.json.ObjectMap, key: []const u8) !usize {
++    const v = o.get(key) orelse return error.UnsupportedQwenGeometry;
++    if (v != .integer or v.integer < 1) return error.UnsupportedQwenGeometry;
++    return @intCast(v.integer);
++}
++
++/// A number, integer or float.
++fn number(o: std.json.ObjectMap, key: []const u8) !f64 {
++    return switch (o.get(key) orelse return error.UnsupportedQwenGeometry) {
++        .integer => |i| @floatFromInt(i),
++        .float => |f| f,
++        else => error.UnsupportedQwenGeometry,
++    };
++}
++
++/// `loop_settings`: the shared-weight loop, as the reference's `execution_plan` reads it. Absent: every layer once.
++pub fn read(g: *geometry.Geometry, root: std.json.ObjectMap) !void {
++    try loopPlan(g, root);
++    try mhcSettings(g, root);
++}
++
++fn loopPlan(g: *geometry.Geometry, root: std.json.ObjectMap) !void {
++    const v = root.get("loop_settings") orelse return;
++    const o = try object(v);
++    const start = try integer(o, "start");
++    const end = try integer(o, "end");
++    const count = try integer(o, "eval_count");
++    if (start >= end or end > g.layers or count < 1) return error.UnsupportedQwenGeometry;
++    // the reference runs fixed-count loop checkpoints only: `counts` is exactly [eval_count] when present
++    if (o.get("counts")) |c| {
++        if (c != .array or c.array.items.len != 1) return error.UnsupportedQwenGeometry;
++        if (c.array.items[0] != .integer or c.array.items[0].integer != @as(i64, @intCast(count))) return error.UnsupportedQwenGeometry;
++    }
++    const steps = start + count * (end - start) + (g.layers - end);
++    if (steps > geometry.max_steps) return error.UnsupportedQwenGeometry;
++    g.loop_start = start;
++    g.loop_end = end;
++    g.loop_count = count;
++}
++
++/// `mhc`: manifold-constrained hyper-connections over one loop phase, as the reference's plan validator reads them.
++fn mhcSettings(g: *geometry.Geometry, root: std.json.ObjectMap) !void {
++    const v = root.get("mhc") orelse return;
++    const o = try object(v);
++    const start = try integer(o, "start");
++    const end = try integer(o, "end");
++    const streams = try integer(o, "streams");
++    const iterations = try integer(o, "iterations");
++    if (start >= end or end > g.layers or (streams != 2 and streams != 4) or iterations < 1 or iterations > 64)
++        return error.UnsupportedQwenGeometry;
++    var fixed = false;
++    if (o.get("fixed_identity")) |f| {
++        if (f != .bool) return error.UnsupportedQwenGeometry;
++        fixed = f.bool;
++    }
++    var pre: f32 = 1;
++    if (o.get("pre_scale")) |s| {
++        _ = s;
++        pre = @floatCast(try number(o, "pre_scale"));
++        if (!std.math.isFinite(pre) or pre <= 0) return error.UnsupportedQwenGeometry;
++    }
++    // the window cannot cross a loop phase boundary: the streams would have to survive a collapse
++    const phases = [_][2]usize{ .{ 0, g.loop_start }, .{ g.loop_start, g.loop_end }, .{ g.loop_end, g.layers } };
++    var inside = false;
++    for (phases) |p| if (p[0] <= start and end <= p[1]) {
++        inside = true;
++    };
++    if (!inside) return error.UnsupportedQwenGeometry;
++    // the kernels mix with the learned map only: an identity map would have to skip the Sinkhorn
++    if (fixed) return error.UnsupportedQwenGeometry;
++    g.mhc = .{ .start = start, .end = end, .streams = streams, .iterations = iterations, .fixed_identity = fixed, .pre_scale = pre };
++}
++
+diff --git a/zig/src/families/qwen3_5/cuda_loop_plan_test.zig b/zig/src/families/qwen3_5/cuda_loop_plan_test.zig
+new file mode 100644
+index 000000000..421d7e6b2
+--- /dev/null
++++ b/zig/src/families/qwen3_5/cuda_loop_plan_test.zig
+@@ -0,0 +1,38 @@
++//! The loop plan and mHC validation, at SenseNova-Loop-9B's own shape.
++const std = @import("std");
++const parse = @import("cuda_geometry.zig").parse;
++
++test "SenseNova-Loop-9B: [4,28) twice over 32 layers is 56 executions, 14 attention slots and 42 delta slots" {
++    const a = std.testing.allocator;
++    var json: std.ArrayList(u8) = .empty;
++    defer json.deinit(a);
++    try json.appendSlice(a, "{\"model_type\":\"sensenova_loop\",\"quantization\":{\"group_size\":64,\"bits\":8,\"mode\":\"affine\"},\"tie_word_embeddings\":false,\"loop_settings\":{\"counts\":[2],\"end\":28,\"eval_count\":2,\"start\":4},\"mhc\":{\"end\":28,\"fixed_identity\":false,\"iterations\":20,\"pre_scale\":1.0,\"start\":4,\"streams\":2},\"text_config\":{\"model_type\":\"qwen3_5_text\",\"attention_bias\":false,\"attn_output_gate\":true,\"hidden_act\":\"silu\",\"head_dim\":256,\"linear_key_head_dim\":128,\"linear_value_head_dim\":128,\"linear_conv_kernel_dim\":4,\"hidden_size\":4096,\"intermediate_size\":12288,\"num_hidden_layers\":32,\"vocab_size\":248320,\"linear_num_key_heads\":16,\"linear_num_value_heads\":32,\"num_attention_heads\":16,\"num_key_value_heads\":4,\"rms_norm_eps\":1e-06,\"max_position_embeddings\":524288,\"layer_types\":[");
++    for (0..32) |i| {
++        if (i != 0) try json.append(a, ',');
++        try json.appendSlice(a, if ((i + 1) % 4 == 0) "\"full_attention\"" else "\"linear_attention\"");
++    }
++    try json.appendSlice(a, "],\"rope_parameters\":{\"rope_type\":\"yarn\",\"rope_theta\":10000000,\"partial_rotary_factor\":0.25,\"factor\":2.0,\"original_max_position_embeddings\":262144}}}");
++    const g = try parse(a, json.items);
++    try std.testing.expectEqual(@as(usize, 56), g.steps());
++    try std.testing.expectEqual(@as(usize, 14), g.attentions());
++    try std.testing.expectEqual(@as(usize, 42), g.deltas());
++    try std.testing.expectEqual(@as(usize, 3), g.physical(3));
++    try std.testing.expectEqual(@as(usize, 4), g.physical(4));
++    try std.testing.expectEqual(@as(usize, 27), g.physical(27));
++    try std.testing.expectEqual(@as(usize, 4), g.physical(28)); // the loop's second pass restarts at 4
++    try std.testing.expectEqual(@as(usize, 27), g.physical(51));
++    try std.testing.expectEqual(@as(usize, 28), g.physical(52));
++    try std.testing.expectEqual(@as(usize, 31), g.physical(55));
++    // a token's keys and values: 14 executions of 4 KV heads of 256, K and V, bf16
++    try std.testing.expectEqual(@as(usize, 14 * 4096), g.kvBytes(1, false));
++    try std.testing.expectEqual(@as(usize, 42 * (32 * 128 * 128 * 4 + 3 * 8192 * 2)), g.stateBytes());
++    const m = g.mhc.?;
++    try std.testing.expectEqual(@as(usize, 8), m.outputs());
++    try std.testing.expect(m.holds(4) and m.holds(27) and !m.holds(3) and !m.holds(28));
++    // a looped model has no physical stage slice, and a learned identity map is not what the kernels run
++    try std.testing.expectError(error.BadStageRange, g.stage(0, 16, false));
++    const fixed = try std.mem.replaceOwned(u8, a, json.items, "\"fixed_identity\":false", "\"fixed_identity\":true");
++    defer a.free(fixed);
++    try std.testing.expectError(error.UnsupportedQwenGeometry, parse(a, fixed));
++}
++
+diff --git a/zig/src/families/qwen3_5/cuda_mhc.zig b/zig/src/families/qwen3_5/cuda_mhc.zig
+new file mode 100644
+index 000000000..c99b22c26
+--- /dev/null
++++ b/zig/src/families/qwen3_5/cuda_mhc.zig
+@@ -0,0 +1,40 @@
++//! SenseNova-Loop's mHC: its own kernel image, and the four launches the forward makes through it.
++const E = @import("cuda_engine.zig");
++const geometry = @import("cuda_geometry.zig");
++const sig = @import("cuda_signatures.zig");
++const launch = @import("cuda_forward.zig").launch;
++
++/// The kernels' image (module 19), under the family's symbol prefix.
++pub fn install(e: *E.Engine) !void {
++    inline for (kernels) |name| @field(e.fns, name) = try e.mods[19].function("tf_q35_" ++ name);
++}
++
++/// The bf16 tiles' two buffers, which the shared-memory opt-in must declare.
++pub const tiles = @import("cuda_forward.zig").attn_tiles;
++
++const kernels = .{ "mhc_branch", "mhc_merge", "mhc_enter", "mhc_leave" };
++
++/// h into every stream at the window's entry, folding the previous layer's output when it is still pending.
++pub fn enter(e: *E.Engine, rows: usize, m: geometry.Mhc, fold: bool) !void {
++    const geo = e.geo;
++    const r: u64 = if (fold) e.r else 0;
++    try launch(e, e.fns.mhc_enter, sig.mhc_enter, .{ (rows * e.g.hidden + 255) / 256, 1, 1 }, .{ 256, 1, 1 }, .{ geo, e.h, r, e.hs, @as(c_int, @intCast(rows)), @as(c_int, @intCast(m.streams)) });
++}
++
++/// The streams' mean into h: the window's last execution.
++pub fn leave(e: *E.Engine, rows: usize, m: geometry.Mhc) !void {
++    const geo = e.geo;
++    try launch(e, e.fns.mhc_leave, sig.mhc_leave, .{ (rows * e.g.hidden + 255) / 256, 1, 1 }, .{ 256, 1, 1 }, .{ geo, e.hs, e.h, @as(c_int, @intCast(rows)), @as(c_int, @intCast(m.streams)) });
++}
++
++/// A sublayer's branch out of the streams (into h), with its pre/post/mix kept for the merge.
++pub fn branch(e: *E.Engine, w: u64, b: u64, rows: usize, m: geometry.Mhc) !void {
++    const geo = e.geo;
++    try launch(e, e.fns.mhc_branch, sig.mhc_branch, .{ rows, 1, 1 }, .{ 256, 1, 1 }, .{ geo, e.hs, w, b, e.h, e.mhc_state, @as(c_int, @intCast(rows)), @as(c_int, @intCast(m.streams)), @as(c_int, @intCast(m.iterations)), @as(f32, m.pre_scale) });
++}
++
++/// The sublayer's output (r) back into the streams.
++pub fn merge(e: *E.Engine, rows: usize, m: geometry.Mhc) !void {
++    const geo = e.geo;
++    try launch(e, e.fns.mhc_merge, sig.mhc_merge, .{ (rows * e.g.hidden + 255) / 256, 1, 1 }, .{ 256, 1, 1 }, .{ geo, e.r, e.mhc_state, e.hs, @as(c_int, @intCast(rows)), @as(c_int, @intCast(m.streams)) });
++}
+diff --git a/zig/src/platform/environment.zig b/zig/src/platform/environment.zig
+index 952a13ef4..78db02383 100644
+--- a/zig/src/platform/environment.zig
++++ b/zig/src/platform/environment.zig
+@@ -70,6 +70,7 @@ pub const rules = [_]Rule{
+     .{ .name = "TF_QWEN27_SLOT_RESUME", .scope = .metal, .kind = .flag, .forms = "0 or 1 (0 stops slot 0 resuming a later prompt; unset or blank keeps it on)" },
+     .{ .name = "TF_QWEN27_METAL_KV_PAGES", .scope = .metal, .kind = .flag, .forms = "0 or 1 (1 puts the 27B's keys and values in core-pool pages; unset or blank is 0)" },
+     .{ .name = "TF_QWEN35_METAL_KV_PAGES", .scope = .metal, .kind = .flag, .forms = "0 or 1 (1 puts the streams' keys and values in core-pool pages; unset or blank is 0)" },
++    .{ .name = "TF_Q35_DEBUG", .scope = .cuda, .kind = .flag, .forms = "0 or 1 (1 prints a forward's execution plan, cache slots and mHC settings)" },
+     .{ .name = "TF_DSV41_SMALL", .scope = .metal, .kind = .flag, .forms = "0 or 1 (1 reads a DeepSeek-V4.1 Metal checkpoint's config at its own small shapes)" },
+     .{ .name = "TF_DSV41_ASSETS", .scope = .metal, .kind = .path, .forms = "a directory path without control characters holding DeepSeek-V4.1's Engram token map" },
+     .{ .name = "TF_DSV41_ENGRAM_DIR", .scope = .metal, .kind = .path, .forms = "a directory path without control characters holding DeepSeek-V4.1's packed Engram tables" },

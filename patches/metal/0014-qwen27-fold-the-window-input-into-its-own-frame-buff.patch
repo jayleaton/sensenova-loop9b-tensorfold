@@ -1,0 +1,67 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Jay Leaton <58495321+jayleaton@users.noreply.github.com>
+Date: Wed, 18 Nov 2026 04:01:41 +0800
+Subject: [PATCH 14/26] qwen27: fold the window input into its own frame buffer
+
+The fold wrote into s.hidden, which the residual swap had already made the normed
+buffer, so enter expanded rows that were not the layer-3 residual at all: the
+folded plane measured rms 1.084 against h04's 0.276. A dedicated mhc_folded
+buffer holds the fold's output, so no swap can move it away from enter, and the
+copy path is used when nothing is pending.
+
+Frame buffers are shared and untracked, so no Metal hazard tracking orders the
+fold against enter; the barrier between them is a buffers memory barrier and is
+load-bearing, not decorative.
+---
+ zig/src/families/qwen27/forward.zig   | 11 +++++++----
+ zig/src/families/qwen27/gpu_frame.zig |  5 ++++-
+ 2 files changed, 11 insertions(+), 5 deletions(-)
+
+diff --git a/zig/src/families/qwen27/forward.zig b/zig/src/families/qwen27/forward.zig
+index c4b6c7d05..c7fa8a6ac 100644
+--- a/zig/src/families/qwen27/forward.zig
++++ b/zig/src/families/qwen27/forward.zig
+@@ -148,13 +148,16 @@ pub const Stages = struct {
+             // only the window's first layer expands h into the streams; after it the residual is the streams
+             if (m.config.physical(index) == mh.start) {
+                 // the window's input is the residual with its pending output folded in once: fold in place
+-                const src = s.hidden;
++                // a dedicated buffer, so the residual swap cannot move the fold's output away from enter
++                const folded = f.get(.mhc_folded);
+                 if (s.pending) |pending| {
+-                    m.glue.residual(e, src, pending, src, h, s.rows);
++                    m.glue.residual(e, s.hidden, pending, folded, h, s.rows);
+                     e.barrier();
++                    if (s.hooks.tap) |tap| try tap(s.hooks.ptr, e, folded_tap, folded, s.rows);
+                     s.pending = null;
+-                }
+-                mhc_mod.enter(e, m.mhc.?, b, b.params(mh, h), s.rows, src, null);
++                } else try m.glue.unstack(e, s.hidden, folded, .{ .rows = s.rows, .width = h, .stride = h, .offset = 0 });
++                e.barrier();
++                mhc_mod.enter(e, m.mhc.?, b, b.params(mh, h), s.rows, folded, null);
+                 e.barrier();
+                 // from here the window's residual is the flat streams: every stage reads and writes that
+                 s.hidden = s.window;
+diff --git a/zig/src/families/qwen27/gpu_frame.zig b/zig/src/families/qwen27/gpu_frame.zig
+index febb2aaa3..841d23a45 100644
+--- a/zig/src/families/qwen27/gpu_frame.zig
++++ b/zig/src/families/qwen27/gpu_frame.zig
+@@ -6,7 +6,9 @@ const Ref = @import("projection.zig").Ref;
+ 
+ pub const Field = enum { ids, dims, positions, hidden, residual, input, sums, mixed, mixer_out, output, z, a, b, query, key, value, norm_query, norm_key, q_gate, gate, up, activated, act_sums, logits, drawn, eps, parents, windows, row_slots, segments, keeps, kept_rows, rotated_key, takes, slot_steps, router, picks, route_weights, offsets, order, sorted_weights, sorted_rows, expert_gate, expert_up, expert_act, expert_out, expert_sums,
+     /// A looped checkpoint's mHC: the residual streams (four planes at most), the router's f32 outputs, the branch.
+-    streams, mhc_state, mhc_branch };
++    streams, mhc_state, mhc_branch,
++    /// The window's folded input: the residual plus its pending output, in a buffer no swap can move.
++    mhc_folded };
+ 
+ /// A prompt pass's rows at most (a chain); rounds with trees and every logits row stay within `logit_rows`.
+ pub const max_rows = 2048;
+@@ -41,6 +43,7 @@ pub fn allocationSizes(config: Config, capacity: u32) [std.enums.values(Field).l
+         slots * config.hidden * 2,                                                          slots * @max(config.hidden, config.moe_intermediate) / 64 * 4,
+         // the window's streams, router state and branch: nothing at all unless the checkpoint declares mHC
+         streamBytes(config, capacity),                                                       mhcStateBytes(config, capacity),                                                                    mhcBranchBytes(config, capacity),
++        mhcBranchBytes(config, capacity),
+     };
+ }
+ 

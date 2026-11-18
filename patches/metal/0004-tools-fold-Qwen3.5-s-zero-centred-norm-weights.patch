@@ -1,0 +1,95 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Jay Leaton <58495321+jayleaton@users.noreply.github.com>
+Date: Wed, 18 Nov 2026 02:06:09 +0800
+Subject: [PATCH 04/26] tools: fold Qwen3.5's zero-centred norm weights
+
+Qwen3_5RMSNorm stores a zero-initialized weight and multiplies by (1 + w);
+Qwen3_5RMSNormGated (linear_attn.norm) multiplies by w alone. The converter
+copied the stored values straight through, so every norm ran about 20x small:
+the engine's layer-0 normalized input had rms 0.115 against the reference's
+1.089 and cosine 0.815, and every later seam drifted from it.
+
+Folding 1 + w into input_layernorm, post_attention_layernorm, model.norm,
+q_norm and k_norm, and leaving linear_attn.norm alone, moves layer 0 from
+cosine 0.857 to 0.9983 and layer 2 from 0.680 to 0.9964, and the 32-layer plain
+pass now matches the reference run on the same 4-bit values 64/64 on two
+prompts and to an exact 0.0-margin tie on the third.
+
+sensenova_loop_mlx_test.py pins the classification: no norm other than the
+gated one may be treated as zero-centred.
+---
+ tools/sensenova_loop_mlx.py      |  9 ++++++++
+ tools/sensenova_loop_mlx_test.py | 37 ++++++++++++++++++++++++++++++++
+ 2 files changed, 46 insertions(+)
+ create mode 100644 tools/sensenova_loop_mlx_test.py
+
+diff --git a/tools/sensenova_loop_mlx.py b/tools/sensenova_loop_mlx.py
+index f639f6948..59de53100 100644
+--- a/tools/sensenova_loop_mlx.py
++++ b/tools/sensenova_loop_mlx.py
+@@ -35,6 +35,12 @@ QUANT_SUFFIXES = (
+     "linear_attn.in_proj_a.weight",
+     "linear_attn.out_proj.weight",
+ )
++def zero_centered(name):
++    """Whether a norm stores a zero-centred weight: Qwen3_5RMSNorm computes `x * (1 + w)`, the Gated one `x * w`."""
++    if "linear_attn.norm" in name:
++        return False
++    return name.endswith(("input_layernorm.weight", "post_attention_layernorm.weight", "model.norm.weight",
++                          "q_norm.weight", "k_norm.weight"))
+ COPY = ("tokenizer.json", "tokenizer_config.json", "chat_template.jinja", "generation_config.json",
+         "preprocessor_config.json", "processor_config.json")
+ 
+@@ -164,6 +170,9 @@ def main():
+                 pending[f"{base}.scales"] = torch.from_numpy(s_all.view(np.int16)).view(torch.bfloat16)
+                 pending[f"{base}.biases"] = torch.from_numpy(b_all.view(np.int16)).view(torch.bfloat16)
+                 checked += 1
++            elif zero_centered(out):
++                # the engine multiplies by the stored weight, as mlx checkpoints do: fold the model's `1 + w`
++                pending[out] = (t.float() + 1.0).to(torch.bfloat16).contiguous()
+             elif out.endswith("A_log"):
+                 # the GDN kernel reads a bf16 decay weight; the checkpoint's A_log is f32
+                 pending[out] = t.to(torch.bfloat16).contiguous()
+diff --git a/tools/sensenova_loop_mlx_test.py b/tools/sensenova_loop_mlx_test.py
+new file mode 100644
+index 000000000..5ba9d0477
+--- /dev/null
++++ b/tools/sensenova_loop_mlx_test.py
+@@ -0,0 +1,37 @@
++"""The norm mapping that makes SenseNova-Loop-9B load with the right scale."""
++import numpy as np
++import torch
++
++from sensenova_loop_mlx import zero_centered
++
++
++def test_the_gated_norm_is_not_zero_centred():
++    assert not zero_centered("language_model.model.layers.0.linear_attn.norm.weight")
++
++
++def test_every_qwen3_5rmsnorm_weight_is_zero_centred():
++    for name in (
++        "language_model.model.layers.0.input_layernorm.weight",
++        "language_model.model.layers.0.post_attention_layernorm.weight",
++        "language_model.model.norm.weight",
++        "language_model.model.layers.3.self_attn.q_norm.weight",
++        "language_model.model.layers.3.self_attn.k_norm.weight",
++    ):
++        assert zero_centered(name), name
++
++
++def test_projections_and_the_embedding_are_left_alone():
++    for name in (
++        "language_model.model.embed_tokens.weight",
++        "language_model.model.layers.0.mlp.down_proj.weight",
++        "language_model.model.layers.0.linear_attn.in_proj_qkv.weight",
++        "language_model.lm_head.weight",
++    ):
++        assert not zero_centered(name), name
++
++
++def test_folding_one_turns_a_zero_centred_norm_into_a_multiplier():
++    # the released checkpoint's layer-0 input norm has rms 0.0492 and mean 0.0331; `1 + w` must land near one
++    w = torch.tensor([0.0331] * 4096)
++    assert abs(float((w.float() + 1.0).pow(2).mean().sqrt()) - 1.0336) < 1e-3
++    assert abs(float((w.float()).pow(2).mean().sqrt()) - 0.0331) < 1e-3

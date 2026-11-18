@@ -1,0 +1,118 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Jay Leaton <58495321+jayleaton@users.noreply.github.com>
+Date: Wed, 18 Nov 2026 04:52:48 +0800
+Subject: [PATCH 20/26] qwen27: run the mHC router's outputs side by side, bit
+ for bit
+
+The router was one simdgroup a row, computing its eight outputs one after
+another: each lane walked H/32 elements for every output and stream in turn, so
+the window cost 7.6x the whole rest of the loop. Each output now runs in its own
+simdgroup, keeping the identical 32-lane per-output reduction order, and the
+row's mean stays on simdgroup 0 with the same order it always had. The result is
+bit-identical to the previous kernel, so the gate is unchanged, and the MHC check
+against the CPU reference still passes exactly.
+
+Decode on an M3 Ultra: 11.3 -> 35.3 tok/s on the same 24-token run, with p1 and
+p2 still 64/64 and p0 19/64 against the same-4-bit reference.
+---
+ zig/kernels/metal/qwen27/mhc.metal | 41 +++++++++++++++++-------------
+ zig/src/families/qwen27/mhc.zig    |  3 ++-
+ 2 files changed, 26 insertions(+), 18 deletions(-)
+
+diff --git a/zig/kernels/metal/qwen27/mhc.metal b/zig/kernels/metal/qwen27/mhc.metal
+index f1006745c..54ac47fb3 100644
+--- a/zig/kernels/metal/qwen27/mhc.metal
++++ b/zig/kernels/metal/qwen27/mhc.metal
+@@ -9,42 +9,49 @@ static inline float tf_mhc_rbf(float v) {
+ }
+ 
+ // One row's router: `outs` mixes of the streams, Sinkhorn over the S x S map, then the branch the layer runs on.
+-[[max_total_threads_per_threadgroup(32)]] kernel void tf_mhc_branch(device const bfloat* HS [[buffer(0)]],
++[[max_total_threads_per_threadgroup(256)]] kernel void tf_mhc_branch(device const bfloat* HS [[buffer(0)]],
+                           device const float* W [[buffer(1)]],
+                           device const float* B [[buffer(2)]],
+                           device bfloat* BRANCH [[buffer(3)]],
+                           device float* STATE [[buffer(4)]],
+                           constant TfMhc& a [[buffer(5)]],
+                           uint row [[threadgroup_position_in_grid]],
++                          uint tid [[thread_index_in_threadgroup]],
+                           uint lane [[thread_index_in_simdgroup]]) {
+   const uint S = a.streams, n = a.outs, H = a.hidden, D = S * H;
+   if (S == 0u || S > 4u || n > 8u) return;
++  const uint sg = tid / 32u;
+   threadgroup float mean;
+   // the coefficients lane 0 computes, shared through threadgroup memory: a barrier orders that space, not device
+   threadgroup float coef[24];
+-  // the row's mean square over the flattened streams, then one simdgroup an output's dot product
+-  float acc = 0.f;
+-  for (uint s = 0; s < S; ++s) for (uint i = lane; i < H; i += 32u) {
+-    const float x = float(HS[row * S * H + s * H + i]);
+-    acc += x * x;
++  /// One output a simdgroup computes: shared, since the coefficients read all of them.
++  threadgroup float logits[8];
++  // the row's mean square: one simdgroup, the same 32-lane order the single-group kernel used
++  if (sg == 0) {
++    float acc = 0.f;
++    for (uint s = 0; s < S; ++s) for (uint i = lane; i < H; i += 32u) {
++      const float x = float(HS[row * S * H + s * H + i]);
++      acc += x * x;
++    }
++    acc = simd_sum(acc);
++    if (lane == 0) mean = rsqrt(acc / float(D) + 1e-6f);
+   }
+-  acc = simd_sum(acc);
+-  if (lane == 0) mean = rsqrt(acc / float(D) + 1e-6f);
++  // every other simdgroup reads the mean, so the shared write must be ordered before it
+   threadgroup_barrier(mem_flags::mem_threadgroup);
+-  const float inv = mean;
+-
+-  float logits[8];
+-  for (uint o = 0; o < n; ++o) {
+-    const device float* w = W + uint64_t(o) * D;
++  // one simdgroup an output, each with the same 32-lane order: bit-identical to running them in turn
++  if (sg < n) {
++    const device float* w = W + uint64_t(sg) * D;
++    const float inv = mean;
+     float s = 0.f;
+     for (uint t = 0; t < S; ++t) for (uint i = lane; i < H; i += 32u) {
+       s += w[t * H + i] * (float(HS[row * S * H + t * H + i]) * inv);
+     }
+     s = simd_sum(s);
+-    logits[o] = s + (B == nullptr ? 0.f : B[o]);
++    if (lane == 0) logits[sg] = s + (B == nullptr ? 0.f : B[sg]);
+   }
++  threadgroup_barrier(mem_flags::mem_threadgroup);
+   // the coefficients: pre sigmoid, post 2 sigmoid, mix Sinkhorn-normalized in log space
+-  if (lane == 0) {
++  if (tid == 0) {
+     for (uint s = 0; s < S; ++s) {
+       coef[s] = 1.f / (1.f + exp(-logits[s]));
+       coef[S + s] = 2.f / (1.f + exp(-logits[S + s]));
+@@ -73,11 +80,11 @@ static inline float tf_mhc_rbf(float v) {
+   }
+   threadgroup_barrier(mem_flags::mem_threadgroup);
+   // the merge kernel reads these later, so device memory gets its own copy after the shared ones are final
+-  if (lane == 0) {
++  if (tid == 0) {
+     float* st = STATE + uint64_t(row) * n;
+     for (uint i = 0; i < n; ++i) st[i] = coef[i];
+   }
+-  for (uint d = lane; d < H; d += 32u) {
++  for (uint d = tid; d < H; d += 256u) {
+     float b = 0.f;
+     for (uint s = 0; s < S; ++s) b += tf_mhc_rbf(coef[s]) * float(HS[row * S * H + s * H + d]);
+     if (a.pre_scale != 1.f) b *= a.pre_scale;
+diff --git a/zig/src/families/qwen27/mhc.zig b/zig/src/families/qwen27/mhc.zig
+index dece2249e..63f949f63 100644
+--- a/zig/src/families/qwen27/mhc.zig
++++ b/zig/src/families/qwen27/mhc.zig
+@@ -85,7 +85,8 @@ pub fn branch(e: mtl.ComputeEncoder, k: Kernels, b: Buffers, p: Params, rows: u3
+     e.setBuffer(b.branch.buffer, b.branch.offset, 3);
+     e.setBuffer(b.state.buffer, b.state.offset, 4);
+     e.setValue(p, 5);
+-    e.dispatchGroups(mtl.Size.of(rows, 1, 1), mtl.Size.of(32, 1, 1));
++    // one simdgroup an output: the same 32-lane order, run side by side
++    e.dispatchGroups(mtl.Size.of(rows, 1, 1), mtl.Size.of(256, 1, 1));
+ }
+ 
+ /// The sublayer's output back into the streams.

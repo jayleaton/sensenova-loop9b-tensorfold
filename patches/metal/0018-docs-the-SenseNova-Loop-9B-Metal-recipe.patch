@@ -1,0 +1,141 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Jay Leaton <58495321+jayleaton@users.noreply.github.com>
+Date: Wed, 18 Nov 2026 04:41:27 +0800
+Subject: [PATCH 18/26] docs: the SenseNova-Loop-9B Metal recipe
+
+Records the model's shape, the two converter mappings that matter (the
+zero-centred norms and the loader's namespace), how to serve it, and the
+measurements taken on an M3 Ultra: 10.77 tok/s decode against a 123.7 plain
+control, prefill 150.2, and 64/64 parity on two of three prompts with the third
+breaking at a rank-2 near-tie. Names the open cost, the vision and context gaps,
+and credits SenseNova for the model and ashhart/TensorFold for the engine.
+---
+ docs/recipes/README.md                  |   1 +
+ docs/recipes/sensenova-loop-9b-metal.md | 106 ++++++++++++++++++++++++
+ 2 files changed, 107 insertions(+)
+ create mode 100644 docs/recipes/sensenova-loop-9b-metal.md
+
+diff --git a/docs/recipes/README.md b/docs/recipes/README.md
+index 0789c6b98..9e548e851 100644
+--- a/docs/recipes/README.md
++++ b/docs/recipes/README.md
+@@ -14,6 +14,7 @@
+ | Nemotron 3.5 Parse | [Native HIP OCR, validation and qualification limits](nemotron-parse.md) |
+ | Nemotron 3.5 Super VL | [Native CUDA on one or two GB10s, images](nemotron-3.5-super-vl.md) |
+ | Qwen3.8-27B | [MLX, quantization and CUDA](qwen3.8-27b.md) |
++| SenseNova-Loop-9B | [Metal, a shared-weight loop and two-stream mHC](sensenova-loop-9b-metal.md) |
+ | Qwen3-Embedding | [Native Metal](qwen3-embedding-metal.md), [HIP](qwen3-embedding-hip.md) |
+ | Qwen3.5-2B | [Native Metal preview, tied affine 4-bit](qwen3.5-2b-native.md) |
+ | Qwen3.8 Flash Next | [MLX prefill and CUDA](qwen3.8-flash-next.md), [native CUDA](flash-next-cuda.md), [CUDA images](flash-next-vision.md), [exact SSD residency on Metal](fluid-subgraph-residency.md) |
+diff --git a/docs/recipes/sensenova-loop-9b-metal.md b/docs/recipes/sensenova-loop-9b-metal.md
+new file mode 100644
+index 000000000..dce07a03b
+--- /dev/null
++++ b/docs/recipes/sensenova-loop-9b-metal.md
+@@ -0,0 +1,106 @@
++# SenseNova-Loop-9B on Metal
++
++[SenseNova-Loop-9B](https://huggingface.co/sensenova/SenseNova-Loop-9B) by SenseNova, served by
++[TensorFold](https://github.com/ashhart/TensorFold) on one Mac. Revision
++`329a65f701ba8c48b73c30d0cbaa6f0449733673`, BF16, MLX affine 4-bit groups of 64.
++
++This recipe is **experimental**: two of three parity prompts are token-exact and the served decode rate is
++about 4x below what the execution count predicts. Both are measured below rather than estimated.
++
++## The model
++
++A Qwen3.5 dense hybrid text tower whose middle layers run twice:
++
++| property | value |
++| --- | --- |
++| physical layers / executions | 32 / **56** (`loop_settings` `{start:4, end:28, counts:[2]}`) |
++| attention schedule | 3 linear : 1 full, `full_attention_interval: 4` |
++| hidden / heads / kv heads / head dim | 4096 / 16 / 4 / 256 |
++| linear attention | 16 key heads x128, 32 value heads x128, conv 4, fp32 state |
++| MLP / vocab | 12288 / 248320, untied head |
++| rope | YaRN, theta 1e7, factor 2.0, original 262144, partial 0.25 |
++| mHC | 2 streams, 20 Sinkhorn iterations, over `[4, 28)` |
++
++The two-stream mHC wraps that range: each site has a learned fp32 router (`[8, 8192]`), the streams are mixed by a
++Sinkhorn-normalised 2x2 map, and they collapse to their mean at the range's end.
++
++## Convert
++
++```bash
++python3 tools/sensenova_loop_mlx.py --source SenseNova-Loop-9B --out loop9b-mlx4
++```
++
++Two mappings are not obvious and are the difference between working and garbage:
++
++- `Qwen3_5RMSNorm` stores a **zero-centred** weight and multiplies by `1 + w`; `Qwen3_5RMSNormGated` multiplies by
++  `w`. The converter folds `1 + w` into `input_layernorm`, `post_attention_layernorm`, `model.norm`, `q_norm` and
++  `k_norm`, and leaves `linear_attn.norm` alone. Getting this wrong makes every norm run about 20x small.
++- the loader selects a namespace by prefix: `language_model.model.*` and `language_model.lm_head`, with
++  `conv1d.weight` as `[qkv, kernel, 1]` and `dt_bias` in bf16.
++
++`tools/sensenova_loop_mlx_test.py` pins the norm classification.
++
++## Serve
++
++```bash
++zig build native -Dcpu=apple_m1
++zig-out/native/bin/tensorfold-native serve loop9b-mlx4 --name loop9b \
++  --context 2048 --prompt-cache-gib 0 --no-drafts
++```
++
++Load takes about 1.7 s for 4.72 GiB of weights. The model runs 56 decoder executions per token from 32 weight sets,
++so weights are read once and the graph walks the plan: `build: plan.linear 42 slots 8 cap 2048 steps 56 mhc true`.
++Each visit owns its KV and recurrent state, 14 attention and 42 linear slots.
++
++`--no-drafts` is the only supported mode: this checkpoint ships no drafter, and the loop's second visit is not a
++speculative path. Do not enable MTP or DFlash2 against it.
++
++## Measured on an M3 Ultra (macOS 27.2), 4-bit, drafts off
++
++Through the served API with `tools/bench_openai.py`, 64 tokens, two repetitions, temperature 0:
++
++| metric | looped | plain 32-layer control |
++| --- | --- | --- |
++| decode | **10.77 tok/s** | **123.7 tok/s** |
++| prefill | 150.2 tok/s | 1457.8 tok/s |
++| TTFT | 0.093 s | 0.010 s |
++| inter-token latency | 92.8 ms | 8.09 ms |
++
++The plain control is the same binary and the same weights with `loop_settings.counts=[1]` and no `mhc`, so it
++isolates the loop and the mHC. 56 executions from 32 weight sets should cost about 1.75x a plain pass, which would
++be roughly 70 tok/s; the measured 10.77 is a further 6.5x. Removing only the mHC window (keeping 56 executions)
++recovers **82.0 tok/s**, so the cost is in the two-stream boundary, not the loop. Committing every 4 layers instead
++of 4 executions, and widening the router's threadgroups, changed nothing measurable. The open suspects are the
++8192-wide stream buffer being touched by two extra kernels per window layer, and 20-row dispatches over
++prompt-sized buffers. This is the next thing to fix, and these numbers should be re-taken after it.
++
++## Fidelity
++
++Compared against transformers at the pinned revision, run on the **same 4-bit weights**
++(`tools/ref/golden.py`, `attn_implementation=sdpa`), 64 greedy tokens from three fixed prompts:
++
++| prompt | tokens identical |
++| --- | --- |
++| code completion | **64/64** |
++| arithmetic reasoning | **64/64** |
++| plain prose | 19/64 |
++
++Top-1 agrees on all three. The prose prompt breaks first at token 19 on a rank-2 candidate 1.19 logits behind, and
++the per-execution error curve is continuous rather than stepped, with the same character on the prompt that passes,
++so this is a numerical accumulation difference rather than a wiring fault. A 512-token prompt agrees for 14 of its
++first 16 tokens.
++
++For reference, transformers' own BF16-versus-FP32 agreement on the same weights is 39/64, 48/64 and 64/64 — the
++model's own noise floor is not far from where the engine sits on the hardest prompt.
++
++## What is not covered
++
++- images and video: the 27-block vision tower is not converted or loaded, and image parts are refused.
++- contexts past 262144: the checkpoint advertises 524288 positions, but admission caps at 262144.
++- concurrent streams: every number here is one stream.
++- other Apple chips: measured on M3 Ultra only.
++
++## Credits
++
++Model and architecture: [SenseNova](https://huggingface.co/sensenova/SenseNova-Loop-9B). Engine:
++[ashhart/TensorFold](https://github.com/ashhart/TensorFold), whose 27B Metal family carries this port.

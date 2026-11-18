@@ -1,0 +1,92 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Jay Leaton <58495321+jayleaton@users.noreply.github.com>
+Date: Wed, 18 Nov 2026 09:52:00 +0700
+Subject: [PATCH 26/26] qwen27: the mHC frame fields, the router buffers and
+ their checks as zig fmt writes them
+
+Formatting and comments only, the same tokens: the frame's Field enum stays on
+one line with the four mHC fields last and one doc line above it, the size
+table gives their bytes without a comment inside it, and three files lose a
+double blank line. zig fmt --check build.zig zig is clean again.
+---
+ zig/src/families/qwen27/gpu_frame.zig | 14 +++++---------
+ zig/src/families/qwen27/mhc.zig       |  1 -
+ zig/src/families/qwen27/taps.zig      |  1 -
+ zig/tests/qwen27/mhc_check.zig        |  1 -
+ 4 files changed, 5 insertions(+), 12 deletions(-)
+
+diff --git a/zig/src/families/qwen27/gpu_frame.zig b/zig/src/families/qwen27/gpu_frame.zig
+index 841d23a45..0b9e85f49 100644
+--- a/zig/src/families/qwen27/gpu_frame.zig
++++ b/zig/src/families/qwen27/gpu_frame.zig
+@@ -4,11 +4,8 @@ const mtl = @import("metal");
+ const Config = @import("config.zig").Config;
+ const Ref = @import("projection.zig").Ref;
+ 
+-pub const Field = enum { ids, dims, positions, hidden, residual, input, sums, mixed, mixer_out, output, z, a, b, query, key, value, norm_query, norm_key, q_gate, gate, up, activated, act_sums, logits, drawn, eps, parents, windows, row_slots, segments, keeps, kept_rows, rotated_key, takes, slot_steps, router, picks, route_weights, offsets, order, sorted_weights, sorted_rows, expert_gate, expert_up, expert_act, expert_out, expert_sums,
+-    /// A looped checkpoint's mHC: the residual streams (four planes at most), the router's f32 outputs, the branch.
+-    streams, mhc_state, mhc_branch,
+-    /// The window's folded input: the residual plus its pending output, in a buffer no swap can move.
+-    mhc_folded };
++/// The last four hold a looped checkpoint's mHC: its streams, router outputs, branch and folded window input.
++pub const Field = enum { ids, dims, positions, hidden, residual, input, sums, mixed, mixer_out, output, z, a, b, query, key, value, norm_query, norm_key, q_gate, gate, up, activated, act_sums, logits, drawn, eps, parents, windows, row_slots, segments, keeps, kept_rows, rotated_key, takes, slot_steps, router, picks, route_weights, offsets, order, sorted_weights, sorted_rows, expert_gate, expert_up, expert_act, expert_out, expert_sums, streams, mhc_state, mhc_branch, mhc_folded };
+ 
+ /// A prompt pass's rows at most (a chain); rounds with trees and every logits row stay within `logit_rows`.
+ pub const max_rows = 2048;
+@@ -22,6 +19,7 @@ pub const logit_rows = 128;
+ pub fn allocationSizes(config: Config, capacity: u32) [std.enums.values(Field).len]usize {
+     const mp = 16 * ((capacity + 15) / 16);
+     const slots: usize = if (config.moe()) capacity * (config.top_k + 1) else 0; // a row's picks and its shared expert
++    // the mHC fields are 0 bytes unless the checkpoint declares mHC
+     return .{
+         capacity * 4,                                                                       8 * 4,                                                                                                                                  3 * capacity * 4,
+         capacity * config.hidden * 2,                                                       capacity * config.hidden * 2,                                                                                                           capacity * config.hidden * 2,
+@@ -40,10 +38,8 @@ pub fn allocationSizes(config: Config, capacity: u32) [std.enums.values(Field).l
+         slots * 4,                                                                          slots * 4,                                                                                                                              (config.experts + 1) * 4,
+         slots * 4,                                                                          slots * 4,                                                                                                                              slots * config.hidden * 2,
+         slots * config.moe_intermediate * 2,                                                slots * config.moe_intermediate * 2,                                                                                                    slots * config.moe_intermediate * 2,
+-        slots * config.hidden * 2,                                                          slots * @max(config.hidden, config.moe_intermediate) / 64 * 4,
+-        // the window's streams, router state and branch: nothing at all unless the checkpoint declares mHC
+-        streamBytes(config, capacity),                                                       mhcStateBytes(config, capacity),                                                                    mhcBranchBytes(config, capacity),
+-        mhcBranchBytes(config, capacity),
++        slots * config.hidden * 2,                                                          slots * @max(config.hidden, config.moe_intermediate) / 64 * 4,                                                                          streamBytes(config, capacity),
++        mhcStateBytes(config, capacity),                                                    mhcBranchBytes(config, capacity),                                                                                                       mhcBranchBytes(config, capacity),
+     };
+ }
+ 
+diff --git a/zig/src/families/qwen27/mhc.zig b/zig/src/families/qwen27/mhc.zig
+index 748a2cd61..1c27057fb 100644
+--- a/zig/src/families/qwen27/mhc.zig
++++ b/zig/src/families/qwen27/mhc.zig
+@@ -47,7 +47,6 @@ pub const Buffers = struct {
+     /// One row's outputs: pre, post, then the stream-mixing logits.
+     outs: u32,
+ 
+-
+     pub fn params(b: Buffers, s: schedule.Mhc, hidden: u32) Params {
+         return .{ .hidden = hidden, .streams = s.streams, .outs = b.outs, .iters = s.iterations, .pre_scale = s.pre_scale };
+     }
+diff --git a/zig/src/families/qwen27/taps.zig b/zig/src/families/qwen27/taps.zig
+index 4588eb103..128c9e969 100644
+--- a/zig/src/families/qwen27/taps.zig
++++ b/zig/src/families/qwen27/taps.zig
+@@ -110,7 +110,6 @@ pub const Taps = struct {
+         return t.recordHalfW(glue, e, seam_base + index, hidden, rows, t.half_width);
+     }
+ 
+-
+     /// One hook, two tapes: a layer's carried state goes to the streams tape, a seam's plane to the narrow one.
+     pub fn recordOne(t: *Taps, glue: Glue, e: mtl.ComputeEncoder, layer: usize, hidden: Ref, rows: u32) !void {
+         if (t.half != null and (layer >= seam_base or t.width == t.half_width)) {
+diff --git a/zig/tests/qwen27/mhc_check.zig b/zig/tests/qwen27/mhc_check.zig
+index 36b4f0d36..9f545c267 100644
+--- a/zig/tests/qwen27/mhc_check.zig
++++ b/zig/tests/qwen27/mhc_check.zig
+@@ -109,7 +109,6 @@ pub fn main(init: std.process.Init) !void {
+     const k = try mhc.Kernels.init(device);
+     defer k.deinit();
+ 
+-
+     var hs: [streams * hidden]f32 = undefined;
+     fill(&hs, 7);
+     var w: [outs * streams * hidden]f32 = undefined;

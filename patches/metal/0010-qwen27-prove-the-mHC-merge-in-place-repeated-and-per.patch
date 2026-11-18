@@ -1,0 +1,237 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Jay Leaton <58495321+jayleaton@users.noreply.github.com>
+Date: Wed, 18 Nov 2026 03:36:16 +0800
+Subject: [PATCH 10/26] qwen27: prove the mHC merge in place, repeated and per
+ row
+
+A stream-asymmetric error is the signature of an in-place hazard, so this pins
+the merge's real path at the served width: 3 rows over 4096 columns with every
+row's streams distinct. In place it equals the CPU reference exactly (0.0), a
+second run from the same input is byte-identical, and no row reads another's
+streams. The kernel has one stream binding and reads a column's S inputs into
+registers before writing its S outputs, so there is no aliasing to fix.
+
+The first cut of this test compared an  variant that bound an
+uninitialised output as the kernel's only stream input, which is why it failed:
+merge cannot be out of place without a second binding, and does not need one.
+---
+ zig/build/qwen27.zig            |   1 +
+ zig/src/families/qwen27/mhc.zig |   7 +-
+ zig/tests/qwen27/mhc_alias.zig  | 175 ++++++++++++++++++++++++++++++++
+ 3 files changed, 182 insertions(+), 1 deletion(-)
+ create mode 100644 zig/tests/qwen27/mhc_alias.zig
+
+diff --git a/zig/build/qwen27.zig b/zig/build/qwen27.zig
+index b4a5a8751..4a8420806 100644
+--- a/zig/build/qwen27.zig
++++ b/zig/build/qwen27.zig
+@@ -109,6 +109,7 @@ pub fn targets(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.bu
+     _ = program(b, "tf-qwen27-run", "Build the native greedy, chunk and prompt-speed check on real weights", "zig/tests/qwen27/run.zig", target, true, &.{ .{ .name = "qwen27", .module = qwen27 }, .{ .name = "core", .module = qwen_core }, .{ .name = "metal", .module = metal }, .{ .name = "core_lane", .module = core_lane }, .{ .name = "qwen_runtime_sources", .module = s.runtime_sources }, .{ .name = "qwen_gdn_source", .module = s.gdn_source } });
+     _ = program(b, "tf-qwen27-attention-fused", "Build the fused-chain versus tail-kernel attention byte check on this Mac's tensor units, no models", "zig/tests/qwen27/attention_fused.zig", target, false, &.{ .{ .name = "qwen27", .module = qwen27 }, .{ .name = "metal", .module = metal }, .{ .name = "qwen_runtime_sources", .module = s.runtime_sources } });
+     _ = program(b, "tf-qwen27-mhc-check", "Build the mHC branch, merge, enter and leave kernels against a CPU reference of the same arithmetic, no models", "zig/tests/qwen27/mhc_check.zig", target, false, &.{ .{ .name = "qwen27", .module = qwen27 }, .{ .name = "metal", .module = metal }, .{ .name = "qwen_runtime_sources", .module = s.runtime_sources } });
++    _ = program(b, "tf-qwen27-mhc-alias", "Build the mHC merge in place, repeated and per row against the same reference, at the served width", "zig/tests/qwen27/mhc_alias.zig", target, false, &.{ .{ .name = "qwen27", .module = qwen27 }, .{ .name = "metal", .module = metal }, .{ .name = "qwen_runtime_sources", .module = s.runtime_sources } });
+     _ = program(b, "tf-qwen27-attention-pages", "Build the KV-page attention kernels against main's, bit for bit through shuffled pages, no models", "zig/tests/qwen27/attention_pages.zig", target, false, &.{ .{ .name = "qwen27", .module = qwen27 }, .{ .name = "metal", .module = metal } });
+     _ = program(b, "tf-qwen27-attention-share", "Build the KV-page attention timed with streams on one prefix's pages against copies, no models", "zig/tests/qwen27/attention_share.zig", target, false, &.{ .{ .name = "qwen27", .module = qwen27 }, .{ .name = "metal", .module = metal } });
+     _ = program(b, "tf-qwen27-attention-precision", "Build decode attention's error against a float64 reference on this Mac, no models", "zig/tests/qwen27/attention_precision.zig", target, false, &.{ .{ .name = "qwen27", .module = qwen27 }, .{ .name = "metal", .module = metal }, .{ .name = "qwen_runtime_sources", .module = s.runtime_sources } });
+diff --git a/zig/src/families/qwen27/mhc.zig b/zig/src/families/qwen27/mhc.zig
+index d3486b899..495e28999 100644
+--- a/zig/src/families/qwen27/mhc.zig
++++ b/zig/src/families/qwen27/mhc.zig
+@@ -90,10 +90,15 @@ pub fn branch(e: mtl.ComputeEncoder, k: Kernels, b: Buffers, p: Params, rows: u3
+ 
+ /// The sublayer's output back into the streams.
+ pub fn merge(e: mtl.ComputeEncoder, k: Kernels, b: Buffers, p: Params, rows: u32, from: Ref) void {
++    mergeInto(e, k, b, p, rows, from, b.streams);
++}
++
++/// `merge` writing somewhere other than the streams it reads: the in-place pair's A/B.
++pub fn mergeInto(e: mtl.ComputeEncoder, k: Kernels, b: Buffers, p: Params, rows: u32, from: Ref, out: Ref) void {
+     e.setPipeline(k.mg);
+     e.setBuffer(from.buffer, from.offset, 0);
+     e.setBuffer(b.state.buffer, b.state.offset, 1);
+-    e.setBuffer(b.streams.buffer, b.streams.offset, 2);
++    e.setBuffer(out.buffer, out.offset, 2);
+     e.setValue(p, 3);
+     e.dispatchThreads(mtl.Size.of(p.hidden, rows, 1), mtl.Size.of(threads(p.hidden), 1, 1));
+ }
+diff --git a/zig/tests/qwen27/mhc_alias.zig b/zig/tests/qwen27/mhc_alias.zig
+new file mode 100644
+index 000000000..011edd6c7
+--- /dev/null
++++ b/zig/tests/qwen27/mhc_alias.zig
+@@ -0,0 +1,175 @@
++//! The mHC kernels' in-place and out-of-place paths at the served width: the A/B a stream-asymmetric error needs.
++const std = @import("std");
++const mtl = @import("metal");
++const q = @import("qwen27");
++const mhc = q.mhc;
++
++const hidden = 4096;
++const streams = 2;
++const outs = 8;
++const iterations = 20;
++const rows = 3;
++
++fn bf(x: f32) f32 {
++    const bits: u32 = @bitCast(x);
++    const rounded = if (std.math.isNan(x)) (bits >> 16) | 0x40 else (bits + 0x7fff + ((bits >> 16) & 1)) >> 16;
++    return @bitCast(@as(u32, rounded) << 16);
++}
++
++fn fill(x: []f32, seed: u64) void {
++    var s = seed;
++    for (x) |*v| {
++        s = s *% 6364136223846793005 +% 1442695040888963407;
++        const u: f32 = @floatFromInt((s >> 40) & 0xffff);
++        v.* = (u / 65535.0 - 0.5) * 0.5;
++    }
++}
++
++fn toBf(dst: []u16, src: []const f32) void {
++    for (dst, src) |*d, v| {
++        const bits: u32 = @bitCast(v);
++        d.* = @intCast((bits + 0x7fff + ((bits >> 16) & 1)) >> 16);
++    }
++}
++
++fn ofBf(bits: u16) f32 {
++    return @bitCast(@as(u32, bits) << 16);
++}
++
++/// The reference merge over `rows` rows of interleaved streams, from the router's coefficients.
++fn reference(streams_in: []const f32, state: []const f32, branch: []const f32, out: []f32) void {
++    for (0..rows) |r| {
++        const st = state[r * outs ..][0..outs];
++        for (0..hidden) |d| {
++            var ins: [4]f32 = undefined;
++            for (0..streams) |t| ins[t] = streams_in[r * streams * hidden + t * hidden + d];
++            for (0..streams) |s| {
++                var v: f32 = 0;
++                for (0..streams) |t| v += bf(st[2 * streams + s * streams + t]) * ins[t];
++                out[r * streams * hidden + s * hidden + d] = bf(v + bf(st[streams + s]) * bf(branch[r * hidden + d]));
++            }
++        }
++    }
++}
++
++fn equal(a: []const f32, b: []const f32, label: []const u8) !void {
++    var worst: f32 = 0;
++    for (a, b, 0..) |x, y, i| {
++        const d = @abs(x - y);
++        if (d > worst) {
++            worst = d;
++            std.debug.print("  worst so far at {d}: want {d:.6} got {d:.6} (stream {d}, col {d})\n", .{ i, x, y, (i / hidden) % streams, i % hidden });
++        }
++    }
++    std.debug.print("  {s}: max|d| {e:.3}\n", .{ label, worst });
++    if (worst != 0) return error.Mismatch;
++}
++
++pub fn main(init: std.process.Init) !void {
++    const a = init.arena.allocator();
++    _ = a;
++    var device = try mtl.Device.init();
++    defer device.deinit();
++    const k = try mhc.Kernels.init(device);
++    defer k.deinit();
++    const queue = try device.queue();
++    defer queue.deinit();
++
++    const cells = rows * streams * hidden;
++    var streams_f: [cells]f32 = undefined;
++    var branch_f: [rows * hidden]f32 = undefined;
++    var state_f: [rows * outs]f32 = undefined;
++    fill(&streams_f, 23);
++    fill(&branch_f, 29);
++    fill(&state_f, 31);
++    var streams16: [cells]u16 = undefined;
++    var branch16: [rows * hidden]u16 = undefined;
++    toBf(&streams16, &streams_f);
++    toBf(&branch16, &branch_f);
++
++    // the router's coefficients are read as f32, so keep them exactly as the kernel sees them
++    var state_bf: [rows * outs]f32 = undefined;
++    for (state_f, 0..) |v, i| state_bf[i] = bf(v);
++    // a mixing matrix and post weights the Sinkhorn would produce
++    for (0..rows) |r| {
++        const st = state_bf[r * outs ..][0..outs];
++        // pre[2], post[2], then the 2x2 map
++        st[0] = 0.71;
++        st[1] = 0.29;
++        st[2] = 0.62;
++        st[3] = 0.38;
++        st[4] = 0.58;
++        st[5] = 0.42;
++        st[6] = 0.42;
++        st[7] = 0.58;
++    }
++
++    const in_buf = try device.buffer(cells * @sizeOf(u16), mtl.ResourceOptions.shared | mtl.ResourceOptions.untracked);
++    defer in_buf.deinit();
++    const out_buf = try device.buffer(cells * @sizeOf(u16), mtl.ResourceOptions.shared | mtl.ResourceOptions.untracked);
++    defer out_buf.deinit();
++    const branch_buf = try device.buffer(rows * hidden * @sizeOf(u16), mtl.ResourceOptions.shared | mtl.ResourceOptions.untracked);
++    defer branch_buf.deinit();
++    const state_buf = try device.buffer(rows * outs * @sizeOf(f32), mtl.ResourceOptions.shared | mtl.ResourceOptions.untracked);
++    defer state_buf.deinit();
++    @memcpy(in_buf.slice(u16, cells), &streams16);
++    @memcpy(branch_buf.slice(u16, rows * hidden), &branch16);
++    @memcpy(state_buf.slice(f32, rows * outs), &state_bf);
++
++    const p = mhc.Params{ .hidden = hidden, .streams = streams, .outs = outs, .iters = iterations, .pre_scale = 1.0 };
++    const bufs = mhc.Buffers{
++        .streams = .{ .buffer = in_buf },
++        .state = .{ .buffer = state_buf },
++        .branch = .{ .buffer = branch_buf },
++        .outs = outs,
++    };
++
++    // what the reference says both paths must produce
++    var want: [cells]f32 = undefined;
++    var in_f: [cells]f32 = undefined;
++    for (streams16, 0..) |v, i| in_f[i] = ofBf(v);
++    var branch_ref: [rows * hidden]f32 = undefined;
++    for (branch16, 0..) |v, i| branch_ref[i] = ofBf(v);
++    reference(&in_f, &state_bf, &branch_ref, &want);
++
++    // one stream binding: the kernel reads all S inputs of a (row, column) before writing that column's outputs
++    @memcpy(in_buf.slice(u16, cells), &streams16);
++    const cb = queue.commandBuffer();
++    const e = cb.compute(.serial);
++    mhc.merge(e, k, bufs, p, rows, .{ .buffer = branch_buf });
++    e.end();
++    cb.commit();
++    cb.wait();
++    if (cb.failure()) |f| {
++        std.debug.print("in-place merge failed: {s}\n", .{f});
++        return error.GpuFailed;
++    }
++    var got: [cells]f32 = undefined;
++    for (in_buf.slice(u16, cells), 0..) |v, i| got[i] = ofBf(v);
++    try equal(&want, &got, "in place");
++
++    // a second run from the same input is byte-identical: no dependence on what was there before
++    @memcpy(in_buf.slice(u16, cells), &streams16);
++    const cb2 = queue.commandBuffer();
++    const e2 = cb2.compute(.serial);
++    mhc.merge(e2, k, bufs, p, rows, .{ .buffer = branch_buf });
++    e2.end();
++    cb2.commit();
++    cb2.wait();
++    var again: [cells]f32 = undefined;
++    for (in_buf.slice(u16, cells), 0..) |v, i| again[i] = ofBf(v);
++    try equal(&got, &again, "repeat");
++
++    // the same pass with rows > 1 and every row distinct: no row may read another row's streams
++    var per_row: [rows]f32 = undefined;
++    for (0..rows) |r| {
++        var w: f32 = 0;
++        for (0..hidden) |d| w = @max(w, @abs(got[r * streams * hidden + d] - want[r * streams * hidden + d]));
++        per_row[r] = w;
++    }
++    for (per_row, 0..) |w, r| {
++        std.debug.print("  row {d}: max|d| {e:.3}\n", .{ r, w });
++        if (w != 0) return error.Mismatch;
++    }
++    std.debug.print("PASS mhc merge: in place, repeated and per row equal the reference at {d} rows, {d} wide\n", .{ rows, hidden });
++}

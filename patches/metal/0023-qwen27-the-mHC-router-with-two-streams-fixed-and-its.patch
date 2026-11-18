@@ -1,0 +1,110 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Jay Leaton <58495321+jayleaton@users.noreply.github.com>
+Date: Wed, 18 Nov 2026 09:28:15 +0800
+Subject: [PATCH 23/26] qwen27: the mHC router with two streams fixed and its
+ lane loops unrolled, bit for bit
+
+Each lane keeps its own summation order; the loads of eight steps now overlap.
+Prompt and decode state hashes equal the previous kernel at 512, 1003, 2k, 8k and 32k rows.
+---
+ zig/kernels/metal/qwen27/mhc.metal | 16 ++++++++++++----
+ zig/src/families/qwen27/mhc.zig    |  9 ++++++---
+ 2 files changed, 18 insertions(+), 7 deletions(-)
+
+diff --git a/zig/kernels/metal/qwen27/mhc.metal b/zig/kernels/metal/qwen27/mhc.metal
+index 54ac47fb3..bded41ab5 100644
+--- a/zig/kernels/metal/qwen27/mhc.metal
++++ b/zig/kernels/metal/qwen27/mhc.metal
+@@ -9,6 +9,7 @@ static inline float tf_mhc_rbf(float v) {
+ }
+ 
+ // One row's router: `outs` mixes of the streams, Sinkhorn over the S x S map, then the branch the layer runs on.
++template <uint FS>
+ [[max_total_threads_per_threadgroup(256)]] kernel void tf_mhc_branch(device const bfloat* HS [[buffer(0)]],
+                           device const float* W [[buffer(1)]],
+                           device const float* B [[buffer(2)]],
+@@ -18,8 +19,8 @@ static inline float tf_mhc_rbf(float v) {
+                           uint row [[threadgroup_position_in_grid]],
+                           uint tid [[thread_index_in_threadgroup]],
+                           uint lane [[thread_index_in_simdgroup]]) {
+-  const uint S = a.streams, n = a.outs, H = a.hidden, D = S * H;
+-  if (S == 0u || S > 4u || n > 8u) return;
++  const uint S = FS != 0u ? FS : a.streams, n = a.outs, H = a.hidden, D = S * H;
++  if (S == 0u || S > 4u || n > 8u || S != a.streams) return;
+   const uint sg = tid / 32u;
+   threadgroup float mean;
+   // the coefficients lane 0 computes, shared through threadgroup memory: a barrier orders that space, not device
+@@ -29,7 +30,8 @@ static inline float tf_mhc_rbf(float v) {
+   // the row's mean square: one simdgroup, the same 32-lane order the single-group kernel used
+   if (sg == 0) {
+     float acc = 0.f;
+-    for (uint s = 0; s < S; ++s) for (uint i = lane; i < H; i += 32u) {
++    for (uint s = 0; s < S; ++s)
++      _Pragma("unroll(8)") for (uint i = lane; i < H; i += 32u) {
+       const float x = float(HS[row * S * H + s * H + i]);
+       acc += x * x;
+     }
+@@ -43,7 +45,8 @@ static inline float tf_mhc_rbf(float v) {
+     const device float* w = W + uint64_t(sg) * D;
+     const float inv = mean;
+     float s = 0.f;
+-    for (uint t = 0; t < S; ++t) for (uint i = lane; i < H; i += 32u) {
++    for (uint t = 0; t < S; ++t)
++      _Pragma("unroll(8)") for (uint i = lane; i < H; i += 32u) {
+       s += w[t * H + i] * (float(HS[row * S * H + t * H + i]) * inv);
+     }
+     s = simd_sum(s);
+@@ -92,6 +95,11 @@ static inline float tf_mhc_rbf(float v) {
+   }
+ }
+ 
++template [[host_name("tf_mhc_branch")]] kernel void tf_mhc_branch<0>(device const bfloat*, device const float*,
++    device const float*, device bfloat*, device float*, constant TfMhc&, uint, uint, uint);
++template [[host_name("tf_mhc_branch2")]] kernel void tf_mhc_branch<2>(device const bfloat*, device const float*,
++    device const float*, device bfloat*, device float*, constant TfMhc&, uint, uint, uint);
++
+ // streams = mix . streams + post * branch, a thread a (row, column): the outputs of a column read its inputs.
+ kernel void tf_mhc_merge(device const bfloat* BRANCH [[buffer(0)]],
+                          device const float* STATE [[buffer(1)]],
+diff --git a/zig/src/families/qwen27/mhc.zig b/zig/src/families/qwen27/mhc.zig
+index 113767fef..d72fb06ca 100644
+--- a/zig/src/families/qwen27/mhc.zig
++++ b/zig/src/families/qwen27/mhc.zig
+@@ -11,6 +11,7 @@ pub const Params = extern struct { hidden: u32, streams: u32, outs: u32, iters:
+ 
+ pub const Kernels = struct {
+     br: mtl.Pipeline,
++    br2: mtl.Pipeline,
+     mg: mtl.Pipeline,
+     en: mtl.Pipeline,
+     lv: mtl.Pipeline,
+@@ -20,16 +21,18 @@ pub const Kernels = struct {
+         defer lib.deinit();
+         const br = try mtl.Pipeline.init(device, lib, "tf_mhc_branch", false);
+         errdefer br.deinit();
++        const br2 = try mtl.Pipeline.init(device, lib, "tf_mhc_branch2", false);
++        errdefer br2.deinit();
+         const mg = try mtl.Pipeline.init(device, lib, "tf_mhc_merge", false);
+         errdefer mg.deinit();
+         const en = try mtl.Pipeline.init(device, lib, "tf_mhc_enter", false);
+         errdefer en.deinit();
+         const lv = try mtl.Pipeline.init(device, lib, "tf_mhc_leave", false);
+-        return .{ .br = br, .mg = mg, .en = en, .lv = lv };
++        return .{ .br = br, .br2 = br2, .mg = mg, .en = en, .lv = lv };
+     }
+ 
+     pub fn deinit(k: Kernels) void {
+-        inline for (.{ k.br, k.mg, k.en, k.lv }) |p| p.deinit();
++        inline for (.{ k.br, k.br2, k.mg, k.en, k.lv }) |p| p.deinit();
+     }
+ };
+ 
+@@ -78,7 +81,7 @@ pub fn leave(e: mtl.ComputeEncoder, k: Kernels, b: Buffers, p: Params, rows: u32
+ 
+ /// A sublayer's branch out of the streams, with its pre/post/mix kept for `merge`.
+ pub fn branch(e: mtl.ComputeEncoder, k: Kernels, b: Buffers, p: Params, rows: u32, weight: Ref, bias: Ref) void {
+-    e.setPipeline(k.br);
++    e.setPipeline(if (p.streams == 2) k.br2 else k.br);
+     e.setBuffer(b.streams.buffer, b.streams.offset, 0);
+     e.setBuffer(weight.buffer, weight.offset, 1);
+     e.setBuffer(bias.buffer, bias.offset, 2);

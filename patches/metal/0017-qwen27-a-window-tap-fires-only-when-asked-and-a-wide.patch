@@ -1,0 +1,81 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Jay Leaton <58495321+jayleaton@users.noreply.github.com>
+Date: Wed, 18 Nov 2026 04:40:40 +0800
+Subject: [PATCH 17/26] qwen27: a window tap fires only when asked, and a wider
+ seam tape
+
+Two taps per window layer were firing unconditionally, one of them a probe left
+over from the branch measurement, and both were full-tile blits even with no dump
+requested. One tap call remains and its barrier is conditional on a hook being
+present. The seam tape grows to 32 planes so an execution-indexed dump covers the
+whole loop.
+
+Measured with it: the p0 curve is continuous rather than stepped (exec 4 at 2.63
+cos 0.970, spikes at ffn layers re-absorbed by the next), the same character as
+p2, so the last gate miss is not a discrete wire fault. Gate after the change:
+p1 64/64, p2 64/64, p0 19/64.
+---
+ zig/src/families/qwen27/forward.zig | 6 +++---
+ zig/src/families/qwen27/taps.zig    | 8 ++++----
+ 2 files changed, 7 insertions(+), 7 deletions(-)
+
+diff --git a/zig/src/families/qwen27/forward.zig b/zig/src/families/qwen27/forward.zig
+index 62c6e6eb1..748405272 100644
+--- a/zig/src/families/qwen27/forward.zig
++++ b/zig/src/families/qwen27/forward.zig
+@@ -150,10 +150,11 @@ pub const Stages = struct {
+                 const folded = f.get(.mhc_folded);
+                 if (s.pending) |pending| {
+                     m.glue.residual(e, s.hidden, pending, folded, h, s.rows);
+-                    e.barrier();
+-                    if (s.hooks.tap) |tap| try tap(s.hooks.ptr, e, folded_tap, folded, s.rows);
+                     s.pending = null;
+                 } else try m.glue.unstack(e, s.hidden, folded, .{ .rows = s.rows, .width = h, .stride = h, .offset = 0 });
++                if (s.hooks.tap != null) e.barrier();
++                if (s.hooks.tap) |tap| try tap(s.hooks.ptr, e, folded_tap, folded, s.rows);
++                // one barrier orders the fold against enter: untracked buffers demand it
+                 e.barrier();
+                 mhc_mod.enter(e, m.mhc.?, b, b.params(mh, h), s.rows, folded, null);
+                 e.barrier();
+@@ -161,7 +162,6 @@ pub const Stages = struct {
+                 s.hidden = s.window;
+             }
+             if (s.hooks.tap) |tap| try tap(s.hooks.ptr, e, index, s.window, s.rows);
+-            if (s.hooks.tap) |tap| try tap(s.hooks.ptr, e, entered_tap, s.window, s.rows);
+             mhc_mod.branch(e, m.mhc.?, b, b.params(mh, h), s.rows, wts.ref(layer.mhc_attn.?.weight), wts.ref(layer.mhc_attn.?.bias));
+             e.barrier();
+             if (s.hooks.half) |half| try half(s.hooks.ptr, e, branch_tap, b.branch, s.rows);
+diff --git a/zig/src/families/qwen27/taps.zig b/zig/src/families/qwen27/taps.zig
+index 543c2538f..4588eb103 100644
+--- a/zig/src/families/qwen27/taps.zig
++++ b/zig/src/families/qwen27/taps.zig
+@@ -6,9 +6,9 @@ const Glue = @import("glue_gpu.zig").Kernels;
+ 
+ /// The 27B drafter's tap layers, the default before a drafter sets its own.
+ pub const layers = [_]usize{ 5, 19, 33, 47, 61 };
+-pub const max_planes = 8;
++pub const max_planes = 32;
+ /// Seam planes the narrow tape holds: one a seam id, from `seam_base`.
+-pub const max_seams = 16;
++pub const max_seams = 32;
+ pub const seam_base = 1000;
+ 
+ pub const Taps = struct {
+@@ -16,7 +16,7 @@ pub const Taps = struct {
+     capacity: u32,
+     width: u32,
+     seen: u16 = 0,
+-    ids: [max_planes]usize = layers ++ [_]usize{ 0, 0, 0 },
++    ids: [max_planes]usize = layers ++ @as([max_planes - layers.len]usize, @splat(0)),
+     count: usize = layers.len,
+     /// Planes the buffer holds: the 27B's five until a drafter of more taps takes them (use).
+     planes: usize = layers.len,
+@@ -31,7 +31,7 @@ pub const Taps = struct {
+ 
+     pub fn init(device: mtl.Device, capacity: u32, width: u32) !Taps {
+         if (capacity == 0 or capacity > @import("gpu_frame.zig").max_rows or width == 0) return error.BadTapShape;
+-        return .{ .buffer = try planesBuffer(device, capacity, width, layers.len), .capacity = capacity, .width = width };
++        return .{ .buffer = try planesBuffer(device, capacity, width, max_planes), .planes = max_planes, .capacity = capacity, .width = width };
+     }
+ 
+     /// A drafter's tap layers; the buffer grows to their count when it holds fewer planes, never shrinks.

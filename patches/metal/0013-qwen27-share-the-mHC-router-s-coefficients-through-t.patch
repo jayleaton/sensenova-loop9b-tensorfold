@@ -1,0 +1,179 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Jay Leaton <58495321+jayleaton@users.noreply.github.com>
+Date: Wed, 18 Nov 2026 03:58:12 +0800
+Subject: [PATCH 13/26] qwen27: share the mHC router's coefficients through
+ threadgroup memory
+
+The branch kernel wrote pre/post/mix to device memory from lane 0 and then read
+them in the other lanes behind a mem_threadgroup barrier, which orders nothing
+about device writes. The coefficients now go through a threadgroup array, the
+barrier orders them, and lane 0 copies them to device afterwards for the merge
+that reads them next.
+
+Also fixes the tap routing: a seam id at or past seam_base goes to the narrow
+tape and a layer id to the streams tape, and a run may ask for either alone.
+---
+ zig/kernels/metal/qwen27/mhc.metal  | 16 +++++++++++-----
+ zig/src/families/qwen27/forward.zig | 16 ++++++++++------
+ zig/src/families/qwen27/mhc.zig     |  6 +++---
+ zig/src/families/qwen27/taps.zig    | 17 ++++++++++++++++-
+ 4 files changed, 40 insertions(+), 15 deletions(-)
+
+diff --git a/zig/kernels/metal/qwen27/mhc.metal b/zig/kernels/metal/qwen27/mhc.metal
+index 650eefa71..f1006745c 100644
+--- a/zig/kernels/metal/qwen27/mhc.metal
++++ b/zig/kernels/metal/qwen27/mhc.metal
+@@ -20,6 +20,8 @@ static inline float tf_mhc_rbf(float v) {
+   const uint S = a.streams, n = a.outs, H = a.hidden, D = S * H;
+   if (S == 0u || S > 4u || n > 8u) return;
+   threadgroup float mean;
++  // the coefficients lane 0 computes, shared through threadgroup memory: a barrier orders that space, not device
++  threadgroup float coef[24];
+   // the row's mean square over the flattened streams, then one simdgroup an output's dot product
+   float acc = 0.f;
+   for (uint s = 0; s < S; ++s) for (uint i = lane; i < H; i += 32u) {
+@@ -42,11 +44,10 @@ static inline float tf_mhc_rbf(float v) {
+     logits[o] = s + (B == nullptr ? 0.f : B[o]);
+   }
+   // the coefficients: pre sigmoid, post 2 sigmoid, mix Sinkhorn-normalized in log space
+-  float* st = STATE + uint64_t(row) * n;
+   if (lane == 0) {
+     for (uint s = 0; s < S; ++s) {
+-      st[s] = 1.f / (1.f + exp(-logits[s]));
+-      st[S + s] = 2.f / (1.f + exp(-logits[S + s]));
++      coef[s] = 1.f / (1.f + exp(-logits[s]));
++      coef[S + s] = 2.f / (1.f + exp(-logits[S + s]));
+     }
+     float m[16];
+     for (uint i = 0; i < S * S; ++i) m[i] = logits[2 * S + i];
+@@ -68,12 +69,17 @@ static inline float tf_mhc_rbf(float v) {
+         for (uint r = 0; r < S; ++r) m[r * S + c] -= lz;
+       }
+     }
+-    for (uint i = 0; i < S * S; ++i) st[2 * S + i] = exp(m[i]);
++    for (uint i = 0; i < S * S; ++i) coef[2 * S + i] = exp(m[i]);
+   }
+   threadgroup_barrier(mem_flags::mem_threadgroup);
++  // the merge kernel reads these later, so device memory gets its own copy after the shared ones are final
++  if (lane == 0) {
++    float* st = STATE + uint64_t(row) * n;
++    for (uint i = 0; i < n; ++i) st[i] = coef[i];
++  }
+   for (uint d = lane; d < H; d += 32u) {
+     float b = 0.f;
+-    for (uint s = 0; s < S; ++s) b += tf_mhc_rbf(st[s]) * float(HS[row * S * H + s * H + d]);
++    for (uint s = 0; s < S; ++s) b += tf_mhc_rbf(coef[s]) * float(HS[row * S * H + s * H + d]);
+     if (a.pre_scale != 1.f) b *= a.pre_scale;
+     BRANCH[row * H + d] = bfloat(b);
+   }
+diff --git a/zig/src/families/qwen27/forward.zig b/zig/src/families/qwen27/forward.zig
+index 6ad39b53b..c4b6c7d05 100644
+--- a/zig/src/families/qwen27/forward.zig
++++ b/zig/src/families/qwen27/forward.zig
+@@ -17,6 +17,8 @@ pub const Mixer = struct {
+     tap: ?*const fn (*anyopaque, mtl.ComputeEncoder, usize, Ref, u32) anyerror!void = null,
+     /// The narrow tape: a plane one layer wide, inside a window whose state is streams wide.
+     half: ?*const fn (*anyopaque, mtl.ComputeEncoder, usize, Ref, u32) anyerror!void = null,
++    /// The window's stream plane sliced to `hidden`, for a seam whose source is streams wide.
++    enter_tap: ?*const fn (*anyopaque, mtl.ComputeEncoder, usize, Ref, u32) anyerror!void = null,
+     /// A pass that keeps no row and has no other reader of the last layer: that layer writes keys and values only.
+     keys: ?*const fn (*anyopaque, mtl.ComputeEncoder, usize, wts.Attention, *Frame, u32) anyerror!void = null,
+ };
+@@ -74,6 +76,8 @@ pub const branch_tap = 1003;
+ /// The residual before the window's fold, and after it: the seam that proves the fold's content.
+ pub const hidden_tap = 1004;
+ pub const folded_tap = 1005;
++/// The window's streams as `enter` left them: the router's real input.
++pub const entered_tap = 1006;
+ /// A verified head's dependent readback work stays in its final command buffer.
+ pub const Tail = struct { ptr: *anyopaque, encode: *const fn (*anyopaque, mtl.ComputeEncoder) anyerror!void };
+ pub const Stages = struct {
+@@ -144,20 +148,20 @@ pub const Stages = struct {
+             // only the window's first layer expands h into the streams; after it the residual is the streams
+             if (m.config.physical(index) == mh.start) {
+                 // the window's input is the residual with its pending output folded in once: fold in place
++                const src = s.hidden;
+                 if (s.pending) |pending| {
+-                    if (s.hooks.tap) |tap| try tap(s.hooks.ptr, e, hidden_tap, s.hidden, s.rows);
+-                    m.glue.residual(e, s.hidden, pending, s.hidden, h, s.rows);
++                    m.glue.residual(e, src, pending, src, h, s.rows);
+                     e.barrier();
+-                    if (s.hooks.tap) |tap| try tap(s.hooks.ptr, e, folded_tap, s.hidden, s.rows);
+                     s.pending = null;
+                 }
+-                mhc_mod.enter(e, m.mhc.?, b, b.params(mh, h), s.rows, s.hidden, null);
++                mhc_mod.enter(e, m.mhc.?, b, b.params(mh, h), s.rows, src, null);
+                 e.barrier();
+                 // from here the window's residual is the flat streams: every stage reads and writes that
+                 s.hidden = s.window;
+             }
+             if (s.hooks.tap) |tap| try tap(s.hooks.ptr, e, index, s.window, s.rows);
+-            mhc_mod.branch(e, m.mhc.?, b, b.params(mh, h), s.rows, layer.mhc_attn.?.weight.buffer, layer.mhc_attn.?.bias.buffer);
++            if (m.config.physical(index) == mh.start) if (s.hooks.enter_tap) |hook| try hook(s.hooks.ptr, e, entered_tap, s.window, s.rows);
++            mhc_mod.branch(e, m.mhc.?, b, b.params(mh, h), s.rows, wts.ref(layer.mhc_attn.?.weight), wts.ref(layer.mhc_attn.?.bias));
+             e.barrier();
+             if (s.hooks.half) |half| try half(s.hooks.ptr, e, branch_tap, b.branch, s.rows);
+             try m.kernels.norm(e, b.branch, null, wts.ref(layer.norm), f.get(.eps), f.get(.dims), f.get(.input), f.get(.input), f.get(.sums), h, s.rows);
+@@ -230,7 +234,7 @@ pub const Stages = struct {
+             const b = s.hc(f);
+             mhc_mod.merge(e, m.mhc.?, b, b.params(mh, h), s.rows, f.get(.output));
+             e.barrier();
+-            mhc_mod.branch(e, m.mhc.?, b, b.params(mh, h), s.rows, layer.mhc_ffn.?.weight.buffer, layer.mhc_ffn.?.bias.buffer);
++            mhc_mod.branch(e, m.mhc.?, b, b.params(mh, h), s.rows, wts.ref(layer.mhc_ffn.?.weight), wts.ref(layer.mhc_ffn.?.bias));
+             e.barrier();
+             try m.kernels.norm(e, b.branch, null, wts.ref(layer.post_norm), f.get(.eps), f.get(.dims), f.get(.input), f.get(.input), f.get(.sums), h, s.rows);
+         } else try m.kernels.norm(e, s.hidden, f.get(.output), wts.ref(layer.post_norm), f.get(.eps), f.get(.dims), s.residual, f.get(.input), f.get(.sums), h, s.rows);
+diff --git a/zig/src/families/qwen27/mhc.zig b/zig/src/families/qwen27/mhc.zig
+index 495e28999..dece2249e 100644
+--- a/zig/src/families/qwen27/mhc.zig
++++ b/zig/src/families/qwen27/mhc.zig
+@@ -77,11 +77,11 @@ pub fn leave(e: mtl.ComputeEncoder, k: Kernels, b: Buffers, p: Params, rows: u32
+ }
+ 
+ /// A sublayer's branch out of the streams, with its pre/post/mix kept for `merge`.
+-pub fn branch(e: mtl.ComputeEncoder, k: Kernels, b: Buffers, p: Params, rows: u32, weight: mtl.Buffer, bias: mtl.Buffer) void {
++pub fn branch(e: mtl.ComputeEncoder, k: Kernels, b: Buffers, p: Params, rows: u32, weight: Ref, bias: Ref) void {
+     e.setPipeline(k.br);
+     e.setBuffer(b.streams.buffer, b.streams.offset, 0);
+-    e.setBuffer(weight, 0, 1);
+-    e.setBuffer(bias, 0, 2);
++    e.setBuffer(weight.buffer, weight.offset, 1);
++    e.setBuffer(bias.buffer, bias.offset, 2);
+     e.setBuffer(b.branch.buffer, b.branch.offset, 3);
+     e.setBuffer(b.state.buffer, b.state.offset, 4);
+     e.setValue(p, 5);
+diff --git a/zig/src/families/qwen27/taps.zig b/zig/src/families/qwen27/taps.zig
+index dcd69e8c8..b96ac5eda 100644
+--- a/zig/src/families/qwen27/taps.zig
++++ b/zig/src/families/qwen27/taps.zig
+@@ -66,6 +66,20 @@ pub const Taps = struct {
+     }
+ 
+     /// Records `hidden` into the narrow tape, at the same plane index the streams tape uses.
++    pub fn recordHalfW(t: *Taps, glue: Glue, e: mtl.ComputeEncoder, layer: usize, hidden: Ref, rows: u32, width: u32) !void {
++        const buf = t.half orelse return;
++        if (width == 0 or width > t.half_width) return;
++        const index = if (layer >= seam_base) layer - seam_base else return;
++        if (index >= t.count) return;
++        if (t.half_seen != 0 and rows != t.half_rows) return error.BadTapShape;
++        const bit = @as(u16, 1) << @intCast(index);
++        if (t.half_seen & bit != 0) return;
++        try glue.unstack(e, hidden, .{ .buffer = buf, .offset = index * @as(usize, t.capacity) * t.half_width * 2 }, .{ .rows = rows, .width = width, .stride = width, .offset = 0 });
++        e.barrier();
++        t.half_seen |= bit;
++        t.half_rows = rows;
++    }
++
+     pub fn recordHalf(t: *Taps, glue: Glue, e: mtl.ComputeEncoder, layer: usize, hidden: Ref, rows: u32) !void {
+         const buf = t.half orelse return;
+         if (rows == 0 or rows > t.capacity) return error.BadTapShape;
+@@ -112,7 +126,8 @@ pub const Taps = struct {
+     pub fn complete(t: Taps) !void {
+         if (t.count == 0 or t.count > t.planes) return error.IncompleteTaps;
+         const all = (@as(u16, 1) << @intCast(t.count)) - 1;
+-        if (t.seen != all) return error.IncompleteTaps;
++        // a run may ask for the narrow tape's seams alone: then the streams tape legitimately holds none
++        if (t.seen != all and !(t.seen == 0 and t.half_seen != 0)) return error.IncompleteTaps;
+     }
+ 
+     /// The narrow tape is optional, so it completes on its own: every requested plane, or none at all.

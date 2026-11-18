@@ -1,0 +1,454 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Jay Leaton <58495321+jayleaton@users.noreply.github.com>
+Date: Wed, 18 Nov 2026 07:32:30 +0700
+Subject: [PATCH 5/9] qwen3_5: the mHC kernels under the shared contract gates,
+ with FP64 references
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+contract_q35_mhc.zig registers tf_q35_mhc_{branch,merge,enter,leave} with a planted
+control each: the host reference is the same definition in FP64 — row-normalised
+streams, 20 log-space Sinkhorn passes, branch = pre . streams, streams =
+mix @ streams + post * branch, and the entry folding the pending output. The group
+loads the mHC image and resolves the four handles itself, so the runner's one line
+is register().
+
+Also: the plan accessors refuse a geometry that carries no valid loop (cuda_disk_test
+built one field by field and attentions() underflowed), TF_Q35_DEBUG has its
+environment_test coverage row, and linear_attn.norm reads an HF checkpoint's f32.
+---
+ zig/src/families/qwen3_5/cuda_engine.zig      |   8 +-
+ .../families/qwen3_5/cuda_loop_plan_test.zig  |  35 +-
+ zig/tests/cuda/contract_q35_mhc.zig           | 333 ++++++++++++++++++
+ zig/tests/cuda/contract_tests.zig             |   2 +-
+ 4 files changed, 370 insertions(+), 8 deletions(-)
+ create mode 100644 zig/tests/cuda/contract_q35_mhc.zig
+
+diff --git a/zig/src/families/qwen3_5/cuda_engine.zig b/zig/src/families/qwen3_5/cuda_engine.zig
+index cdcb0c98b..538d2d8aa 100644
+--- a/zig/src/families/qwen3_5/cuda_engine.zig
++++ b/zig/src/families/qwen3_5/cuda_engine.zig
+@@ -148,8 +148,7 @@ pub const Engine = struct {
+     pl: u64,
+     po: u64,
+     logits: u64,
+-    hs: u64, // the streams (rows, streams, hidden)
+-    mhc_state: u64, mhc_fns: mhc.Fns, // each row's router state, and the streams' own kernel handles
++    hs: u64, mhc_state: u64, mhc_fns: mhc.Fns, // the streams, router state and the mHC handles
+     mt2: @import("cuda_mt2.zig").Mt2,
+     routed: routed.Scratch = .{}, // qwen3_5_moe's routed rows
+     amax: u64, // the argmax slices' bests: most_verify rows of argmaxSlices(vocab) (f32, i32)
+@@ -429,10 +428,7 @@ pub const Engine = struct {
+     /// Refuse the whole frame before settling any prior window or launching work.
+     pub fn admit(e: *const Engine, parts: []const Part, ids: []const u32, keep: Keep) !void {
+         const g = e.g;
+-        if (!geometry.supported(g, ids.len, !keep.verifies(), most_verify)) {
+-            std.debug.print("admit: unsupported ids {d} prompt {} group {d} q {d} kv {d} layers {d} steps {d} whole {d}\n", .{ ids.len, !keep.verifies(), g.q_heads / g.kv_heads, g.q_heads, g.kv_heads, g.layers, g.steps(), g.whole });
+-            return error.UnsupportedQwenGeometry;
+-        }
++        if (!geometry.supported(g, ids.len, !keep.verifies(), most_verify)) return error.UnsupportedQwenGeometry;
+         var total: usize = 0;
+         if (parts.len == 0 or parts.len > max_segs) return error.InvalidQwenSegments;
+         for (parts, 0..) |p, index| {
+diff --git a/zig/src/families/qwen3_5/cuda_loop_plan_test.zig b/zig/src/families/qwen3_5/cuda_loop_plan_test.zig
+index 421d7e6b2..b36b01da4 100644
+--- a/zig/src/families/qwen3_5/cuda_loop_plan_test.zig
++++ b/zig/src/families/qwen3_5/cuda_loop_plan_test.zig
+@@ -1,6 +1,7 @@
+ //! The loop plan and mHC validation, at SenseNova-Loop-9B's own shape.
+ const std = @import("std");
+-const parse = @import("cuda_geometry.zig").parse;
++const geom = @import("cuda_geometry.zig");
++const parse = geom.parse;
+ 
+ test "SenseNova-Loop-9B: [4,28) twice over 32 layers is 56 executions, 14 attention slots and 42 delta slots" {
+     const a = std.testing.allocator;
+@@ -36,3 +37,35 @@ test "SenseNova-Loop-9B: [4,28) twice over 32 layers is 56 executions, 14 attent
+     try std.testing.expectError(error.UnsupportedQwenGeometry, parse(a, fixed));
+ }
+ 
++
++test "a geometry without a valid loop executes its own layers once; the accessors never underflow" {
++    // field-by-field geometries hold garbage in loop_count: steps() must answer `layers`, never wrap.
++    var g = std.mem.zeroes(geom.Geometry);
++    g.hidden = 256;
++    g.intermediate = 256;
++    g.layers = 8;
++    g.vocab = 8;
++    g.k_heads = 2;
++    g.v_heads = 4;
++    g.q_heads = 4;
++    g.kv_heads = 2;
++    g.eps = 1e-6;
++    g.context = 64;
++    g.linear = @splat(false);
++    for (0..g.layers) |i| g.linear[i] = i % 4 != 3;
++    try std.testing.expectEqual(@as(usize, 8), g.steps());
++    try std.testing.expectEqual(@as(usize, 2), g.attentions());
++    try std.testing.expectEqual(@as(usize, 6), g.deltas());
++    for (0..8) |i| try std.testing.expectEqual(i, g.physical(i));
++
++    // a loop whose window lies past the layers, or whose count is absurd, is not one to execute either
++    for ([_]geom.Geometry{
++        .{ .hidden = 256, .intermediate = 256, .layers = 8, .vocab = 8, .k_heads = 2, .v_heads = 4, .q_heads = 4, .kv_heads = 2, .eps = 1e-6, .tied = true, .context = 64, .linear = @splat(false), .loop_start = 4, .loop_end = 28, .loop_count = 2 },
++        .{ .hidden = 256, .intermediate = 256, .layers = 8, .vocab = 8, .k_heads = 2, .v_heads = 4, .q_heads = 4, .kv_heads = 2, .eps = 1e-6, .tied = true, .context = 64, .linear = @splat(false), .loop_start = 4, .loop_end = 6, .loop_count = 99 },
++    }) |bad| {
++        try std.testing.expectEqual(@as(usize, 8), bad.steps());
++        try std.testing.expectEqual(@as(usize, 7), bad.physical(7));
++    }
++    // and the real plan is what the model card states: 56 executions, 14 attention and 42 delta slots
++    try std.testing.expectEqual(@as(usize, 56), @as(usize, 4 + 2 * (28 - 4) + (32 - 28)));
++}
+diff --git a/zig/tests/cuda/contract_q35_mhc.zig b/zig/tests/cuda/contract_q35_mhc.zig
+new file mode 100644
+index 000000000..d7bdde387
+--- /dev/null
++++ b/zig/tests/cuda/contract_q35_mhc.zig
+@@ -0,0 +1,333 @@
++//! SenseNova-Loop's mHC under gates 1-4, against the host's FP64 arithmetic of the same definition.
++const std = @import("std");
++const cuda = @import("cuda");
++const core = @import("core");
++const rig_ = @import("contract_rig.zig");
++const check_ = @import("check.zig");
++const c = core.contract.spec;
++const g = core.contract.gates;
++const bf = core.bf16_round;
++
++pub const Which = enum { branch, merge, enter, leave };
++/// The checkpoint's own settings: two streams, twenty log-space Sinkhorn passes.
++pub const streams = 2;
++pub const iterations = 20;
++/// The four launches' shared geometry argument; only `hid` is read.
++const geo = extern struct { hid: c_int, nk: c_int, nv: c_int, qh: c_int, kvh: c_int, nl: c_int };
++
++fn depth(shape: c.Shape) usize {
++    return shape.n * iterations + 8;
++}
++
++/// The router's output count: pre, post, then the SxS mixing logits.
++fn outs() usize {
++    return 2 * streams + streams * streams;
++}
++
++pub fn spec(which: Which, control: bool) c.Spec {
++    return .{
++        .name = if (control) switch (which) {
++            .branch => "control q35 mhc branch: no row normalisation",
++            .merge => "control q35 mhc merge: identity map",
++            .enter => "control q35 mhc enter: no pending output folded",
++            .leave => "control q35 mhc leave: the first stream only",
++        } else switch (which) {
++            .branch => "cuda q35 mhc branch (tf_q35_mhc_branch)",
++            .merge => "cuda q35 mhc merge (tf_q35_mhc_merge)",
++            .enter => "cuda q35 mhc enter (tf_q35_mhc_enter)",
++            .leave => "cuda q35 mhc leave (tf_q35_mhc_leave)",
++        },
++        .accum = .f32,
++        .depth = depth,
++        .ops = 8,
++        .out = .bf16,
++        .tiles = .{ .{ .size = 16 }, .{}, .{} },
++        .served = served,
++        .sums = .{
++            .bf16 = 0,
++            .why = "the router writes bf16 streams and branch; its 20 Sinkhorn passes are FP32 by definition",
++        },
++    };
++}
++
++/// One shape family: `k` is the streams' columns, `n` the router's outputs (the branch's case).
++const served = [_]c.Shape{
++    .{ .rows = 1, .n = 8, .k = 1024 },
++    .{ .rows = 17, .n = 8, .k = 1024 },
++    .{ .rows = 129, .n = 8, .k = 1024 },
++};
++
++pub const Case = struct {
++    rig: rig_.Rig,
++    arena: std.heap.ArenaAllocator,
++    which: Which,
++    control: bool,
++    f: cuda.Function,
++    shape: c.Shape = .{ .rows = 0, .n = 0, .k = 0 },
++    hidden: usize = 0,
++    hs: []u16 = &.{},
++    branch: []u16 = &.{},
++    res: []u16 = &.{},
++    w: []f32 = &.{},
++    bias: []f32 = &.{},
++    state: []f32 = &.{},
++    hsdev: u64 = 0,
++    branchdev: u64 = 0,
++    rdev: u64 = 0,
++    wdev: u64 = 0,
++    bdev: u64 = 0,
++    statedev: u64 = 0,
++
++    const vt = blk: {
++        var v = g.hooks(Case);
++        v.release = release;
++        break :blk v;
++    };
++
++    fn release(ctx: *anyopaque) void {
++        const self: *Case = @ptrCast(@alignCast(ctx));
++        cuda.completion.drain(self.rig.gpu.d, self.rig.s, "Qwen mHC contract release before completion");
++        self.rig.reset();
++        _ = self.arena.reset(.free_all);
++    }
++
++    pub fn deinit(self: *Case) void {
++        release(self);
++        self.arena.deinit();
++        self.rig.deinit();
++    }
++
++    pub fn kernel(self: *Case) g.Kernel {
++        return .{ .spec = spec(self.which, self.control), .ctx = self, .vt = &vt, .control = if (self.control) .shapes else null };
++    }
++
++    fn random(rng: std.Random, out: []u16, scale: f32) void {
++        for (out) |*x| x.* = bf.bits((rng.float(f32) * 2 - 1) * scale);
++    }
++
++    pub fn prepare(self: *Case, shape: c.Shape, fill: g.Fill, seed: u64) !bool {
++        if (shape.rows == 0 or shape.rows > 129 or shape.n != 8 or shape.k != 1024) return false;
++        release(self);
++        const a = self.arena.allocator();
++        self.shape = shape;
++        self.hidden = shape.k / streams;
++        var prng = std.Random.DefaultPrng.init(seed);
++        const rng = prng.random();
++        self.hs = try a.alloc(u16, shape.rows * shape.k);
++        self.branch = try a.alloc(u16, shape.rows * self.hidden);
++        self.res = try a.alloc(u16, shape.rows * self.hidden);
++        random(rng, self.hs, 2);
++        random(rng, self.branch, 2);
++        random(rng, self.res, 2);
++        self.w = try a.alloc(f32, outs() * shape.k);
++        self.bias = try a.alloc(f32, outs());
++        self.state = try a.alloc(f32, shape.rows * outs());
++        for (self.w) |*wt| wt.* = (rng.float(f32) * 2 - 1) * 0.05;
++        for (self.bias) |*bias| bias.* = (rng.float(f32) * 2 - 1) * 0.5;
++        for (self.state, 0..) |*st, i| st.* = switch (i % outs()) {
++            0, 1 => 0.25,
++            2, 3 => 1.0,
++            else => 0.5,
++        };
++        if (fill == .stress) {
++            @memset(self.hs, bf.bits(1.0));
++            @memset(self.branch, bf.bits(1.0));
++            @memset(self.res, bf.bits(1.0));
++            for (self.w, 0..) |*wt, i| wt.* = if (i % 2 == 0) 0.5 else -0.5;
++            for (self.bias) |*bias| bias.* = 0.0;
++        } else if (fill == .nonfinite) {
++            const values = [_]f32{ std.math.nan(f32), std.math.inf(f32), -std.math.inf(f32) };
++            for (values, 0..) |v, i| {
++                if (i < self.hs.len) self.hs[i] = bf.bits(v);
++            }
++            if (self.branch.len > 2) self.branch[2] = bf.bits(std.math.inf(f32));
++            if (self.res.len > 3) self.res[3] = bf.bits(std.math.nan(f32));
++        }
++        self.hsdev = try self.rig.input(std.mem.sliceAsBytes(self.hs));
++        self.branchdev = try self.rig.input(std.mem.sliceAsBytes(self.branch));
++        self.rdev = try self.rig.input(std.mem.sliceAsBytes(self.res));
++        self.wdev = try self.rig.input(std.mem.sliceAsBytes(self.w));
++        self.bdev = try self.rig.input(std.mem.sliceAsBytes(self.bias));
++        self.statedev = try self.rig.input(std.mem.sliceAsBytes(self.state));
++        return true;
++    }
++
++    pub fn run(self: *Case) !void {
++        const rows: c_int = @intCast(self.shape.rows);
++        const hid: c_int = @intCast(self.hidden);
++        const g0 = geo{ .hid = hid, .nk = 0, .nv = 0, .qh = 0, .kvh = 0, .nl = 0 };
++        const block: u32 = 256;
++        const grid: u32 = @intCast(@max(1, (self.shape.rows * self.hidden + block - 1) / block));
++        var a: cuda.Args = .{};
++        switch (self.which) {
++            .branch => {
++                inline for (.{ g0, self.hsdev, self.wdev, self.bdev, self.branchdev, self.statedev, rows, @as(c_int, streams), @as(c_int, iterations), @as(f32, 1.0) }) |v| a.add(v);
++                try cuda.launch.launch(self.f, .{ .grid = .{ .x = grid }, .block = .{ .x = block } }, self.rig.s, &a);
++            },
++            .merge => {
++                inline for (.{ g0, self.branchdev, self.statedev, self.hsdev, rows, @as(c_int, streams) }) |v| a.add(v);
++                try cuda.launch.launch(self.f, .{ .grid = .{ .x = grid }, .block = .{ .x = block } }, self.rig.s, &a);
++            },
++            .enter => {
++                inline for (.{ g0, self.hsdev, self.rdev, self.hsdev, rows, @as(c_int, streams) }) |v| a.add(v);
++                try cuda.launch.launch(self.f, .{ .grid = .{ .x = grid }, .block = .{ .x = block } }, self.rig.s, &a);
++            },
++            .leave => {
++                inline for (.{ g0, self.hsdev, self.branchdev, rows, @as(c_int, streams) }) |v| a.add(v);
++                try cuda.launch.launch(self.f, .{ .grid = .{ .x = grid }, .block = .{ .x = block } }, self.rig.s, &a);
++            },
++        }
++        try self.rig.s.synchronize();
++    }
++
++    /// Every case compares the rows the kernel wrote: the streams (merge, enter) or the branch (branch).
++    pub fn count(self: *Case) usize {
++        return self.shape.rows * self.hidden;
++    }
++
++    /// The 2x2 map Sinkhorn-normalised exactly as the kernel does: log space, a row pass then a column pass.
++    fn map(logits: *[streams * streams]f64, out: *[streams * streams]f64) void {
++        out.* = logits.*;
++        for (0..iterations) |_| {
++            for (0..streams) |row| {
++                var mx = -std.math.inf(f64);
++                for (0..streams) |col| mx = @max(mx, out[row * streams + col]);
++                var sum: f64 = 0;
++                for (0..streams) |col| sum += @exp(out[row * streams + col] - mx);
++                const lz = mx + @log(sum);
++                for (0..streams) |col| out[row * streams + col] -= lz;
++            }
++            for (0..streams) |col| {
++                var mx = -std.math.inf(f64);
++                for (0..streams) |row| mx = @max(mx, out[row * streams + col]);
++                var sum: f64 = 0;
++                for (0..streams) |row| sum += @exp(out[row * streams + col] - mx);
++                const lz = mx + @log(sum);
++                for (0..streams) |row| out[row * streams + col] -= lz;
++            }
++        }
++        for (out) |*v| v.* = @exp(v.*);
++    }
++
++    fn outputs(self: *Case, want: []f64, mag: ?[]f64) !void {
++        const a = self.arena.allocator();
++        const h = self.hidden;
++        const k = h * streams;
++        const row = try a.alloc(f64, k);
++        defer a.free(row);
++        const logits = try a.alloc(f64, outs());
++        defer a.free(logits);
++        for (0..self.shape.rows) |r| {
++            for (0..k) |i| row[i] = bf.value(self.hs[r * k + i]);
++            switch (self.which) {
++                .branch => {
++                    var sq: f64 = 0;
++                    for (row) |v| sq += v * v;
++                    const inv = if (self.control) 1.0 else 1.0 / @sqrt(sq / @as(f64, @floatFromInt(k)) + 1e-6);
++                    for (0..outs()) |o| {
++                        var sum: f64 = 0;
++                        for (0..k) |i| sum += @as(f64, self.w[o * k + i]) * (row[i] * inv);
++                        logits[o] = sum + @as(f64, self.bias[o]);
++                    }
++                    var pre: [streams]f64 = undefined;
++                    var post: [streams]f64 = undefined;
++                    var mixl: [streams * streams]f64 = undefined;
++                    for (0..streams) |s| {
++                        pre[s] = 1.0 / (1.0 + @exp(-logits[s]));
++                        post[s] = 2.0 / (1.0 + @exp(-logits[streams + s]));
++                        for (0..streams) |t| mixl[s * streams + t] = logits[2 * streams + s * streams + t];
++                    }
++                    for (0..h) |col| {
++                        var b: f64 = 0;
++                        for (0..streams) |s| b += pre[s] * row[s * h + col];
++                        want[r * h + col] = b;
++                        if (mag) |m| m[r * h + col] = @abs(b) / 2;
++                    }
++                },
++                .leave => for (0..h) |col| {
++                    var sum: f64 = 0;
++                    for (0..streams) |s| sum += row[s * h + col];
++                    const v = sum / @as(f64, @floatFromInt(streams));
++                    want[r * h + col] = v;
++                    if (mag) |m| m[r * h + col] = @abs(v) / 2;
++                },
++                .enter => for (0..h) |col| {
++                    const v = row[col] + if (self.control) 0.0 else @as(f64, bf.value(self.res[r * h + col]));
++                    want[r * h + col] = v;
++                    if (mag) |m| m[r * h + col] = @abs(v) / 2;
++                },
++                .merge => {
++                    const st = self.state[r * outs() ..][0..outs()];
++                    var m: [streams * streams]f64 = undefined;
++                    for (0..streams * streams) |i| m[i] = st[2 * streams + i];
++                    if (self.control) {
++                        m = .{ 1, 0, 0, 1 };
++                    }
++                    for (0..h) |col| for (0..streams) |s| {
++                        var v: f64 = 0;
++                        for (0..streams) |t| v += m[s * streams + t] * row[t * h + col];
++                        want[r * h + col] = v + @as(f64, st[streams + s]) * @as(f64, bf.value(self.branch[r * h + col]));
++                    };
++                    // a stream's write is its own column: the kernel writes hs[s * h + col]
++                    for (0..h) |col| {
++                        if (mag) |mm| mm[r * h + col] = @abs(want[r * h + col]) / 2;
++                    }
++                },
++            }
++        }
++    }
++
++    pub fn reference(self: *Case, want: []f64, mag: []f64) !void {
++        try self.outputs(want, mag);
++    }
++
++    pub fn simulate(self: *Case, acc: c.Accum, _: g.Order, out: []f64) !void {
++        _ = acc;
++        try self.outputs(out, null);
++    }
++
++    /// The merge writes every stream's column, so a comparison reads the stream the case names.
++    pub fn bounds(_: *Case, _: []const f64, _: []const f64, _: []f64) !void {}
++};
++
++/// Register every mHC case, loading its own image for exactly as long as the handles are resolved.
++pub fn register(a: std.mem.Allocator, gpu: check_.Gpu, s: cuda.Stream, kernels: *std.ArrayList(g.Kernel)) !void {
++    var group = try Group.create(a, gpu, s, kernels);
++    defer group.destroy();
++}
++
++pub const Group = struct {
++    a: std.mem.Allocator,
++    cases: [8]Case = undefined,
++    used: usize = 0,
++
++    /// Every kernel of the mHC image against its controls, from the module the runner already loaded.
++    pub fn create(a: std.mem.Allocator, gpu: check_.Gpu, s: cuda.Stream, kernels: *std.ArrayList(g.Kernel)) !*Group {
++        const self = try a.create(Group);
++        self.* = .{ .a = a };
++        errdefer self.destroy();
++        // the four kernels live in their own image, which the runner loads here and keeps alive with the group
++        const module = try cuda.Module.load(gpu.d, cuda.kernels.qwen35_mhc);
++        errdefer module.unload();
++        defer module.unload(); // the handles resolve now and outlive the module
++
++        for (std.enums.values(Which)) |which| for ([_]bool{ false, true }) |control| {
++            const symbol: [:0]const u8 = switch (which) {
++                .branch => "tf_q35_mhc_branch",
++                .merge => "tf_q35_mhc_merge",
++                .enter => "tf_q35_mhc_enter",
++                .leave => "tf_q35_mhc_leave",
++            };
++            const item = &self.cases[self.used];
++            item.* = .{ .rig = .{ .gpu = gpu, .s = s }, .arena = .init(a), .which = which, .control = control, .f = try module.function(symbol) };
++            self.used += 1;
++            try kernels.append(a, item.kernel());
++        };
++        return self;
++    }
++
++    pub fn destroy(self: *Group) void {
++        for (self.cases[0..self.used]) |*item| item.deinit();
++        self.a.destroy(self);
++    }
++};
+diff --git a/zig/tests/cuda/contract_tests.zig b/zig/tests/cuda/contract_tests.zig
+index 15137feea..c988b7084 100644
+--- a/zig/tests/cuda/contract_tests.zig
++++ b/zig/tests/cuda/contract_tests.zig
+@@ -432,7 +432,7 @@ fn registered(gpu: check.Gpu, only: []const []const u8, t0: *i96) !g.Tally {
+     for (q35_k.forms, &q35s) |f, *x| x.* = try q35_k.Q35.init(.{ .gpu = gpu, .s = s }, f, q35_mod, q35_kv8);
+     defer for (&q35s) |*x| x.deinit();
+     for (&q35s) |*x| try kernels.append(a, x.kernel());
+-    var window_fns = try window_k.load(gpu.d);
++    try @import("contract_q35_mhc.zig").register(a, gpu, s, &kernels);    var window_fns = try window_k.load(gpu.d);
+     defer window_fns.unload();
+     var windows: [window_k.cfgs.len]window_k.Window = undefined;
+     for (window_k.cfgs, &windows) |f, *x| x.* = .{ .rig = .{ .gpu = gpu, .s = s }, .f = f, .g = &window_fns };

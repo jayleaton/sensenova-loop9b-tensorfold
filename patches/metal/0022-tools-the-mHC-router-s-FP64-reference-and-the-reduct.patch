@@ -1,0 +1,244 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Jay Leaton <58495321+jayleaton@users.noreply.github.com>
+Date: Wed, 18 Nov 2026 05:03:25 +0800
+Subject: [PATCH 22/26] tools: the mHC router's FP64 reference and the
+ reduction orders it admits
+
+Splitting the router's reduction looked like a free path to the 83 tok/s the
+no-window build reaches, but CONTRIBUTING requires an FP64 reference before a
+reduction order changes. This is that reference: over 528 real router inputs
+from three prompts, physical layers 4, 5 and 27, both sites and both visits, it
+compares the shipped 32-lane order against split-K at 8 and 4 slices, reporting
+logit error and the error it induces in pre, post and mix.
+
+All three agree to fp32 rounding: logit max |err| 2.40-2.47e-05, mean 1.48e-06,
+with pre, post and mix within a few percent of each other. So the order is free
+numerically -- and also buys nothing: the 8-slice kernel measures 34.1 tok/s
+against 35.3, since at one row the loop over eight outputs costs more than the
+parallelism adds. The shipped order stays, now with evidence rather than
+assumption.
+---
+ docs/recipes/sensenova-loop-9b-metal.md |  17 ++-
+ tools/router_fp64.py                    | 185 ++++++++++++++++++++++++
+ 2 files changed, 201 insertions(+), 1 deletion(-)
+ create mode 100644 tools/router_fp64.py
+
+diff --git a/docs/recipes/sensenova-loop-9b-metal.md b/docs/recipes/sensenova-loop-9b-metal.md
+index bac04ffae..632b607f4 100644
+--- a/docs/recipes/sensenova-loop-9b-metal.md
++++ b/docs/recipes/sensenova-loop-9b-metal.md
+@@ -77,7 +77,22 @@
+ the fp32 reduction order and costs parity against the reference, so it is not landed.
+ 
+ Remaining: 33 against the 83 no-window figure. The router is one threadgroup at decode (one row), so it cannot fill
+-the GPU; splitting its work differently would change the reduction order and needs an FP64 reference first.
++the GPU.
++
++`tools/router_fp64.py` settles which reduction orders are open to it. Over **528 real rows** (three prompts,
++physical layers 4, 5 and 27, both sites, both visits) against an FP64 reference:
++
++| order | logit max\|err\| | logit mean\|err\| | pre max | post max | mix max |
++| --- | --- | --- | --- | --- | --- |
++| 32-lane, an output a simdgroup (shipped) | 2.47e-05 | 1.48e-06 | 4.8e-07 | 1.18e-06 | 1.13e-07 |
++| split-K, 8 slices combined in order | 2.40e-05 | 1.48e-06 | 4.7e-07 | 1.21e-06 | 1.07e-07 |
++| split-K, 4 slices combined in order | 2.47e-05 | 1.48e-06 | 4.4e-07 | 1.21e-06 | 1.05e-07 |
++
++All three sit at fp32's own rounding and differ by at most a few percent, so a reduction-order change is numerically
++free here — which is what CONTRIBUTING asks to establish before a reorder lands. It buys nothing, though: the
++8-slice split-K kernel measured **34.1 tok/s** against the shipped 35.3, because at one row the inner loop over the
++eight outputs costs more than the extra parallelism pays. So the 32-lane order stays, and the router's cost at one
++row is a property of the shape rather than of the arithmetic.
+ 
+ ## Fidelity
+ 
+diff --git a/tools/router_fp64.py b/tools/router_fp64.py
+new file mode 100644
+index 000000000..88a99aa9f
+--- /dev/null
++++ b/tools/router_fp64.py
+@@ -0,0 +1,185 @@
++#!/usr/bin/env python3
++"""The mHC router's FP64 reference: the 32-lane order against a split-K order.
++
++Real router inputs come from the harness captures (three prompts, physical layers 4, 5 and 27, both sites, both
++visits). Each candidate emulates its own fp32 summation order, so this compares reduction orders, not libraries.
++"""
++import argparse
++import json
++import sys
++
++import numpy as np
++
++SEAM = 37  # golden-full-exact was captured before this prompt's fixtures grew
++
++
++def tree32(parts):
++    """simd_sum over 32 lanes: a butterfly, stride 16 down to 1, in fp32."""
++    v = np.array(parts, dtype=np.float32).copy()
++    stride = 16
++    while stride >= 1:
++        v[:stride] = (v[:stride].astype(np.float32) + v[stride:2 * stride].astype(np.float32)).astype(np.float32)
++        stride //= 2
++    return v[0]
++
++
++def normalize(row):
++    """The row scaled by its own 1/rms, elementwise in fp32, as the kernel forms it."""
++    acc = np.float32(0)
++    for x in row:
++        acc = np.float32(acc + np.float32(x * x))
++    inv = np.float32(1.0 / np.sqrt(np.float64(acc) / np.float64(row.shape[0]) + 1e-6))
++    return (row * inv).astype(np.float32), inv
++
++
++def order_a(row, weight):
++    """Today: one simdgroup an output, each lane striding 32 over the whole row."""
++    out = np.empty(weight.shape[0], dtype=np.float32)
++    h = row.shape[0]
++    for o in range(weight.shape[0]):
++        w = weight[o]
++        parts = [np.float32(0)] * 32
++        for lane in range(32):
++            acc = np.float32(0)
++            for i in range(lane, h, 32):
++                acc = np.float32(acc + np.float32(w[i] * row[i]))
++            parts[lane] = acc
++        out[o] = tree32(parts)
++    return out
++
++
++def order_b(row, weight, slices=8):
++    """Split-K: each simdgroup a K-slice in 32-lane order, then the slices combined in a fixed order."""
++    out = np.empty(weight.shape[0], dtype=np.float32)
++    h = row.shape[0]
++    per = h // slices
++    for o in range(weight.shape[0]):
++        w = weight[o]
++        sums = np.empty(slices, dtype=np.float32)
++        for s in range(slices):
++            base = s * per
++            parts = [np.float32(0)] * 32
++            for lane in range(32):
++                acc = np.float32(0)
++                for i in range(lane, per, 32):
++                    acc = np.float32(acc + np.float32(w[base + i] * row[base + i]))
++                parts[lane] = acc
++            sums[s] = tree32(parts)
++        acc = np.float32(0)
++        for s in range(slices):
++            acc = np.float32(acc + sums[s])
++        out[o] = acc
++    return out
++
++
++def sinkhorn64(logits, iterations):
++    m = np.array(logits, dtype=np.float64)
++    s = int(round(np.sqrt(m.size)))
++    m = m.reshape(s, s)
++    for _ in range(iterations):
++        m = m - np.log(np.exp(m - m.max(-1, keepdims=True)).sum(-1, keepdims=True)) - m.max(-1, keepdims=True)
++        m = m - np.log(np.exp(m - m.max(-2, keepdims=True)).sum(-2, keepdims=True)) - m.max(-2, keepdims=True)
++    return np.exp(m)
++
++
++def router64(row64, weight64, bias64, iterations, streams):
++    """The coefficients in fp64, the reference every candidate is judged against."""
++    d = row64.shape[0]
++    inv = 1.0 / np.sqrt((row64 * row64).mean() + 1e-6)
++    logits = weight64 @ (row64 * inv) + bias64
++    pre = 1.0 / (1.0 + np.exp(-logits[:streams]))
++    post = 2.0 / (1.0 + np.exp(-logits[streams:2 * streams]))
++    mix = sinkhorn64(logits[2 * streams:], iterations)
++    return logits, pre, post, mix
++
++
++def coef32(logits32, iterations, streams):
++    pre = (1.0 / (1.0 + np.exp(-logits32[:streams].astype(np.float64)))).astype(np.float32)
++    post = (2.0 / (1.0 + np.exp(-logits32[streams:2 * streams].astype(np.float64)))).astype(np.float32)
++    mix = sinkhorn64(logits32[2 * streams:].astype(np.float64), iterations)
++    return pre, post, mix
++
++
++def main():
++    ap = argparse.ArgumentParser()
++    ap.add_argument("--golden", required=True)
++    ap.add_argument("--model", required=True)
++    ap.add_argument("--prompts", default="p0-plain,p1-code,p2-reason")
++    ap.add_argument("--layers", default="4,5,27")
++    ap.add_argument("--slices", type=int, default=8)
++    args = ap.parse_args()
++
++    from safetensors import safe_open
++    import glob
++
++    rows = []
++    for prompt in args.prompts.split(","):
++        z = np.load(f"{args.golden}/{prompt}.npz")
++        for layer in [int(x) for x in args.layers.split(",")]:
++            for site in ("mhc_attn", "mhc_ffn"):
++                for visit in (0, 1):
++                    key = f"mhc_phys{layer}_{site}_v{visit}_residual"
++                    if key not in z.files:
++                        continue
++                    res = z[key].astype(np.float32).reshape(-1, 8192)
++                    rows.append((prompt, layer, site, visit, res))
++
++    weight = bias = None
++    weights = {}
++    for f in sorted(glob.glob(f"{args.model}/*.safetensors")):
++        with safe_open(f, "pt") as s:
++            for k in s.keys():
++                if k.endswith("mhc_attn.weight") or k.endswith("mhc_ffn.weight"):
++                    weights[k] = s.get_tensor(k).float().numpy()
++
++    stats = {}
++    for prompt, layer, site, visit, res in rows:
++        k = f"model.language_model.layers.{layer}.{site}.weight"
++        if k not in weights:
++            continue
++        w32 = weights[k]
++        b32 = None
++        for f in sorted(glob.glob(f"{args.model}/*.safetensors")):
++            with safe_open(f, "pt") as s:
++                bk = f"model.language_model.layers.{layer}.{site}.bias"
++                if bk in s.keys():
++                    b32 = s.get_tensor(bk).float().numpy()
++                    break
++        if b32 is None:
++            continue
++        w64 = w32.astype(np.float64)
++        b64 = b32.astype(np.float64)
++        for r in range(res.shape[0]):
++            row32 = res[r]
++            row64 = row32.astype(np.float64)
++            logits64, pre64, post64, mix64 = router64(row64, w64, b64, 20, 2)
++            normed, _ = normalize(row32)
++            for name, fn in (("a", order_a), ("b", lambda x, y: order_b(x, y, args.slices))):
++                lg32 = fn(normed, w32) + b32
++                err = np.abs(lg32.astype(np.float64) - logits64)
++                p32, po32, mx32 = coef32(lg32, 20, 2)
++                s = stats.setdefault(name, {"max": 0.0, "sum": 0.0, "n": 0, "pre": 0.0, "post": 0.0, "mix": 0.0, "rows": 0})
++                s["max"] = max(s["max"], float(err.max()))
++                s["sum"] += float(err.sum())
++                s["n"] += err.size
++                s["pre"] = max(s["pre"], float(np.abs(p32.astype(np.float64) - pre64).max()))
++                s["post"] = max(s["post"], float(np.abs(po32.astype(np.float64) - post64).max()))
++                s["mix"] = max(s["mix"], float(np.abs(mx32 - mix64).max()))
++                s["rows"] += 1
++
++    out = {}
++    for name, s in sorted(stats.items()):
++        out[name] = {
++            "logit_max": s["max"],
++            "logit_mean": s["sum"] / max(s["n"], 1),
++            "pre_max": s["pre"],
++            "post_max": s["post"],
++            "mix_max": s["mix"],
++            "rows": s["rows"],
++        }
++    print(json.dumps({"rows": sum(s["rows"] for s in stats.values()) // max(len(stats), 1), "orders": out}, indent=2))
++
++
++
++if __name__ == "__main__":
++    main()

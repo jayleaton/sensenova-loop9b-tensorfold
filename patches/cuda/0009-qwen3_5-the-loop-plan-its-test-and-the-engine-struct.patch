@@ -1,0 +1,56 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Jay Leaton <58495321+jayleaton@users.noreply.github.com>
+Date: Wed, 18 Nov 2026 09:43:32 +0700
+Subject: [PATCH 9/9] qwen3_5: the loop plan, its test and the engine struct as
+ zig fmt writes them
+
+Formatting only: one field a line in the engine's scratch struct, no blank line
+at the end of two files and no double blank line in the loop-plan test. zig fmt
+--check build.zig zig is clean again; cuda_engine.zig is 599 lines.
+---
+ zig/src/families/qwen3_5/cuda_engine.zig         | 5 +++--
+ zig/src/families/qwen3_5/cuda_loop_plan.zig      | 1 -
+ zig/src/families/qwen3_5/cuda_loop_plan_test.zig | 1 -
+ 3 files changed, 3 insertions(+), 4 deletions(-)
+
+diff --git a/zig/src/families/qwen3_5/cuda_engine.zig b/zig/src/families/qwen3_5/cuda_engine.zig
+index 538d2d8aa..fe607a8e8 100644
+--- a/zig/src/families/qwen3_5/cuda_engine.zig
++++ b/zig/src/families/qwen3_5/cuda_engine.zig
+@@ -148,7 +148,9 @@ pub const Engine = struct {
+     pl: u64,
+     po: u64,
+     logits: u64,
+-    hs: u64, mhc_state: u64, mhc_fns: mhc.Fns, // the streams, router state and the mHC handles
++    hs: u64,
++    mhc_state: u64,
++    mhc_fns: mhc.Fns, // the streams, router state and the mHC handles
+     mt2: @import("cuda_mt2.zig").Mt2,
+     routed: routed.Scratch = .{}, // qwen3_5_moe's routed rows
+     amax: u64, // the argmax slices' bests: most_verify rows of argmaxSlices(vocab) (f32, i32)
+@@ -595,4 +597,3 @@ pub const Engine = struct {
+         return e.host_logits.slice(u16)[i * e.g.vocab ..][0..e.g.vocab];
+     }
+ };
+-
+diff --git a/zig/src/families/qwen3_5/cuda_loop_plan.zig b/zig/src/families/qwen3_5/cuda_loop_plan.zig
+index e46504c57..8fa00a3d6 100644
+--- a/zig/src/families/qwen3_5/cuda_loop_plan.zig
++++ b/zig/src/families/qwen3_5/cuda_loop_plan.zig
+@@ -87,4 +87,3 @@ fn mhcSettings(g: *geometry.Geometry, root: std.json.ObjectMap) !void {
+     if (fixed) return error.UnsupportedQwenGeometry;
+     g.mhc = .{ .start = start, .end = end, .streams = streams, .iterations = iterations, .fixed_identity = fixed, .pre_scale = pre };
+ }
+-
+diff --git a/zig/src/families/qwen3_5/cuda_loop_plan_test.zig b/zig/src/families/qwen3_5/cuda_loop_plan_test.zig
+index b36b01da4..ea2bafbda 100644
+--- a/zig/src/families/qwen3_5/cuda_loop_plan_test.zig
++++ b/zig/src/families/qwen3_5/cuda_loop_plan_test.zig
+@@ -37,7 +37,6 @@ test "SenseNova-Loop-9B: [4,28) twice over 32 layers is 56 executions, 14 attent
+     try std.testing.expectError(error.UnsupportedQwenGeometry, parse(a, fixed));
+ }
+ 
+-
+ test "a geometry without a valid loop executes its own layers once; the accessors never underflow" {
+     // field-by-field geometries hold garbage in loop_count: steps() must answer `layers`, never wrap.
+     var g = std.mem.zeroes(geom.Geometry);

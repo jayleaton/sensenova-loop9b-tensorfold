@@ -1,0 +1,18 @@
+# engine checkouts and converted weights: built or downloaded locally, never committed
+engine-*/
+SenseNova-Loop-9B/
+loop9b-mlx*/
+*.safetensors
+
+# private names for scripts/check-public.sh
+.check-public.local
+
+# Python
+__pycache__/
+*.py[cod]
+
+# editors / OS
+.vscode/
+.idea/
+*.swp
+.DS_Store

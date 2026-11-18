@@ -1,0 +1,65 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Jay Leaton <58495321+jayleaton@users.noreply.github.com>
+Date: Wed, 18 Nov 2026 04:58:35 +0800
+Subject: [PATCH 21/26] docs: the router's side-by-side outputs, and the
+ measured cost that remains
+
+Decode 33.19 tok/s through the served API against 123.7 for the plain control and
+83.1 for 56 executions without the window. Names tf_mhc_branch as the one kernel
+that cost the gap, the bit-identical fix that closed 3.1x of it, and that the
+remaining 33-of-83 wants a reduction order change that needs an FP64 reference.
+---
+ docs/recipes/sensenova-loop-9b-metal.md | 23 ++++++++++++++---------
+ zig/src/families/qwen27/mhc.zig         |  2 +-
+ 2 files changed, 15 insertions(+), 10 deletions(-)
+
+diff --git a/docs/recipes/sensenova-loop-9b-metal.md b/docs/recipes/sensenova-loop-9b-metal.md
+index 46927f8e0..bac04ffae 100644
+--- a/docs/recipes/sensenova-loop-9b-metal.md
++++ b/docs/recipes/sensenova-loop-9b-metal.md
+@@ -61,18 +61,23 @@
+ 
+ | metric | looped | plain 32-layer control |
+ | --- | --- | --- |
+-| decode | **10.77 tok/s** | **123.7 tok/s** |
++| decode | **33.19 tok/s** | **123.7 tok/s** |
+ | prefill | 150.2 tok/s | 1457.8 tok/s |
+-| TTFT | 0.093 s | 0.010 s |
+-| inter-token latency | 92.8 ms | 8.09 ms |
++| TTFT | 0.032 s | 0.010 s |
+ 
+ The plain control is the same binary and the same weights with `loop_settings.counts=[1]` and no `mhc`, so it
+-isolates the loop and the mHC. 56 executions from 32 weight sets should cost about 1.75x a plain pass, which would
+-be roughly 70 tok/s; the measured 10.77 is a further 6.5x. Removing only the mHC window (keeping 56 executions)
+-recovers **82.0 tok/s**, so the cost is in the two-stream boundary, not the loop. Committing every 4 layers instead
+-of 4 executions, and widening the router's threadgroups, changed nothing measurable. The open suspects are the
+-8192-wide stream buffer being touched by two extra kernels per window layer, and 20-row dispatches over
+-prompt-sized buffers. This is the next thing to fix, and these numbers should be re-taken after it.
++isolates the loop and the mHC. Keeping 56 executions but removing only the window gives **83.1 tok/s**, so the
++loop's own cost is as expected — and the window was the whole gap.
++
++The window was one kernel: `tf_mhc_branch`, the router. Skipping each mHC kernel in turn moved decode only for the
++router (11.3 -> 80.4 tok/s); `merge`, `enter` and `leave` were free. It dispatched **32 threads a row** and computed
++its eight outputs one after another, so each lane walked 128 elements per output per stream in a single simdgroup.
++An output a simdgroup — the same 32-lane order, run side by side — is **bit-identical** and takes decode from
++**11.3 to 35.3 tok/s** (33.19 through the served API). A wider 256-thread tree reduction reaches 42.4 but changes
++the fp32 reduction order and costs parity against the reference, so it is not landed.
++
++Remaining: 33 against the 83 no-window figure. The router is one threadgroup at decode (one row), so it cannot fill
++the GPU; splitting its work differently would change the reduction order and needs an FP64 reference first.
+ 
+ ## Fidelity
+ 
+diff --git a/zig/src/families/qwen27/mhc.zig b/zig/src/families/qwen27/mhc.zig
+index 63f949f63..113767fef 100644
+--- a/zig/src/families/qwen27/mhc.zig
++++ b/zig/src/families/qwen27/mhc.zig
+@@ -62,7 +62,7 @@ pub fn enter(e: mtl.ComputeEncoder, k: Kernels, b: Buffers, p: Params, rows: u32
+     e.dispatchThreads(mtl.Size.of(p.hidden, rows, 1), mtl.Size.of(threads(p.hidden), 1, 1));
+ }
+ 
+-/// Threads a width wants: a whole number of 32-lane groups, at most 256.
++/// Threads a width wants: whole 32-lane groups, at most 256; these kernels are elementwise so the width is free.
+ fn threads(width: u32) u32 {
+     return @min(@max(width + 31 & ~@as(u32, 31), 32), 256);
+ }

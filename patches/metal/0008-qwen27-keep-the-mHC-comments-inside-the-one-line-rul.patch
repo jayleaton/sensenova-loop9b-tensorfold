@@ -1,0 +1,45 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Jay Leaton <58495321+jayleaton@users.noreply.github.com>
+Date: Wed, 18 Nov 2026 02:48:08 +0800
+Subject: [PATCH 08/26] qwen27: keep the mHC comments inside the one-line rule
+
+---
+ zig/kernels/metal/qwen27/mhc.metal  | 3 +--
+ zig/src/families/qwen27/forward.zig | 5 ++---
+ 2 files changed, 3 insertions(+), 5 deletions(-)
+
+diff --git a/zig/kernels/metal/qwen27/mhc.metal b/zig/kernels/metal/qwen27/mhc.metal
+index 4555e5248..650eefa71 100644
+--- a/zig/kernels/metal/qwen27/mhc.metal
++++ b/zig/kernels/metal/qwen27/mhc.metal
+@@ -1,6 +1,5 @@
+ using namespace metal;
+-// Hyper-connections (mHC): the router's branch, the streams' merge and the two window boundaries.
+-// A row's streams are interleaved, `row * streams * hidden + stream * hidden + column`, as the reference flattens them.
++// Hyper-connections: the router's branch, the streams' merge and the two boundaries, rows of interleaved streams.
+ 
+ struct TfMhc { uint hidden, streams, outs, iters; float pre_scale; };
+ 
+diff --git a/zig/src/families/qwen27/forward.zig b/zig/src/families/qwen27/forward.zig
+index d2d02a398..0dab04d52 100644
+--- a/zig/src/families/qwen27/forward.zig
++++ b/zig/src/families/qwen27/forward.zig
+@@ -82,7 +82,7 @@ pub const Stages = struct {
+     images: ?Ref = null,
+     /// A tensor-parallel rank's all-reduce: null on one Mac, and then every seam is compiled out of the program.
+     reduce: ?Reduce = null,
+-    /// The mHC window's residual while its streams are open: stream-major planes, each `hidden` wide.
++    /// The mHC window's residual while its streams are open: stream-major planes, each hidden wide.
+     window: Ref = undefined,
+     /// Head seam picks (one u32 a row), required with `Reduce.argmax`: the ranks must pick the same token.
+     picks: ?Ref = null,
+@@ -134,8 +134,7 @@ pub const Stages = struct {
+         if (holds(m, index)) {
+             const mh = m.config.mhc.?;
+             const b = s.hc(f);
+-            // the reference expands h into the streams only at the window's first layer; after it the residual
+-            // *is* the flattened streams, which the next layer takes as they are
++            // only the window's first layer expands h into the streams; after it the residual is the streams
+             if (m.config.physical(index) == mh.start) {
+                 if (s.pending) |pending| {
+                     // the previous layer's output is still pending: fold it in, as the norm that would run here does

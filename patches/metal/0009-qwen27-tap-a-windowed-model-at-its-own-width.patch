@@ -1,0 +1,61 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Jay Leaton <58495321+jayleaton@users.noreply.github.com>
+Date: Wed, 18 Nov 2026 03:24:22 +0800
+Subject: [PATCH 09/26] qwen27: tap a windowed model at its own width
+
+A windowed checkpoint carries its residual as the flat streams, twice as wide as
+a plain layer's hidden state, so Taps.init now takes its width from the window
+and the per-layer taps record that plane; a plain model keeps a layer's own
+width. With it the loop's whole curve can be drawn: smooth and geometric with no
+step at the pass-1 to pass-2 boundary (cos 0.96328 at exec 26, 0.96772 at 28).
+---
+ zig/src/families/qwen27/decode_round.zig | 4 +++-
+ zig/src/families/qwen27/forward.zig      | 6 ++++--
+ 2 files changed, 7 insertions(+), 3 deletions(-)
+
+diff --git a/zig/src/families/qwen27/decode_round.zig b/zig/src/families/qwen27/decode_round.zig
+index bf7ce0761..8c0e3cda3 100644
+--- a/zig/src/families/qwen27/decode_round.zig
++++ b/zig/src/families/qwen27/decode_round.zig
+@@ -159,7 +159,9 @@ pub const Runner = struct {
+         const offsets = try a.alloc(u32, slots);
+         errdefer a.free(offsets);
+         @memset(offsets, 0);
+-        const taps = try Taps.init(m.device, m.frame.capacity, @intCast(m.config.hidden));
++        // a windowed model carries its state as the flat streams, so its taps are that wide
++        const tap_width: usize = @as(usize, m.config.hidden) * (if (m.config.mhc) |mh| mh.streams else 1);
++        const taps = try Taps.init(m.device, m.frame.capacity, @intCast(tap_width));
+         return .{ .allocator = a, .model = m, .geometry = geometry, .gdn = pool, .attention = attention, .scratch = scratch, .bindings = bindings, .caches = caches, .linear_index = linear_index, .attention_index = attention_index, .offsets = offsets, .owned = owned, .taps = taps, .slots = slots, .ready = ready, .capacity = capacity, .kv = kv };
+     }
+ 
+diff --git a/zig/src/families/qwen27/forward.zig b/zig/src/families/qwen27/forward.zig
+index 0dab04d52..c355d948a 100644
+--- a/zig/src/families/qwen27/forward.zig
++++ b/zig/src/families/qwen27/forward.zig
+@@ -147,6 +147,7 @@ pub const Stages = struct {
+                 // from here the window's residual is the flat streams: every stage reads and writes that
+                 s.hidden = s.window;
+             }
++            if (index != 0) if (s.hooks.tap) |tap| try tap(s.hooks.ptr, e, index - 1, s.window, s.rows);
+             mhc_mod.branch(e, m.mhc.?, b, b.params(mh, h), s.rows, layer.mhc_attn.?.weight.buffer, layer.mhc_attn.?.bias.buffer);
+             e.barrier();
+             try m.kernels.norm(e, b.branch, null, wts.ref(layer.norm), f.get(.eps), f.get(.dims), f.get(.input), f.get(.input), f.get(.sums), h, s.rows);
+@@ -157,7 +158,8 @@ pub const Stages = struct {
+         e.barrier();
+         if (s.pending != null) {
+             std.mem.swap(Ref, &s.hidden, &s.residual);
+-            if (s.hooks.tap) |tap| try tap(s.hooks.ptr, e, index - 1, s.hidden, s.rows);
++            // a windowed model's taps are streams-wide: only the window's own planes are recorded
++            if (m.config.mhc == null) if (s.hooks.tap) |tap| try tap(s.hooks.ptr, e, index - 1, s.hidden, s.rows);
+         }
+     }
+ 
+@@ -322,7 +324,7 @@ pub const Stages = struct {
+         try m.kernels.norm(e, s.hidden, s.pending, wts.ref(m.weights.norm), f.get(.eps), f.get(.dims), s.residual, f.get(.input), f.get(.sums), @intCast(m.config.hidden), s.rows);
+         e.barrier();
+         std.mem.swap(Ref, &s.hidden, &s.residual);
+-        if (s.hooks.tap) |tap| try tap(s.hooks.ptr, e, m.config.steps() - 1, s.hidden, s.rows);
++        if (m.config.mhc == null) if (s.hooks.tap) |tap| try tap(s.hooks.ptr, e, m.config.steps() - 1, s.hidden, s.rows);
+         if (s.head == .all and s.rows > @import("gpu_frame.zig").logit_rows) return error.BadFrameRows;
+         if (s.head != .none) {
+             var input = f.get(.input);

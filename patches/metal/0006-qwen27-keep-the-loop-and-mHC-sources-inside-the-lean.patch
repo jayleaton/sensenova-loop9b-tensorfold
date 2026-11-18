@@ -1,0 +1,80 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Jay Leaton <58495321+jayleaton@users.noreply.github.com>
+Date: Wed, 18 Nov 2026 02:33:11 +0800
+Subject: [PATCH 06/26] qwen27: keep the loop and mHC sources inside the lean
+ rule
+
+---
+ zig/kernels/metal/qwen27/mhc.metal       | 9 +++------
+ zig/src/families/qwen27/decode_round.zig | 3 +--
+ zig/src/families/qwen27/gpu_weights.zig  | 3 +--
+ zig/tests/qwen27/mhc_check.zig           | 3 +--
+ 4 files changed, 6 insertions(+), 12 deletions(-)
+
+diff --git a/zig/kernels/metal/qwen27/mhc.metal b/zig/kernels/metal/qwen27/mhc.metal
+index f068a5419..315543565 100644
+--- a/zig/kernels/metal/qwen27/mhc.metal
++++ b/zig/kernels/metal/qwen27/mhc.metal
+@@ -1,17 +1,14 @@
+ using namespace metal;
+-// Hyper-connections (mHC): the router's branch, the streams' merge, and the two window boundaries.
+-// The coefficients are bf16-rounded before use, as the reference casts them; Sinkhorn runs in log space.
+-// Streams are stored stream-major: plane `s` is `streams + s * rows * hidden`, so an operator takes one row range.
++// Hyper-connections (mHC): the router's branch, the streams' merge and the two window boundaries, stream-major planes.
+ 
+ struct TfMhc { uint hidden, streams, outs, iters, plane; float pre_scale; };
+ 
+-// A coefficient rounded to bf16 before use, as the reference casts it (`pre.to(dtype)`, `mix.to(dtype)`).
++// A coefficient rounded to bf16 before use, as the reference casts it.
+ static inline float tf_mhc_rbf(float v) {
+   return float(bfloat(v));
+ }
+ 
+-// One row's router: `outs` mixes of the flattened streams, Sinkhorn over the S x S map, then the branch
+-// `pre . streams` the sublayer runs on. STATE keeps S pre, S post and S*S mix as f32 for the merge.
++// One row's router: `outs` mixes of the streams, Sinkhorn over the S x S map, then the branch the layer runs on.
+ [[max_total_threads_per_threadgroup(32)]] kernel void tf_mhc_branch(device const bfloat* HS [[buffer(0)]],
+                           device const float* W [[buffer(1)]],
+                           device const float* B [[buffer(2)]],
+diff --git a/zig/src/families/qwen27/decode_round.zig b/zig/src/families/qwen27/decode_round.zig
+index af5f471fd..bf7ce0761 100644
+--- a/zig/src/families/qwen27/decode_round.zig
++++ b/zig/src/families/qwen27/decode_round.zig
+@@ -89,8 +89,7 @@ pub const Runner = struct {
+     fn build(a: std.mem.Allocator, m: *Model, slots: u32, capacity: u32, ready: u32, paged: bool) !Runner {
+         if (slots == 0 or slots > attn.planning.max_streams or capacity == 0 or m.frame.capacity % 16 != 0 or ready == 0 or ready > slots) return error.BadRoundCapacity;
+         const geometry = try attn.planning.Geometry.fromConfig(m.config, m.device.tensorUnits());
+-        // indexed by execution, not by physical block: a shared-weight loop's second visit needs its own KV
+-        // and its own recurrent state, so the ordinals count executions of each kind
++        // indexed by execution: a loop's second visit needs its own KV and recurrent state, not the first's
+         const linear_index = try a.alloc(u32, m.config.steps());
+         errdefer a.free(linear_index);
+         const attention_index = try a.alloc(u32, m.config.steps());
+diff --git a/zig/src/families/qwen27/gpu_weights.zig b/zig/src/families/qwen27/gpu_weights.zig
+index de4cdcab0..4b8551caa 100644
+--- a/zig/src/families/qwen27/gpu_weights.zig
++++ b/zig/src/families/qwen27/gpu_weights.zig
+@@ -16,8 +16,7 @@ pub const Gdn = struct { qkv: Linear, zba: Linear, out: Linear, conv: Tensor, a_
+ pub const Attention = struct { q: Linear, kv: Linear, out: Linear, q_norm: Tensor, k_norm: Tensor };
+ /// The routed block: the router (experts, shared gate, zero rows), the stacked experts, the shared expert's matrices.
+ pub const Moe = struct { router: row_gpu.Weights, gate: row_gpu.Experts, up: row_gpu.Experts, down: row_gpu.Experts, shared_gate: row_gpu.Weights, shared_up: row_gpu.Weights, shared_down: row_gpu.Weights };
+-/// With experts, `gu` and `down` are the shared expert's.
+-/// A layer's two mHC routers, f32 as the checkpoint ships them: `[outputs, streams*hidden]` and `[outputs]`.
++/// With experts, `gu` and `down` are the shared expert's; the two mHC routers stay f32 as the checkpoint ships them.
+ pub const Router = struct { weight: Tensor, bias: Tensor };
+ pub const Layer = struct { norm: Tensor, post_norm: Tensor, gu: Linear, down: Linear, moe: ?Moe = null, mhc_attn: ?Router = null, mhc_ffn: ?Router = null, mixer: union(@import("config.zig").Kind) { linear: Gdn, attention: Attention } };
+ 
+diff --git a/zig/tests/qwen27/mhc_check.zig b/zig/tests/qwen27/mhc_check.zig
+index f3735dcad..7f248f768 100644
+--- a/zig/tests/qwen27/mhc_check.zig
++++ b/zig/tests/qwen27/mhc_check.zig
+@@ -179,8 +179,7 @@ pub fn main(init: std.process.Init) !void {
+     for (0..outs) |i| std.debug.print("  state[{d}] got {d:.6} want {d:.6}\n", .{ i, got_state[i], want_state[i] });
+     std.debug.print("  branch[0..4] bits {d} {d} {d} {d}\n", .{ got_branch[0], got_branch[1], got_branch[2], got_branch[3] });
+     std.debug.print("  branch[0] got {d:.6} want {d:.6}\n", .{ ofBf(got_branch[0..]), want_branch[0] });
+-    // the state is a sigmoid of a dot product and the branch a bf16 sum: a permuted fp32 reduction
+-    // of 512 terms moves these, and the released router is fp32 with coefficients far from 0 or 1
++    // a permuted fp32 reduction of 512 terms moves the state; the branch is a bf16 sum of the same terms
+     if (worst_state > 2e-3 or worst_branch > 1e-2) return error.MhcBranchMismatch;
+ 
+     // the merge, from the router's own coefficients

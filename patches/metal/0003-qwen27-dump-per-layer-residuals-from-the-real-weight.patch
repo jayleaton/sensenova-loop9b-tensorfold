@@ -1,0 +1,136 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Jay Leaton <58495321+jayleaton@users.noreply.github.com>
+Date: Wed, 18 Nov 2026 01:58:48 +0800
+Subject: [PATCH 03/26] qwen27: dump per-layer residuals from the real-weight
+ gate
+
+A port needs the first layer whose residual leaves the reference, not just a
+token mismatch. Stages.begin now answers the tap hook at embedding_tap (1000),
+which no layer index collides with, so a dump carries the rows layer 0 starts
+from; tf-qwen27-run takes --dump-taps L0,L1,... and --dump PATH and writes each
+tapped plane as raw bf16 with a 16-byte header of planes, rows, width, capacity.
+
+Measured with it on SenseNova-Loop-9B: the packed embedding matches the
+reference (max 0.0133, cos 0.99395, i.e. the 4-bit group step) and layer 0, a
+Gated-DeltaNet layer, is the first divergence (delta cos 0.857 with rms 1.65x
+the reference). The converter also ships A_log in bf16 to match the decay
+kernel's declared dtype.
+---
+ tools/sensenova_loop_mlx.py         |  3 +++
+ zig/src/families/qwen27/forward.zig |  3 +++
+ zig/tests/qwen27/run.zig            | 39 +++++++++++++++++++++++++++++
+ 3 files changed, 45 insertions(+)
+
+diff --git a/tools/sensenova_loop_mlx.py b/tools/sensenova_loop_mlx.py
+index 12d60a55c..f639f6948 100644
+--- a/tools/sensenova_loop_mlx.py
++++ b/tools/sensenova_loop_mlx.py
+@@ -164,6 +164,9 @@ def main():
+                 pending[f"{base}.scales"] = torch.from_numpy(s_all.view(np.int16)).view(torch.bfloat16)
+                 pending[f"{base}.biases"] = torch.from_numpy(b_all.view(np.int16)).view(torch.bfloat16)
+                 checked += 1
++            elif out.endswith("A_log"):
++                # the GDN kernel reads a bf16 decay weight; the checkpoint's A_log is f32
++                pending[out] = t.to(torch.bfloat16).contiguous()
+             elif out.endswith("dt_bias"):
+                 # the engine keeps dt_bias bf16; the checkpoint's is f32
+                 pending[out] = t.to(torch.bfloat16).contiguous()
+diff --git a/zig/src/families/qwen27/forward.zig b/zig/src/families/qwen27/forward.zig
+index fce18ea57..acd74c1cc 100644
+--- a/zig/src/families/qwen27/forward.zig
++++ b/zig/src/families/qwen27/forward.zig
+@@ -61,6 +61,8 @@ pub const Reduce = struct {
+ 
+ /// Serial decode and prompt segments own separate frames and order shared caches at the mixer.
+ pub const Head = enum { all, last, none };
++/// The tap index the embedding answers to: no layer has it, so a dump can carry the rows a layer 0 begins from.
++pub const embedding_tap = 1000;
+ /// A verified head's dependent readback work stays in its final command buffer.
+ pub const Tail = struct { ptr: *anyopaque, encode: *const fn (*anyopaque, mtl.ComputeEncoder) anyerror!void };
+ pub const Stages = struct {
+@@ -85,6 +87,7 @@ pub const Stages = struct {
+         s.residual = m.frame.get(.residual);
+         try m.glue.embedding(lane.enc, m.config, m.weights.embed, m.frame.get(.ids), s.hidden, s.rows);
+         lane.enc.barrier();
++        if (s.hooks.tap) |tap| try tap(s.hooks.ptr, lane.enc, embedding_tap, s.hidden, s.rows);
+         if (s.images) |rows| {
+             m.glue.imageRows(lane.enc, s.hidden, rows, m.frame.get(.takes), @intCast(m.config.hidden), s.rows);
+             lane.enc.barrier();
+diff --git a/zig/tests/qwen27/run.zig b/zig/tests/qwen27/run.zig
+index 46420bb9e..6d452742a 100644
+--- a/zig/tests/qwen27/run.zig
++++ b/zig/tests/qwen27/run.zig
+@@ -47,6 +47,25 @@ fn emit(a: std.mem.Allocator, io: std.Io, dir: []const u8) !void {
+         try write(a, io, dir, try std.fmt.allocPrint(a, "lane-{d}.metal", .{i}), text);
+     }
+ }
++/// The tapped residual of every requested layer for the prompt's rows: a header, then one plane a layer.
++fn dumps(a: std.mem.Allocator, io: std.Io, r: *q.decode_round.Runner, rows: usize, path: []const u8) !void {
++    const t = r.taps;
++    const row_bytes = @as(usize, t.width) * 2;
++    var out: std.ArrayList(u8) = .empty;
++    defer out.deinit(a);
++    var header: [16]u8 = undefined;
++    @memcpy(header[0..4], std.mem.asBytes(&@as(u32, @intCast(t.count))));
++    @memcpy(header[4..8], std.mem.asBytes(&@as(u32, @intCast(rows))));
++    @memcpy(header[8..12], std.mem.asBytes(&@as(u32, t.width)));
++    @memcpy(header[12..16], std.mem.asBytes(&@as(u32, @intCast(t.capacity))));
++    try out.appendSlice(a, &header);
++    for (0..t.count) |plane| {
++        const offset = plane * @as(usize, t.capacity) * row_bytes;
++        try out.appendSlice(a, t.buffer.contents()[offset..][0 .. rows * row_bytes]);
++    }
++    try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = path, .data = out.items });
++}
++
+ const Difference = struct { position: usize, expected: ?u32, actual: u32, top2: q.session.TopTwo };
+ const Generated = struct { tokens: []u32, first_difference: ?Difference, top2: ?[]q.session.TopTwo };
+ fn generated(a: std.mem.Allocator, s: q.session.Session, count: usize, force: bool, expected: ?[]const u32, trace: ?*profile.Trace, profile_steps: usize, teacher: bool) !Generated {
+@@ -116,6 +135,8 @@ pub fn main(init: std.process.Init) !void {
+     var teacher = false;
+     var profile_prompt = false;
+     var resume_reply = false;
++    var dump_layers: ?[]const u32 = null;
++    var dump_path: ?[]const u8 = null;
+     var i: usize = 1;
+     while (i < args.len) : (i += 1) {
+         const arg = args[i];
+@@ -127,6 +148,19 @@ pub fn main(init: std.process.Init) !void {
+             force = true;
+             continue;
+         }
++        if (std.mem.eql(u8, arg, "--dump-taps") and i + 1 < args.len) {
++            i += 1;
++            var list: std.ArrayList(u32) = .empty;
++            var it = std.mem.tokenizeScalar(u8, args[i], ',');
++            while (it.next()) |field| try list.append(a, try std.fmt.parseInt(u32, field, 10));
++            dump_layers = try list.toOwnedSlice(a);
++            continue;
++        }
++        if (std.mem.eql(u8, arg, "--dump") and i + 1 < args.len) {
++            i += 1;
++            dump_path = args[i];
++            continue;
++        }
+         if (std.mem.eql(u8, arg, "--teacher")) {
+             teacher = true;
+             continue;
+@@ -165,6 +199,10 @@ pub fn main(init: std.process.Init) !void {
+     if (ids.len + count + extra > m.config.max_position) return error.ContextFull;
+     var runner = try q.decode_round.Runner.init(init.gpa, m, 1, @intCast(@max(ids.len + count + extra, 128)));
+     defer runner.deinit();
++    if (dump_layers) |ls| {
++        try runner.taps.use(m.device, ls);
++        runner.capture_taps = true;
++    }
+     const s = q.session.Session{ .runner = &runner };
+     const load_ns = load_start.durationTo(std.Io.Clock.awake.now(io)).toNanoseconds();
+     if (warmup) {
+@@ -178,6 +216,7 @@ pub fn main(init: std.process.Init) !void {
+     try s.prefill(ids, chunk);
+     const prompt_ns = start.durationTo(std.Io.Clock.awake.now(io)).toNanoseconds();
+     trace.enabled = false;
++    if (dump_path) |path| try dumps(a, io, &runner, ids.len, path);
+     const digest = try s.fingerprint();
+     const decode_start = std.Io.Clock.awake.now(io);
+     const generation = try generated(a, s, count, force, expected, if (profile_steps > 0) &trace else null, profile_steps, teacher);
