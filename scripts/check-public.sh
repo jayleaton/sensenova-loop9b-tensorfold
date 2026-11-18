@@ -19,7 +19,7 @@ patterns=(
     'private IPv4 172.16/12|\b172\.(1[6-9]|2[0-9]|3[01])\.[0-9]{1,3}\.[0-9]{1,3}\b'
     'CGNAT IPv4|\b100\.(6[4-9]|[7-9][0-9]|1[01][0-9]|12[0-7])\.[0-9]{1,3}\.[0-9]{1,3}\b'
     'home directories|/hom[e]/[a-z0-9_.-]+/|/User[s]/[A-Za-z0-9_.-]+/|(^|[^a-z0-9_.-])~/[a-z]'
-    'machine host names|\bdgx-?[0-9]{1,2}\b|\bnode-?[0-9]{2}\b|\bspark-?[0-9]{2}\b'
+    'machine host names|\bdg[x]-?[0-9]{1,2}\b|\bnod[e]-?[0-9]{2}\b|\bspar[k]-?[0-9]{2}\b'
     'gmail address|[a-z0-9._%+-]+@gmail\.com'
     'SSH key|ssh-(ed25519|rsa|dss) AAA[A]|BEGI[N] [A-Z ]*PRIVATE KEY'
     'tokens|\bh[f]_[A-Za-z0-9]{30,}|\bg[h][pousr]_[A-Za-z0-9]{30,}|githu[b]_pat_[A-Za-z0-9_]{20,}|\bs[k]-[A-Za-z0-9_-]{20,}|\bAKI[A][0-9A-Z]{16}\b|xo[x][abprs]-[A-Za-z0-9-]{10,}'
