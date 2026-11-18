@@ -12,6 +12,15 @@
   `tools/bench_concurrent.py` clients are upstream work. The converter reproduces the engine's own
   `quantizeMlx` (`zig/src/core/affine4_host.zig`). Apache License 2.0;
   code written before 0.6.0 keeps its MIT notice.
+- **Shared-round drafter pricing: upstream TensorFold PR [#2475](https://github.com/ashhart/TensorFold/pull/2475) by
+  [jrb-ai](https://github.com/jrb-ai)**, which prices rounds that several streams share from measured costs; this
+  recipe's drafter work builds on it.
+- **[exllamav3](https://github.com/turboderp-org/exllamav3) by turboderp**: the EXL3 format and its quantizer, which
+  the EXL3 packs are made with, and **[QTIP](https://github.com/Cornell-RelaxML/qtip)** (Tseng, Sun, Hou and De Sa,
+  Cornell RelaxML), the trellis-coded quantization EXL3 is built on. MIT and GPL-3.0 respectively; neither is included
+  here.
+- [xgrammar](https://github.com/mlc-ai/xgrammar) v0.2.8 (Apache License 2.0): the grammar engine behind
+  `libtfgrammar`, built by the user for required and named tool calls.
 - [Hugging Face transformers](https://github.com/huggingface/transformers) 5.18.0 and
   [PyTorch](https://github.com/pytorch/pytorch) 2.15.0: the reference runs.
 - [mlx-lm](https://github.com/ml-explore/mlx-lm) 0.32.2: the Metal prefill comparison.

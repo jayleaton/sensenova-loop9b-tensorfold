@@ -6,8 +6,8 @@ Support me here: https://buymeacoffee.com/jayleaton
 
 A recipe for serving [SenseNova-Loop-9B](https://huggingface.co/sensenova/SenseNova-Loop-9B) with
 [TensorFold](https://github.com/ashhart/TensorFold) on two backends: CUDA on one NVIDIA DGX Spark (TP=1), and Metal on
-a Mac Studio M5 Ultra. It ships an exact upstream TensorFold pin and a patch series for each backend, a converter from
-the published BF16 checkpoint to the engine's MLX affine format, serving profiles, and the measurements behind them.
+Apple Silicon. It ships an exact upstream TensorFold pin and a patch series for each backend, a converter from the
+published BF16 checkpoint to the engine's MLX affine format, serving profiles, and the measurements behind them.
 No weights are included or published: you download the checkpoint from SenseNova and convert it yourself.
 
 ## Credits
@@ -23,16 +23,22 @@ No weights are included or published: you download the checkpoint from SenseNova
   the dense `qwen27` Metal family, their Gated DeltaNet, hybrid-attention, YaRN and MLX-affine code, and the
   Qwen3.5-VL tower are upstream work this recipe builds on. The patches here extend it; they are not upstream changes.
 
+- **Shared-round drafter pricing:** upstream TensorFold PR [#2475](https://github.com/ashhart/TensorFold/pull/2475)
+  by [jrb-ai](https://github.com/jrb-ai).
+- **EXL3:** [exllamav3](https://github.com/turboderp-org/exllamav3) by turboderp, built on
+  [QTIP](https://github.com/Cornell-RelaxML/qtip) (Cornell RelaxML).
+
 More in [CREDITS](docs/CREDITS.md); license terms in [LICENSING](docs/LICENSING.md) and [NOTICE](NOTICE).
 
 | | |
 | --- | --- |
 | Model | [`sensenova/SenseNova-Loop-9B`](https://huggingface.co/sensenova/SenseNova-Loop-9B) @ `329a65f701ba8c48b73c30d0cbaa6f0449733673`, BF16, Apache-2.0 |
 | Architecture | Qwen3.5 dense hybrid attention; physical layers `[4, 28)` run twice (56 executions from 32 weight sets), wrapped in a two-stream mHC ([MODEL](docs/MODEL.md)) |
-| Weights served | MLX affine g64, 4-bit (or 8-bit), converted with [`tools/sensenova_loop_mlx.py`](docs/CONVERT.md) from the patch series |
-| CUDA | 1x DGX Spark (GB10), TP=1: upstream TensorFold [`038e4a278`](config/cuda/tensorfold.rev) + [`patches/cuda/`](patches/cuda/) `0001`-`0009` |
-| Metal | Mac Studio M5 Ultra: upstream TensorFold [`6d0a128b0`](config/metal/tensorfold.rev) + [`patches/metal/`](patches/metal/) `0001`-`0039` |
-| Input | text on both; **images on Metal** ([METAL](docs/METAL.md#images)); CUDA images [in progress](#in-progress) |
+| Weights served | MLX affine g64, converted with [`tools/sensenova_loop_mlx.py`](docs/CONVERT.md) from the patch series: 8-bit on CUDA, 4-bit on Metal |
+| CUDA | 1x DGX Spark (GB10), TP=1: upstream TensorFold [`038e4a278`](config/cuda/tensorfold.rev) + [`patches/cuda/`](patches/cuda/) `0001`-`0019` |
+| Metal | Apple Silicon (measured on M5 Ultra and M4 Pro): upstream TensorFold [`6d0a128b0`](config/metal/tensorfold.rev) + [`patches/metal/`](patches/metal/) `0001`-`0044` |
+| Input | text and images on both ([CUDA](docs/CUDA.md#serve), [METAL](docs/METAL.md#images)) |
+| Drafts | copy drafts on by default on both: drafts from a stream's own context, verified, so tokens are unchanged |
 
 The two series sit on different upstream commits, so each backend keeps its own pin. Each pin is the upstream commit
 its backend was measured on, and each series rebuilds the measured engine tree exactly
@@ -43,6 +49,29 @@ pin, but that tree has not been measured. See [ENGINE](docs/ENGINE.md).
 > misses the planned 0.05-logit parity gate and has no task gate yet; Metal passes its task gate on code and reasoning,
 > and its prose prompt stops at the reference's own noise floor. Read [KNOWN-ISSUES](docs/KNOWN-ISSUES.md) before you
 > rely on it.
+
+## What works today
+
+**CUDA, DGX Spark: 8-bit, 1M context, images, four chats.** The served build is `patches/cuda/` `0001`-`0019`
+([CUDA](docs/CUDA.md#serve)): the converter's 8-bit text weights, the BF16 vision tower, YaRN factor 4, fp8 KV, a 24
+GiB prompt cache and an NVMe disk tier.
+
+| | |
+| --- | --- |
+| decode | 18.0 tok/s one chat; 13.2-14.6 tok/s each with four chats |
+| prefix reuse | a 74K prompt's second turn: TTFT 0.66 s against 52.4 s cold |
+| tools | strict tool gate pass (`required` and `auto`) |
+| soak | 45 requests over 12 rotating conversations, 0 errors |
+| drafts on vs off | identical token ids at 2 and 4 chats |
+
+**Metal: 4-bit with copy drafts.** M5 Ultra 59.5-60.0 tok/s without drafts; with copy drafts a repeated paragraph
+runs at 362 tok/s, a code edit at 87 and prose at 94, all 16 reply pairs token-identical to drafts off. An M4 Pro
+MacBook Pro (24 GB) decodes at 26.7 tok/s ([METAL](docs/METAL.md#copy-drafts)).
+
+**Tool calls need `libtfgrammar`.** `tool_choice: "required"`, a named function and `response_format` need
+`libtfgrammar` (`.so` on Linux, `.dylib` on macOS) beside the server, built from xgrammar v0.2.8 with
+`zig build grammar`; without it those requests get HTTP 400 ([CUDA](docs/CUDA.md#required-and-named-tool-calls),
+[METAL](docs/METAL.md#serve)).
 
 ## Results
 
@@ -74,7 +103,7 @@ reasoning 64/64, prose 19/64**. 19/64 is exactly where transformers' own fp32 ru
 so it is the reference's noise floor. The prefill kernels leave every token hash unchanged. CUDA: not run yet; its
 fidelity evidence is the BF16 parity above and the q8 cosine against the stock control.
 
-**Speed** (4-bit, one stream unless noted):
+**Speed** (4-bit, one stream unless noted; the CUDA column is the earlier 4-bit, 32K profile on `0001`-`0009`):
 
 | | CUDA, DGX Spark | Metal, Mac Studio M5 Ultra |
 | --- | --- | --- |
@@ -103,8 +132,9 @@ hf download sensenova/SenseNova-Loop-9B --revision 329a65f701ba8c48b73c30d0cbaa6
 
 ```bash
 scripts/build-engine.sh cuda engine-cuda                     # pin + patches/cuda, then zig build native -Dnvcc=...
-python3 engine-cuda/tools/sensenova_loop_mlx.py --source SenseNova-Loop-9B --out loop9b-mlx4 --bits 4
-scripts/serve.sh cuda engine-cuda loop9b-mlx4                # --parallel 4 --context 32768, port 8090
+python3 engine-cuda/tools/sensenova_loop_mlx.py --source SenseNova-Loop-9B --out loop9b-mlx8 --bits 8
+python3 scripts/serve-tree.py engine-cuda loop9b-mlx8 SenseNova-Loop-9B loop9b-q8-vis 4   # + vision tower, YaRN 4
+scripts/serve.sh cuda engine-cuda loop9b-q8-vis              # 1M context, 4 chats, fp8 KV, --vision, port 8090
 ```
 
 **Metal, on a Mac** (Xcode with the macOS SDK and Metal toolchain; [METAL](docs/METAL.md)):
@@ -112,7 +142,7 @@ scripts/serve.sh cuda engine-cuda loop9b-mlx4                # --parallel 4 --co
 ```bash
 scripts/build-engine.sh metal engine-metal                   # pin + patches/metal, then zig build native -Dcpu=apple_m1
 python3 engine-metal/tools/sensenova_loop_mlx.py --source SenseNova-Loop-9B --out loop9b-mlx4
-scripts/serve.sh metal engine-metal loop9b-mlx4              # --context 2048 --prompt-cache-gib 0 --no-drafts
+scripts/serve.sh metal engine-metal loop9b-mlx4              # --context 33024 --parallel 4, copy drafts on
 PROFILE=vision scripts/serve.sh metal engine-metal loop9b-mlx4   # image input: --context 4096 ... --vision
 ```
 
@@ -124,14 +154,16 @@ curl -s http://127.0.0.1:8090/v1/chat/completions -H 'Content-Type: application/
 ```
 
 Thinking is on by default (the checkpoint's chat template); send `"chat_template_kwargs": {"enable_thinking": false}`
-to turn it off. To check the patch series without building, run `scripts/fetch-engine.sh cuda|metal DIR`: it fetches
+to turn it off. A `--thinking-budget` at or above `max_tokens` never closes the thinking block (the reply ends with
+`length`); keep it under `max_tokens` or add `--thinking-reserve N`. Build `libtfgrammar` for required and named tool
+calls (see above). To check the patch series without building, run `scripts/fetch-engine.sh cuda|metal DIR`: it fetches
 the pin, applies the series and checks the resulting tree.
 
-## In progress
+## Not yet
 
-- **CUDA image input.** The CUDA engine has the Qwen3.5-VL tower code at this geometry, but GPU qualification for
-  this checkpoint is pending, and the CUDA series' converter still leaves the tower out.
-- **CUDA task gate.** The same three-prompt greedy gate Metal passes, on CUDA.
+- **DFlash2 drafter:** waiting on SenseNova's published drafter weights.
+- **EXL3 on 16 GB RTX cards:** not yet tested on a real card.
+- **Benchmarks:** coming.
 
 ## Documentation
 
@@ -139,8 +171,8 @@ the pin, applies the series and checks the resulting tree.
 | --- | --- |
 | [MODEL](docs/MODEL.md) | the checkpoint: loop schedule, mHC, cache sizing, memory |
 | [CONVERT](docs/CONVERT.md) | BF16 to MLX affine: commands and the mappings that matter |
-| [CUDA](docs/CUDA.md) | DGX Spark: build, serve, parity, speed |
-| [METAL](docs/METAL.md) | Mac Studio M5 Ultra: build, serve, fidelity, speed |
+| [CUDA](docs/CUDA.md) | DGX Spark: build, the served 1M profile, parity, speed |
+| [METAL](docs/METAL.md) | Apple Silicon: build, serve, copy drafts, fidelity, speed |
 | [ENGINE](docs/ENGINE.md) | the pins and both patch series, patch by patch |
 | [KNOWN-ISSUES](docs/KNOWN-ISSUES.md) | what is not solved |
 | [CREDITS](docs/CREDITS.md) / [LICENSING](docs/LICENSING.md) | who built what, and under which terms |

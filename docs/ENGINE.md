@@ -7,8 +7,8 @@ patch series applied in order. The pin, the series length and the resulting tree
 | --- | --- | --- |
 | `tensorfold.repo` | `https://github.com/ashhart/TensorFold.git` | same |
 | `tensorfold.rev` | `038e4a27872eaa018adc67b1b5ddffd16820c498` | `6d0a128b0cde35aa091bda933577cfced3519b8a` |
-| `tensorfold.patches` | `0009` | `0039` |
-| `tensorfold.tree` | `31714680052c2be236d6162d450c96b1f61f3bb6` | `bd326a4c58374fa9063f4e011e6004696ee53640` |
+| `tensorfold.patches` | `0019` | `0044` |
+| `tensorfold.tree` | `0882211e9e246e25b23eee4cb573eb4d8290977b` | `d33e2d93ea37f0b3ed1f208599a24ac00b3de16e` |
 
 Both pins are on upstream `main` (2026-11-17); `038e4a278` is 36 commits older than `6d0a128b0`.
 `scripts/fetch-engine.sh BACKEND DEST [SOURCE]` fetches the pin, applies `patches/BACKEND/0001`..`LAST` with `git am`
@@ -24,7 +24,7 @@ measured on, so each series gives back the measured tree exactly. The two series
 and a few shared core, build and Metal runtime files), and the CUDA series also applies cleanly on `6d0a128b0`. That tree is not measured, so
 it is not the pin.
 
-## CUDA series, `patches/cuda/` (21 files, +1185 / -28)
+## CUDA series, `patches/cuda/` (43 files, +1690 / -68)
 
 | patch | change |
 | --- | --- |
@@ -37,12 +37,22 @@ it is not the pin.
 | `0007` | the mHC contract runs: five cases at the served width, FP64 references, a planted control each; registered in `contract_family_sets.zig` |
 | `0008` | `tools/sensenova_loop_mlx.py` and its test, identical to the Metal series' converter after its `0004` |
 | `0009` | formatting only: three `qwen3_5` files as `zig fmt` writes them |
+| `0010` | `tools/checkpoint_view.py`: a probe tree that links its source for reading and never writes through a link (`scripts/serve-tree.py` uses it) |
+| `0011` | an image prompt through the looped decoder on CUDA, and the `image` verb of `tf-qwen35-cuda` |
+| `0012` | a later pipeline stage's first norm folds the residual again; the CUDA host suite builds |
+| `0013` | a required or named tool call closes the think block in time for the call |
+| `0014` | a family's default decode share; `qwen3_5` CUDA takes 0.5 |
+| `0015` | `--spill-gib`'s evictions are not charged to the daily write budget |
+| `0016` | the CUDA disk tier's staging permit is sized for the longest kept state |
+| `0017`-`0019` | shared rounds' copy windows start at three rows and widen as copies land; never where rows are priced or for a drafter's proposals |
 
-`zig/` after `0001`-`0007` is identical to the measured CUDA engine; `0008` adds only `tools/`, and `0009` only
+The tree after `0001`-`0019` is the served CUDA engine with the converter added: its `zig/` source is that build's,
+byte for byte, and the converter (`0008`) is the only difference. `zig/` after `0001`-`0007` is identical to the engine
+behind the 4-bit results; `0008` adds only `tools/`, and `0009` only
 reformats (no blank line at two files' ends, one double blank line, one struct field a line). Both trees as measured
 failed `zig fmt --check`; CUDA `0009` and Metal `0039` are that rewrite, and each leaves every source token unchanged.
 
-## Metal series, `patches/metal/` (41 files, +2656 / -103)
+## Metal series, `patches/metal/` (44 files, +2725 / -154)
 
 | patch | change |
 | --- | --- |
@@ -69,6 +79,11 @@ failed `zig fmt --check`; CUDA `0009` and Metal `0039` are that rewrite, and eac
 | `0036`, `0038` | small-Mac candidates and recipes (`docs/small-quant-*`), and the recipe's "Small Macs" section |
 | `0037` | converter: a stock Qwen3.5 f32 gated norm stored as bf16 (SenseNova's is bf16 already; this is for the control) |
 | `0039` | formatting and comments only, the same tokens: four `qwen27` files as `zig fmt` writes them |
+| `0040` | the mHC state pointers in Metal's `device` address space, so macOS 26 (MSL 4.0) and 15 (MSL 3.2) compile the library |
+| `0041` | every execution's state kept after a shared round, not only the physical layers (2 or more streams) |
+| `0042` | lone streams propose copy drafts without a drafter |
+| `0043` | copy drafts on by default, `--no-drafts` turns them off; EXL3 checkpoints would keep them opt-in. One conflict against this series, in `qwen27_served.zig`: the incoming `copy_policy` line is taken, and since this tree has no EXL3 loader `model.exl3` is set false |
+| `0044` | the engine's Metal recipe: serve with copy drafts and `libtfgrammar`, and keep answer room with `--thinking-reserve` |
 
 `0001`-`0025` are the archive's `sensenova/loop9b-metal-prefill` (`79222dc1a`); `0026`-`0033` are
 `sensenova/loop9b-metal-vision` (`12b5090b8`), which forked before the last three prefill commits, replayed on top;

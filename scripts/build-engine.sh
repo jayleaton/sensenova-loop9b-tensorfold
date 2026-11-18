@@ -25,5 +25,6 @@ case "$backend" in
         fi
         ;;
     metal) zig build native -Dcpu=apple_m1 ;;
+    *) echo "no build for $backend" >&2; exit 2 ;;
 esac
 echo "built $dest/zig-out/native/bin/tensorfold-native"

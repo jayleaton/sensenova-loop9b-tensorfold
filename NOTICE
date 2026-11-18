@@ -30,3 +30,9 @@ SenseNova-Loop-9B
   By SenseNova, Apache License 2.0 (https://github.com/OpenSenseNova/SenseNova-Loop/blob/main/LICENSE). Not
   included: each user downloads the checkpoint under the terms on its model card. The docs describe the model's
   architecture as published in its config and reference code.
+
+Also credited, not included:
+  - Upstream TensorFold PR #2475 by jrb-ai (https://github.com/jrb-ai): shared-round drafter pricing.
+  - exllamav3 by turboderp (https://github.com/turboderp-org/exllamav3), MIT: the EXL3 format and quantizer.
+  - QTIP (https://github.com/Cornell-RelaxML/qtip), GPL-3.0: the trellis-coded quantization EXL3 builds on.
+  - xgrammar (https://github.com/mlc-ai/xgrammar), Apache License 2.0: built by the user as libtfgrammar.

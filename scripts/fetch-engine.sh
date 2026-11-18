@@ -1,42 +1,51 @@
 #!/usr/bin/env bash
 # Fetch one backend's upstream TensorFold pin, apply its patch series 0001..LAST in order and require the recorded tree.
 #
-#   scripts/fetch-engine.sh cuda|metal DEST [SOURCE]
+#   scripts/fetch-engine.sh BACKEND DEST [SOURCE]      BACKEND: a directory under config/ (cuda, metal, ...)
 #
 # SOURCE is an optional local TensorFold checkout or bundle that holds the pin; without it the pin is fetched from
-# config/<backend>/tensorfold.repo. DEST must not exist.
+# config/<backend>/tensorfold.repo. DEST must not exist. A backend whose config has a tensorfold.series file applies
+# several series in order, one `DIR:LAST` a word (patches/DIR/0001..LAST each); without it the series is
+# patches/<backend>/0001..config/<backend>/tensorfold.patches.
 set -euo pipefail
-backend=${1:?usage: scripts/fetch-engine.sh cuda|metal DEST [SOURCE]}
-dest=${2:?usage: scripts/fetch-engine.sh cuda|metal DEST [SOURCE]}
+backend=${1:?usage: scripts/fetch-engine.sh BACKEND DEST [SOURCE]}
+dest=${2:?usage: scripts/fetch-engine.sh BACKEND DEST [SOURCE]}
 source=${3:-}
 root=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
-case "$backend" in
-    cuda | metal) ;;
-    *) echo 'backend must be cuda or metal' >&2; exit 2 ;;
-esac
+[[ "$backend" =~ ^[a-z0-9-]+$ && -d "$root/config/$backend" ]] || { echo "no backend config/$backend" >&2; exit 2; }
 config=$root/config/$backend
 read -r repo < "$config/tensorfold.repo"
 read -r rev < "$config/tensorfold.rev"
-read -r last < "$config/tensorfold.patches"
 read -r tree < "$config/tensorfold.tree"
+if [[ -f "$config/tensorfold.series" ]]; then
+    read -r -a layers < "$config/tensorfold.series"
+else
+    read -r last < "$config/tensorfold.patches"
+    layers=("$backend:$last")
+fi
 [[ "$repo" =~ ^https://github\.com/[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+\.git$ ]] || { echo "invalid $config/tensorfold.repo" >&2; exit 2; }
-[[ "$rev" =~ ^[0-9a-f]{40}$ && "$tree" =~ ^[0-9a-f]{40}$ && "$last" =~ ^[0-9]{4}$ ]] || { echo "invalid pin in $config" >&2; exit 2; }
+[[ "$rev" =~ ^[0-9a-f]{40}$ && "$tree" =~ ^[0-9a-f]{40}$ ]] || { echo "invalid pin in $config" >&2; exit 2; }
 [[ ! -e "$dest" ]] || { echo "$dest already exists" >&2; exit 2; }
 
-# The series must be exactly 0001..LAST, one file a number.
+# Each series must be exactly 0001..LAST, one file a number.
 series=()
-n=0
-for p in "$root/patches/$backend"/[0-9][0-9][0-9][0-9]-*.patch; do
-    [[ -f "$p" ]] || break
-    name=${p##*/}
-    [[ "${name:0:4}" > "$last" ]] && break
-    n=$((n + 1))
+for layer in "${layers[@]}"; do
+    dir=${layer%%:*}
+    last=${layer#*:}
+    [[ "$dir" =~ ^[a-z0-9-]+$ && "$last" =~ ^[0-9]{4}$ ]] || { echo "invalid series $layer in $config" >&2; exit 2; }
+    n=0
+    for p in "$root/patches/$dir"/[0-9][0-9][0-9][0-9]-*.patch; do
+        [[ -f "$p" ]] || break
+        name=${p##*/}
+        [[ "${name:0:4}" > "$last" ]] && break
+        n=$((n + 1))
+        printf -v number '%04d' "$n"
+        [[ "${name:0:4}" == "$number" ]] || { echo "patches/$dir/$number missing or not unique" >&2; exit 2; }
+        series+=("$p")
+    done
     printf -v number '%04d' "$n"
-    [[ "${name:0:4}" == "$number" ]] || { echo "patches/$backend/$number missing or not unique" >&2; exit 2; }
-    series+=("$p")
+    [[ "$number" == "$last" ]] || { echo "patches/$dir/$last missing" >&2; exit 2; }
 done
-printf -v number '%04d' "$n"
-[[ "$number" == "$last" ]] || { echo "patches/$backend/$last missing" >&2; exit 2; }
 
 git init -q "$dest"
 git -C "$dest" remote add origin "$repo"
@@ -51,4 +60,4 @@ git -C "$dest" -c user.name='TensorFold recipe' -c user.email=recipe@invalid -c 
     am --quiet --committer-date-is-author-date --whitespace=nowarn "${series[@]}"
 got=$(git -C "$dest" rev-parse 'HEAD^{tree}')
 [[ "$got" == "$tree" ]] || { echo "patched tree $got differs from config/$backend/tensorfold.tree ($tree)" >&2; exit 2; }
-echo "$backend engine in $dest: TensorFold ${rev:0:9} + patches 0001-$last, tree $tree"
+echo "$backend engine in $dest: TensorFold ${rev:0:9} + ${layers[*]}, tree $tree"
