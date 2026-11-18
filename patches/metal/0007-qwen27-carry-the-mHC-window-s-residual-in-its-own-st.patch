@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Jay Leaton <58495321+jayleaton@users.noreply.github.com>
 Date: Wed, 18 Nov 2026 02:45:52 +0800
-Subject: [PATCH 07/39] qwen27: carry the mHC window's residual in its own
+Subject: [PATCH 07/44] qwen27: carry the mHC window's residual in its own
  stream planes
 
 The reference keeps a window's residual as the flattened streams between

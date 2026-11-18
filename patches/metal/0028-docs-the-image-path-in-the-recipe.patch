@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Jay Leaton <58495321+jayleaton@users.noreply.github.com>
 Date: Wed, 18 Nov 2026 09:31:43 +0800
-Subject: [PATCH 28/39] docs: the image path in the recipe
+Subject: [PATCH 28/44] docs: the image path in the recipe
 
 Names the tower's shape, that it is the same one TensorFold already reads at this
 model's width, and the one non-obvious mapping: qwen_vl finds it through the
@@ -15,7 +15,7 @@ diff --git a/docs/recipes/sensenova-loop-9b-metal.md b/docs/recipes/sensenova-lo
 index 72bbd67af..ee23ac094 100644
 --- a/docs/recipes/sensenova-loop-9b-metal.md
 +++ b/docs/recipes/sensenova-loop-9b-metal.md
-@@ -55,6 +55,25 @@
+@@ -55,6 +55,25 @@ Each visit owns its KV and recurrent state, 14 attention and 42 linear slots.
  `--no-drafts` is the only supported mode: this checkpoint ships no drafter, and the loop's second visit is not a
  speculative path. Do not enable MTP or DFlash2 against it.
  
@@ -41,7 +41,7 @@ index 72bbd67af..ee23ac094 100644
  ## Measured on an M5 Ultra (macOS 27.2), 4-bit, drafts off
  
  Cold prefill, one fresh process or server per arm, chunk 2048 (the M5 default), 2 repetitions that agree to 0.3%.
-@@ -131,7 +150,7 @@
+@@ -131,7 +150,7 @@ recipe measures against.
  
  ## What is not covered
  

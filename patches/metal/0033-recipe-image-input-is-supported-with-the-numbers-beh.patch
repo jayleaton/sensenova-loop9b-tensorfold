@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Jay Leaton <58495321+jayleaton@users.noreply.github.com>
 Date: Wed, 18 Nov 2026 10:36:55 +0800
-Subject: [PATCH 33/39] recipe: image input is supported, with the numbers
+Subject: [PATCH 33/44] recipe: image input is supported, with the numbers
  behind it
 
 Rewrites the Images section so it stands alone: what the tower is and the one
@@ -33,7 +33,7 @@ index ee23ac094..9e382b326 100644
  
  ## The model
  
-@@ -57,22 +58,83 @@
+@@ -57,22 +58,83 @@ speculative path. Do not enable MTP or DFlash2 against it.
  
  ## Images
  
@@ -126,7 +126,7 @@ index ee23ac094..9e382b326 100644
  
  ## Measured on an M5 Ultra (macOS 27.2), 4-bit, drafts off
  
-@@ -151,6 +213,7 @@
+@@ -151,6 +213,7 @@ recipe measures against.
  ## What is not covered
  
  - video: the processor's video path is not wired, and video parts are refused.

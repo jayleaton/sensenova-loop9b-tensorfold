@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Jay Leaton <58495321+jayleaton@users.noreply.github.com>
 Date: Wed, 18 Nov 2026 10:15:11 +0800
-Subject: [PATCH 31/39] qwen27: initialise the vision dump before it is read
+Subject: [PATCH 31/44] qwen27: initialise the vision dump before it is read
 
 A created struct carries no field defaults, so Tower.dump was undefined rather
 than the empty slice it declares, and a run with TF_QWEN_VISION_BLOCKS unset read

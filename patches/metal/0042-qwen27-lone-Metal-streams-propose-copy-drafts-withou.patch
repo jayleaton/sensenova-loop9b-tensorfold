@@ -1,0 +1,68 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Jay Leaton <58495321+jayleaton@users.noreply.github.com>
+Date: Wed, 18 Nov 2026 22:12:41 +0800
+Subject: [PATCH 42/44] qwen27: lone Metal streams propose copy drafts without
+ a drafter
+
+With TF_QWEN27_COPIES=1 and no --drafter, a lone stream got exact width 1 and the
+window costs were never timed, so copies never proposed (lone loop=plain).
+Lone copies now take the lane window and the costs are measured.
+
+M5 Ultra, served greedy chat, 256 tokens: tokens equal to --no-drafts at 1, 2 and 4
+streams for q4 (12/12); q4 repeat 59.7 -> 361.8 tok/s, code edit 87.3, prose 93.9,
+story unchanged (59.5).
+---
+ zig/src/native/draft_sources_metal_test.zig | 3 +++
+ zig/src/native/qwen27_lanes.zig             | 2 +-
+ zig/src/native/qwen27_served.zig            | 4 ++--
+ 3 files changed, 6 insertions(+), 3 deletions(-)
+
+diff --git a/zig/src/native/draft_sources_metal_test.zig b/zig/src/native/draft_sources_metal_test.zig
+index 4359c02c9..9bcd49604 100644
+--- a/zig/src/native/draft_sources_metal_test.zig
++++ b/zig/src/native/draft_sources_metal_test.zig
+@@ -71,6 +71,9 @@ test "draft sources: Metal Qwen27 copies and DFlash2 use actual slot and head fa
+     b.tensor_units = false;
+     runner.slots = 1;
+     try check(b.facts(), null, false, false);
++    b.copies = true;
++    try check(b.facts(), null, true, false);
++    b.copies = false;
+     runner.slots = 4;
+     try check(b.facts(), null, true, false);
+     b.draft = present(@TypeOf(b.draft.?));
+diff --git a/zig/src/native/qwen27_lanes.zig b/zig/src/native/qwen27_lanes.zig
+index b94e4c223..f932f1134 100644
+--- a/zig/src/native/qwen27_lanes.zig
++++ b/zig/src/native/qwen27_lanes.zig
+@@ -169,7 +169,7 @@ pub const Metal = struct {
+         const narrow: usize = @min(b.window, b.timed);
+         // routed experts make a drafted window read most expert weights: plain rounds compete with drafted depths
+         const routed = b.runner.model.config.moe();
+-        return .{ .exact_width = if (drafting or shared) b.window else 1, .mtp = drafting, .speculate = drafting, .speculate_early = false, .drafts = b.nodes, .draft_probabilities = true, .plain_guard = routed, .window_costs = b.costs[0..narrow], .shared_costs = b.costs[narrow..b.timed], .hidden_rows = shared, .streams_exact = true, .batch_rows = if (shared) batch_rows else b.window, .max_streams = b.runner.slots, .lone_copies = lone_copies, .context_copies = lone_copies, .allocate_shared_drafts = drafting, .draft_streams = drafting and b.draft_slots > 1 };
++        return .{ .exact_width = if (drafting or shared or lone_copies) b.window else 1, .mtp = drafting, .speculate = drafting, .speculate_early = false, .drafts = b.nodes, .draft_probabilities = true, .plain_guard = routed, .window_costs = b.costs[0..narrow], .shared_costs = b.costs[narrow..b.timed], .hidden_rows = shared, .streams_exact = true, .batch_rows = if (shared) batch_rows else b.window, .max_streams = b.runner.slots, .lone_copies = lone_copies, .context_copies = lone_copies, .allocate_shared_drafts = drafting, .draft_streams = drafting and b.draft_slots > 1 };
+     }
+ 
+     /// The slot holding `s`.
+diff --git a/zig/src/native/qwen27_served.zig b/zig/src/native/qwen27_served.zig
+index 232681da8..af16db70a 100644
+--- a/zig/src/native/qwen27_served.zig
++++ b/zig/src/native/qwen27_served.zig
+@@ -387,7 +387,7 @@ pub fn attach(parent: Allocator, io: std.Io, model: *q.model.Model, drafter: ?*q
+     h.back.chunk = h.runner.promptRows(@min(rows, row_policy.requested(model.device.generation(), model.config.moe(), value)));
+     h.back.grow = .{ .ctx = h, .room = Host.roomFor, .added = Host.added };
+     h.back.vision = o.images;
+-    if (h.draft != null) try h.back.measure(io);
++    if (h.draft != null or h.back.copies) try h.back.measure(io);
+     h.cfg = try lanes.Config.init(gpa, h.back.facts(), window, h.back.nodes);
+     errdefer h.cfg.deinit(gpa);
+     h.clock = .{ .io = io };
+@@ -403,7 +403,7 @@ pub fn attach(parent: Allocator, io: std.Io, model: *q.model.Model, drafter: ?*q
+     // a reply that ends soon goes first beside a long prompt; a share someone set stays as they set it
+     if (o.decode_share == null and std.c.getenv("TENSORFOLD_PREFILL_SHARE") == null) h.host.srpt = .withDefault(true);
+     var loop_text: [160]u8 = undefined;
+-    std.log.info("qwen27: {s}", .{try policy.describe(&loop_text, serial, window, h.draft != null, h.back.copies)});
++    std.log.info("qwen27: {s}", .{try policy.describe(&loop_text, serial and h.draft != null, window, h.draft != null or h.back.copies, h.back.copies)});
+     h.warm = .{ .queue = model.queue };
+     // the ready slots are wired before the cache's budget reads the footprint, and the later ones count as taken
+     const residency = tf.startup_receipt.span(.residency);

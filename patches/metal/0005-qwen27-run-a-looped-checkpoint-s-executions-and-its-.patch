@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Jay Leaton <58495321+jayleaton@users.noreply.github.com>
 Date: Wed, 18 Nov 2026 02:32:26 +0800
-Subject: [PATCH 05/39] qwen27: run a looped checkpoint's executions and its
+Subject: [PATCH 05/44] qwen27: run a looped checkpoint's executions and its
  two-stream mHC on Metal
 
 The 27B engine iterated physical layers. A SenseNova-Loop checkpoint declares a

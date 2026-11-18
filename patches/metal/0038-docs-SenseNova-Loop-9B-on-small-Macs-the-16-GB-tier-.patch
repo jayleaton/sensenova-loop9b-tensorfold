@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Jay Leaton <58495321+jayleaton@users.noreply.github.com>
 Date: Wed, 18 Nov 2026 11:23:16 +0800
-Subject: [PATCH 38/39] docs: SenseNova-Loop-9B on small Macs, the 16 GB tier
+Subject: [PATCH 38/44] docs: SenseNova-Loop-9B on small Macs, the 16 GB tier
  is q4 and no 2-bit pack passes for 8 GB
 
 ---
@@ -13,7 +13,7 @@ diff --git a/docs/recipes/sensenova-loop-9b-metal.md b/docs/recipes/sensenova-lo
 index 9e382b326..ad77016ad 100644
 --- a/docs/recipes/sensenova-loop-9b-metal.md
 +++ b/docs/recipes/sensenova-loop-9b-metal.md
-@@ -210,6 +210,74 @@
+@@ -210,6 +210,74 @@ own fp32 twin at the same token, so 19/64 there is the measurement's resolution,
  Known gap: raising the engine above that floor would need the reference to be the fp32 run, not the bf16 one this
  recipe measures against.
  
@@ -92,7 +92,7 @@ diff --git a/docs/small-quant-candidates.md b/docs/small-quant-candidates.md
 index 072f42649..c2b948762 100644
 --- a/docs/small-quant-candidates.md
 +++ b/docs/small-quant-candidates.md
-@@ -24,8 +24,8 @@
+@@ -24,8 +24,8 @@ python3 tools/sensenova_loop_mlx.py --source SenseNova-Loop-9B --out OUT \
    squared error after bf16 rounding of scale and bias. 0 (default) reproduces the previous min/max quantizer.
  - 3, 5 and 6-bit codes are packed as MLX's continuous little-endian bitstream (codes cross u32 edges); 2, 4 and
    8-bit output is unchanged. Earlier commits packed 3/5/6-bit wrongly; use this branch.
@@ -103,7 +103,7 @@ index 072f42649..c2b948762 100644
  
  All groups are 64. The mHC routers (f32), norms, `A_log`, `dt_bias` and `conv1d` stay unquantized.
  
-@@ -52,3 +52,8 @@
+@@ -52,3 +52,8 @@ All groups are 64. The mHC routers (f32), norms, `A_log`, `dt_bias` and `conv1d`
  Teacher-forced top-1 agreement over 64 positions on the three gate prompts (`p0-plain`, `p1-code`, `p2-reason`)
  against the BF16 reference continuation. Metal q4 against BF16: plain 57/64, code 62/64, reasoning 61/64. Control:
  stock Qwen3.5-9B through the same converter and recipe against its own BF16 continuation.

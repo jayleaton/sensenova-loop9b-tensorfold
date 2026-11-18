@@ -1,1 +1,1 @@
---context 2048 --prompt-cache-gib 0 --no-drafts
+--context 33024 --parallel 4 --prompt-cache-gib 0

@@ -1,0 +1,217 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Jay Leaton <58495321+jayleaton@users.noreply.github.com>
+Date: Wed, 18 Nov 2026 22:33:56 +0800
+Subject: [PATCH 43/44] qwen27: copy drafts on by default on Metal, opt-in for
+ EXL3
+
+Without a drafter, copies now default on unless the checkpoint is EXL3, whose verify
+windows change its summation order (TF_QWEN27_COPIES=1 still turns them on).
+--no-drafts turns copies off in lone and shared rounds, and the host decides the
+policy once for the backend.
+
+M5 Ultra, q4, served greedy chat at 1, 2 and 4 streams: 12/12 replies equal
+--no-drafts; repeat 60 -> 344 tok/s, code edit 85, prose 92, story unchanged.
+---
+ zig/src/families/qwen27/model.zig           |  2 ++
+ zig/src/native/draft_sources_metal_test.zig |  3 +-
+ zig/src/native/metal.zig                    |  2 +-
+ zig/src/native/qwen27_lanes.zig             |  5 ++-
+ zig/src/native/qwen27_served.zig            |  6 ++--
+ zig/src/native/qwen27_window.zig            | 40 +++++++++++++--------
+ 6 files changed, 36 insertions(+), 22 deletions(-)
+
+diff --git a/zig/src/families/qwen27/model.zig b/zig/src/families/qwen27/model.zig
+index 68d729ee8..891f6ea28 100644
+--- a/zig/src/families/qwen27/model.zig
++++ b/zig/src/families/qwen27/model.zig
+@@ -39,6 +39,7 @@ pub const Model = struct {
+     share_pending: bool = false,
+     /// widths.Widths.tag: 0 for a uniform 4-bit g64 checkpoint.
+     widths_tag: u64 = 0,
++    exl3: bool = false,
+ 
+     /// Immediate share loading for tools; `share_fits` null keeps their existing unrestricted behavior.
+     pub fn load(a: std.mem.Allocator, io: std.Io, dir: []const u8, rows: u32, share_fits: ?*const fn (u64) bool) !*Model {
+@@ -109,6 +110,7 @@ pub const Model = struct {
+         m.shard = shard;
+         m.config = shard.local;
+         m.widths_tag = ws.tag();
++        m.exl3 = false;
+         m.device = try mtl.Device.init();
+         errdefer m.device.deinit();
+         if (!qualifiedGeneration(m.device.generation())) return error.QwenMetalQualificationRequired;
+diff --git a/zig/src/native/draft_sources_metal_test.zig b/zig/src/native/draft_sources_metal_test.zig
+index 9bcd49604..3e18c5bf5 100644
+--- a/zig/src/native/draft_sources_metal_test.zig
++++ b/zig/src/native/draft_sources_metal_test.zig
+@@ -73,9 +73,10 @@ test "draft sources: Metal Qwen27 copies and DFlash2 use actual slot and head fa
+     try check(b.facts(), null, false, false);
+     b.copies = true;
+     try check(b.facts(), null, true, false);
+-    b.copies = false;
+     runner.slots = 4;
+     try check(b.facts(), null, true, false);
++    b.copies = false;
++    try check(b.facts(), null, false, false);
+     b.draft = present(@TypeOf(b.draft.?));
+     try check(b.facts(), .{ .kind = "DFlash2", .name = "example/draft" }, true, false);
+     runner.slots = 1;
+diff --git a/zig/src/native/metal.zig b/zig/src/native/metal.zig
+index 8f7d1d135..6de6a7543 100644
+--- a/zig/src/native/metal.zig
++++ b/zig/src/native/metal.zig
+@@ -325,7 +325,7 @@ fn openQwen27(a: Allocator, gpa: Allocator, io: std.Io, o: api.Open, problem: *[
+     var why: []const u8 = "";
+     const drafter = if (o.drafts) o.drafter else null;
+     const learn: ?@import("qwen27_disk.zig").Learn = if (o.learn_conversations) if (o.learn) |root| .{ .root = root, .dir = o.dir, .drafter = drafter, .cap = gibBytes(o.learn_gib), .floor = gibBytes(o.learn_min_free_gib), .daily = gibBytes(o.learn_daily_gib), .spill = o.spill, .slots = spill.slots(o) } else null else null;
+-    const h = qwen27.open(gpa, io, o.dir, .{ .context = @intCast(context), .streams = o.lanes, .streams_fixed = o.lanes_fixed, .drafter = drafter, .drafter_name = o.drafter_name, .drafter_bits = o.drafter_bits, .cache_gib = o.prompt_cache_gib, .cache_over_cap = o.prompt_cache_over_cap, .decode_share = o.decode_share, .learn = learn, .vision = o.vision }, a, &why) catch |err| {
++    const h = qwen27.open(gpa, io, o.dir, .{ .context = @intCast(context), .streams = o.lanes, .streams_fixed = o.lanes_fixed, .drafts = o.drafts, .drafter = drafter, .drafter_name = o.drafter_name, .drafter_bits = o.drafter_bits, .cache_gib = o.prompt_cache_gib, .cache_over_cap = o.prompt_cache_over_cap, .decode_share = o.decode_share, .learn = learn, .vision = o.vision }, a, &why) catch |err| {
+         problem.* = if (why.len > 0) why else try std.fmt.allocPrint(a, "the native Qwen engine (27B class) cannot load {s} ({s})", .{ o.dir, @errorName(err) });
+         return null;
+     };
+diff --git a/zig/src/native/qwen27_lanes.zig b/zig/src/native/qwen27_lanes.zig
+index f932f1134..399f57099 100644
+--- a/zig/src/native/qwen27_lanes.zig
++++ b/zig/src/native/qwen27_lanes.zig
+@@ -93,7 +93,7 @@ pub const Metal = struct {
+     rewind: ?mtl.Buffer = null, // slot 0's DeltaNet states and taps at its last pass's history end
+     slot_resume: bool = true, // TF_QWEN27_SLOT_RESUME: a later prompt resumes where slot 0 stands (0: off)
+ 
+-    pub fn init(gpa: std.mem.Allocator, runner: *q.decode_round.Runner, draft: ?*Draft) !*Metal {
++    pub fn init(gpa: std.mem.Allocator, runner: *q.decode_round.Runner, draft: ?*Draft, copies: bool) !*Metal {
+         if (runner.slots == 0 or runner.slots > max_streams) return error.TargetBinding;
+         const floor = @import("qwen27_prompt_floor.zig");
+         floor.check(runner.model.frame.capacity) catch |err| {
+@@ -104,7 +104,6 @@ pub const Metal = struct {
+         const device = runner.model.device;
+         const tensor_units = device.tensorUnits();
+         const window = try windowRows(tensor_units);
+-        const copies = try @import("qwen27_window.zig").copyPolicy(tensor_units, window, if (platform.c.getenv("TF_QWEN27_COPIES")) |v| std.mem.span(v) else null);
+         const ops = try tf.tree_round_gpu.Ops.init(device);
+         errdefer ops.deinit();
+         const picks = try device.buffer(batch_rows * @sizeOf(contract.Pick), opts);
+@@ -169,7 +168,7 @@ pub const Metal = struct {
+         const narrow: usize = @min(b.window, b.timed);
+         // routed experts make a drafted window read most expert weights: plain rounds compete with drafted depths
+         const routed = b.runner.model.config.moe();
+-        return .{ .exact_width = if (drafting or shared or lone_copies) b.window else 1, .mtp = drafting, .speculate = drafting, .speculate_early = false, .drafts = b.nodes, .draft_probabilities = true, .plain_guard = routed, .window_costs = b.costs[0..narrow], .shared_costs = b.costs[narrow..b.timed], .hidden_rows = shared, .streams_exact = true, .batch_rows = if (shared) batch_rows else b.window, .max_streams = b.runner.slots, .lone_copies = lone_copies, .context_copies = lone_copies, .allocate_shared_drafts = drafting, .draft_streams = drafting and b.draft_slots > 1 };
++        return .{ .exact_width = if (drafting or shared or lone_copies) b.window else 1, .mtp = drafting, .speculate = drafting, .speculate_early = false, .drafts = b.nodes, .draft_probabilities = true, .plain_guard = routed, .window_costs = b.costs[0..narrow], .shared_costs = b.costs[narrow..b.timed], .hidden_rows = shared, .streams_exact = true, .batch_rows = if (shared) batch_rows else b.window, .max_streams = b.runner.slots, .copy_drafts = drafting or lone_copies, .lone_copies = lone_copies, .context_copies = lone_copies, .allocate_shared_drafts = drafting, .draft_streams = drafting and b.draft_slots > 1 };
+     }
+ 
+     /// The slot holding `s`.
+diff --git a/zig/src/native/qwen27_served.zig b/zig/src/native/qwen27_served.zig
+index af16db70a..f5d765674 100644
+--- a/zig/src/native/qwen27_served.zig
++++ b/zig/src/native/qwen27_served.zig
+@@ -24,6 +24,7 @@ pub const Options = struct {
+     context: u32,
+     streams: u32, // --parallel: slots at most, fewer when their caches do not fit
+     streams_fixed: bool = false, // --parallel named a number: every slot fits, or the server refuses
++    drafts: bool = true,
+     drafter: ?[]const u8 = null,
+     drafter_name: ?[]const u8 = null,
+     drafter_bits: u8 = 0,
+@@ -322,10 +323,11 @@ pub fn attach(parent: Allocator, io: std.Io, model: *q.model.Model, drafter: ?*q
+         why.* = policy.problem(err) orelse why.*;
+         return err;
+     };
+-    _ = policy.copyPolicy(units, window, if (platform.c.getenv("TF_QWEN27_COPIES")) |v| std.mem.span(v) else null) catch |err| {
++    const copy_policy = policy.copyPolicy(units, window, model.exl3, drafter != null or o.drafter != null, if (platform.c.getenv("TF_QWEN27_COPIES")) |v| std.mem.span(v) else null) catch |err| {
+         why.* = policy.problem(err) orelse why.*;
+         return err;
+     };
++    const copies = o.drafts and copy_policy;
+     const lanes_value = if (platform.c.getenv("TF_QWEN27_LANES")) |v| std.mem.span(v) else null;
+     const serial = policy.serial(units, window, lanes_value) catch |err| {
+         why.* = policy.problem(err) orelse why.*;
+@@ -381,7 +383,7 @@ pub fn attach(parent: Allocator, io: std.Io, model: *q.model.Model, drafter: ?*q
+     if (draft_model) |d| h.draft = try lb.Draft.attach(gpa, &h.runner, d, owns_draft);
+     draft_owned = false;
+     errdefer if (h.draft) |d| d.deinit();
+-    h.back = try lb.Metal.init(gpa, &h.runner, h.draft);
++    h.back = try lb.Metal.init(gpa, &h.runner, h.draft, copies);
+     errdefer h.back.deinit();
+     h.back.serial_copy_match = policy.serialCopyMatch(units, window, lanes_value);
+     h.back.chunk = h.runner.promptRows(@min(rows, row_policy.requested(model.device.generation(), model.config.moe(), value)));
+diff --git a/zig/src/native/qwen27_window.zig b/zig/src/native/qwen27_window.zig
+index 638ffd814..9a0a15eea 100644
+--- a/zig/src/native/qwen27_window.zig
++++ b/zig/src/native/qwen27_window.zig
+@@ -10,8 +10,9 @@ pub fn proposal(window: u32, copies: bool, granted: u32, room: u32, lone: bool)
+     const cap = if (lone) nodes(window, copies) else @min(granted, if (copies) @as(u32, 15) else 31);
+     return @min(cap, window -| 1, room - 1);
+ }
+-pub fn copyPolicy(tensor_units: bool, window: u32, value: ?[]const u8) !bool {
+-    return flag(value, tensor_units and window > 16, error.BadQwenCopies);
++/// Copies default on without a drafter, except for EXL3, whose verify windows change its summation order.
++pub fn copyPolicy(tensor_units: bool, window: u32, exl3: bool, drafter: bool, value: ?[]const u8) !bool {
++    return flag(value, if (drafter) tensor_units and window > 16 else !exl3, error.BadQwenCopies);
+ }
+ pub fn rows(tensor_units: bool) u32 {
+     _ = tensor_units;
+@@ -41,11 +42,20 @@ test "qwen27 window: head plus copies matches the 64-row serial layout without e
+     try std.testing.expectEqual(@as(u32, 15), nodes(16, true));
+ }
+ 
+-test "qwen27 window: copies remain off until explicitly requested" {
+-    try std.testing.expect(!try copyPolicy(false, 16, null));
+-    try std.testing.expect(!try copyPolicy(true, 16, null));
+-    try std.testing.expect(!try copyPolicy(false, 16, "0"));
+-    try std.testing.expect(try copyPolicy(true, 16, "1"));
++test "qwen27 window: copies default on without a drafter except for EXL3" {
++    for ([_]bool{ false, true }) |units| for ([_]u32{ 16, 32, 64 }) |width| {
++        try std.testing.expect(try copyPolicy(units, width, false, false, null));
++        try std.testing.expect(!try copyPolicy(units, width, true, false, null));
++        try std.testing.expect(try copyPolicy(units, width, true, false, "1"));
++        try std.testing.expect(!try copyPolicy(units, width, false, false, "0"));
++    };
++}
++
++test "qwen27 window: with a drafter, copies remain off until explicitly requested" {
++    try std.testing.expect(!try copyPolicy(false, 16, false, true, null));
++    try std.testing.expect(!try copyPolicy(true, 16, false, true, null));
++    try std.testing.expect(!try copyPolicy(false, 16, false, true, "0"));
++    try std.testing.expect(try copyPolicy(true, 16, false, true, "1"));
+ }
+ 
+ fn flag(value: ?[]const u8, fallback: bool, comptime bad: anyerror) !bool {
+@@ -85,7 +95,7 @@ pub fn problem(err: anyerror) ?[]const u8 {
+ }
+ test "qwen27 window: unknown switches refuse by their startup variable names" {
+     for ([_][]const u8{ "true", "on", "yes", "", "2" }) |v| {
+-        try std.testing.expectError(error.BadQwenCopies, copyPolicy(false, 16, v));
++        try std.testing.expectError(error.BadQwenCopies, copyPolicy(false, 16, false, true, v));
+         try std.testing.expectError(error.BadQwenLanes, serialPolicy(false, v));
+     }
+     try std.testing.expectEqualStrings("TF_QWEN27_COPIES must be 0 or 1", problem(error.BadQwenCopies).?);
+@@ -115,7 +125,7 @@ test "qwen27 window: startup reports the effective lone width beside the lane po
+ 
+ test "qwen27 window: default lone copies return only on the narrow tensor window" {
+     try std.testing.expect(try serial(true, 16, null));
+-    try std.testing.expect(!try copyPolicy(true, 16, null));
++    try std.testing.expect(!try copyPolicy(true, 16, false, true, null));
+     for ([_]u32{ 16, 32, 64 }) |width| {
+         try std.testing.expectEqual(width == 16, try serial(true, width, null));
+         try std.testing.expect(!try serial(false, width, null));
+@@ -127,15 +137,15 @@ test "qwen27 window: default lone copies return only on the narrow tensor window
+ 
+ test "qwen27 window: preserve each device class's qualified default and checked copy overrides" {
+     for ([_]bool{ false, true }) |units| for ([_]u32{ 16, 32, 64 }) |width| {
+-        try std.testing.expectEqual(units and width > 16, try copyPolicy(units, width, null));
+-        try std.testing.expect(!try copyPolicy(units, width, "0"));
+-        try std.testing.expect(try copyPolicy(units, width, "1"));
+-        try std.testing.expectError(error.BadQwenCopies, copyPolicy(units, width, "on"));
++        try std.testing.expectEqual(units and width > 16, try copyPolicy(units, width, false, true, null));
++        try std.testing.expect(!try copyPolicy(units, width, false, true, "0"));
++        try std.testing.expect(try copyPolicy(units, width, false, true, "1"));
++        try std.testing.expectError(error.BadQwenCopies, copyPolicy(units, width, false, true, "on"));
+     };
+     try std.testing.expectEqual(@as(u32, 16), try requested(false, null));
+     try std.testing.expectEqual(@as(u32, 16), try requested(true, null));
+-    try std.testing.expect(!try copyPolicy(false, try requested(false, null), null));
+-    try std.testing.expect(!try copyPolicy(true, try requested(true, null), null));
++    try std.testing.expect(!try copyPolicy(false, try requested(false, null), false, true, null));
++    try std.testing.expect(!try copyPolicy(true, try requested(true, null), false, true, null));
+ }
+ 
+ test "qwen27 window: the tree can use every draft row even beside copies" {

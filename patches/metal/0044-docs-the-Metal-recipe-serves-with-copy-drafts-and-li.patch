@@ -1,0 +1,49 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Jay Leaton <58495321+jayleaton@users.noreply.github.com>
+Date: Wed, 18 Nov 2026 22:33:19 +0700
+Subject: [PATCH 44/44] docs: the Metal recipe serves with copy drafts and
+ libtfgrammar
+
+--no-drafts is no longer the only mode: copies are on by default and keep the
+tokens of a --no-drafts run on the affine trees. The serve step builds
+libtfgrammar from xgrammar v0.2.8, without which required and named tool calls
+get HTTP 400, and says how --thinking-reserve keeps room for the answer when a
+thinking budget would reach max_tokens.
+---
+ docs/recipes/sensenova-loop-9b-metal.md | 16 +++++++++++++---
+ 1 file changed, 13 insertions(+), 3 deletions(-)
+
+diff --git a/docs/recipes/sensenova-loop-9b-metal.md b/docs/recipes/sensenova-loop-9b-metal.md
+index ad77016ad..2705c6507 100644
+--- a/docs/recipes/sensenova-loop-9b-metal.md
++++ b/docs/recipes/sensenova-loop-9b-metal.md
+@@ -45,16 +45,26 @@ Two mappings are not obvious and are the difference between working and garbage:
+ 
+ ```bash
+ zig build native -Dcpu=apple_m1
++git clone --branch v0.2.8 --recurse-submodules https://github.com/mlc-ai/xgrammar ../xgrammar
++zig build grammar -Dxgrammar=../xgrammar   # zig-out/native/lib/libtfgrammar.dylib
+ zig-out/native/bin/tensorfold-native serve loop9b-mlx4 --name loop9b \
+-  --context 2048 --prompt-cache-gib 0 --no-drafts
++  --context 33024 --parallel 4 --prompt-cache-gib 0
+ ```
+ 
++`libtfgrammar.dylib` serves `tool_choice` required or named and `response_format`; without it those requests get
++HTTP 400. Check: a `tool_choice: "required"` request returns `finish_reason: tool_calls`, not 400.
++
+ Load takes about 1.7 s for 4.72 GiB of weights. The model runs 56 decoder executions per token from 32 weight sets,
+ so weights are read once and the graph walks the plan: `build: plan.linear 42 slots 8 cap 2048 steps 56 mhc true`.
+ Each visit owns its KV and recurrent state, 14 attention and 42 linear slots.
+ 
+-`--no-drafts` is the only supported mode: this checkpoint ships no drafter, and the loop's second visit is not a
+-speculative path. Do not enable MTP or DFlash2 against it.
++Copy drafts are on by default: a stream drafts from its own context and the target verifies every draft, so on the
++affine q4 and q8 trees the tokens equal a `--no-drafts` run. `--no-drafts` turns them off. The checkpoint ships no MTP
++head; do not enable MTP against it.
++
++`--thinking-budget N` at or above a request's `max_tokens` never closes the thinking block before the reply runs out
++(`finish_reason: length`). Keep it under `max_tokens`, or add `--thinking-reserve N` to keep `max_tokens` for the
++answer.
+ 
+ ## Images
+ 

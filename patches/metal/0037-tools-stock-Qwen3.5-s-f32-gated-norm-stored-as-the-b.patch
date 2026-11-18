@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Jay Leaton <58495321+jayleaton@users.noreply.github.com>
 Date: Wed, 18 Nov 2026 10:59:58 +0800
-Subject: [PATCH 37/39] tools: stock Qwen3.5's f32 gated norm stored as the
+Subject: [PATCH 37/44] tools: stock Qwen3.5's f32 gated norm stored as the
  bf16 the engine reads
 
 ---

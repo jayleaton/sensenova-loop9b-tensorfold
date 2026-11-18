@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Jay Leaton <58495321+jayleaton@users.noreply.github.com>
 Date: Wed, 18 Nov 2026 05:03:25 +0800
-Subject: [PATCH 22/39] tools: the mHC router's FP64 reference and the
+Subject: [PATCH 22/44] tools: the mHC router's FP64 reference and the
  reduction orders it admits
 
 Splitting the router's reduction looked like a free path to the 83 tok/s the
@@ -27,7 +27,7 @@ diff --git a/docs/recipes/sensenova-loop-9b-metal.md b/docs/recipes/sensenova-lo
 index bac04ffae..632b607f4 100644
 --- a/docs/recipes/sensenova-loop-9b-metal.md
 +++ b/docs/recipes/sensenova-loop-9b-metal.md
-@@ -77,7 +77,22 @@
+@@ -77,7 +77,22 @@ An output a simdgroup — the same 32-lane order, run side by side — is **bit-
  the fp32 reduction order and costs parity against the reference, so it is not landed.
  
  Remaining: 33 against the 83 no-window figure. The router is one threadgroup at decode (one row), so it cannot fill

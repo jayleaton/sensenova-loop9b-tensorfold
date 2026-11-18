@@ -1,0 +1,85 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Jay Leaton <58495321+jayleaton@users.noreply.github.com>
+Date: Wed, 18 Nov 2026 19:30:19 +0800
+Subject: [PATCH 41/44] qwen27: keep every execution's state after a shared
+ round, not only the physical layers
+
+Runner.keep and the device keep walked model.weights.layers, one entry per physical
+layer, while a looped target's KV and recurrent state is indexed per execution. On a
+looped checkpoint the accepted-path commit therefore published only the first 24 GDN
+slots and 8 attention bindings of 42 and 14, leaving the second visits' state at the
+verify window's last row; the next shared round read state from rejected drafts.
+
+Both keeps now walk the executions through linear_index and attention_index (the
+device keep's attention loop walks every binding), the same indexing the verify pass
+uses. A plain config has one execution per layer, so its commit order is unchanged.
+---
+ zig/src/families/qwen27/decode_round.zig | 47 ++++++++++--------------
+ 1 file changed, 19 insertions(+), 28 deletions(-)
+
+diff --git a/zig/src/families/qwen27/decode_round.zig b/zig/src/families/qwen27/decode_round.zig
+index e7c226f3d..6f3020ae8 100644
+--- a/zig/src/families/qwen27/decode_round.zig
++++ b/zig/src/families/qwen27/decode_round.zig
+@@ -345,21 +345,17 @@ pub const Runner = struct {
+         const e = cb.compute(.serial);
+         var ended = false;
+         errdefer if (!ended) e.end(); // an encoder the pool releases unended aborts the process, and the error is lost
+-        var gi: usize = 0;
+-        var ai: usize = 0;
+-        for (r.model.weights.layers) |layer| switch (layer.mixer) {
+-            .linear => {
++        // every execution owns its state: a loop's second visit is kept as well as its first
++        for (r.linear_index, r.attention_index) |gi, ai| {
++            if (gi != std.math.maxInt(u32)) {
+                 try r.gdn.commit(gi, .{ .host = recurrent, .metadata = r.metadata() }, e);
+-                gi += 1;
+-            },
+-            .attention => {
+-                var views: [attn.planning.max_streams]attn.Cache = undefined;
+-                const caches = r.layerCaches(ai, round, &views);
+-                const kept = try r.bindings[ai].uploadKeep(attention_plan, caches, paths);
+-                try r.attention.keep(e, &r.scratch, &r.bindings[ai], kept, caches);
+-                ai += 1;
+-            },
+-        };
++                continue;
++            }
++            var views: [attn.planning.max_streams]attn.Cache = undefined;
++            const caches = r.layerCaches(ai, round, &views);
++            const kept = try r.bindings[ai].uploadKeep(attention_plan, caches, paths);
++            try r.attention.keep(e, &r.scratch, &r.bindings[ai], kept, caches);
++        }
+         e.end();
+         ended = true;
+         cb.commit();
+@@ -413,20 +409,15 @@ pub const Runner = struct {
+         e.barrier();
+         for (0..r.gdn.budget.layers) |gi| try r.gdn.commitPublish(gi, plan, e);
+         e.barrier();
+-        var ai: usize = 0;
+-        for (r.model.weights.layers) |layer| switch (layer.mixer) {
+-            .linear => {},
+-            .attention => {
+-                var views: [attn.planning.max_streams]attn.Cache = undefined;
+-                const caches = r.layerCaches(ai, round, &views);
+-                try r.bindings[ai].admitDeviceKeep(attention_plan, caches, p.rows);
+-                const map = r.bindings[ai].get(.keep_map);
+-                try ops.metadata(e, result, keep_ref, rows, .{ .buf = map.buffer, .off = map.offset }, p);
+-                e.barrier();
+-                try r.attention.keep(e, &r.scratch, &r.bindings[ai], p.rows, caches);
+-                ai += 1;
+-            },
+-        };
++        for (0..r.bindings.len) |ai| { // one binding per attention execution, a loop's second visits included
++            var views: [attn.planning.max_streams]attn.Cache = undefined;
++            const caches = r.layerCaches(ai, round, &views);
++            try r.bindings[ai].admitDeviceKeep(attention_plan, caches, p.rows);
++            const map = r.bindings[ai].get(.keep_map);
++            try ops.metadata(e, result, keep_ref, rows, .{ .buf = map.buffer, .off = map.offset }, p);
++            e.barrier();
++            try r.attention.keep(e, &r.scratch, &r.bindings[ai], p.rows, caches);
++        }
+     }
+ 
+     pub fn completeDeviceKeep(r: *Runner, round: *const Round, path: []const u32) !void {

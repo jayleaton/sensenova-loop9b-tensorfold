@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Jay Leaton <58495321+jayleaton@users.noreply.github.com>
 Date: Wed, 18 Nov 2026 03:51:48 +0800
-Subject: [PATCH 12/39] qwen27: fold the window's pending residual in the live
+Subject: [PATCH 12/44] qwen27: fold the window's pending residual in the live
  buffer
 
 The fold staged into frame.hidden even after the norm's swap had made the live

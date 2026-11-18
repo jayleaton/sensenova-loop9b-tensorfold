@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Jay Leaton <58495321+jayleaton@users.noreply.github.com>
 Date: Wed, 18 Nov 2026 04:49:14 +0800
-Subject: [PATCH 19/39] docs: p0 sits on the model's own noise floor
+Subject: [PATCH 19/44] docs: p0 sits on the model's own noise floor
 
 The prose prompt's 19/64 is exactly transformers' own fp32-versus-bf16
 agreement on the same weights (39, 48, 19 across the three prompts), so that
@@ -16,7 +16,7 @@ diff --git a/docs/recipes/sensenova-loop-9b-metal.md b/docs/recipes/sensenova-lo
 index dce07a03b..46927f8e0 100644
 --- a/docs/recipes/sensenova-loop-9b-metal.md
 +++ b/docs/recipes/sensenova-loop-9b-metal.md
-@@ -85,13 +85,17 @@
+@@ -85,13 +85,17 @@ Compared against transformers at the pinned revision, run on the **same 4-bit we
  | arithmetic reasoning | **64/64** |
  | plain prose | 19/64 |
  

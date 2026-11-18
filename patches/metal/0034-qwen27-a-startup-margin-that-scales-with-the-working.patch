@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Jay Leaton <58495321+jayleaton@users.noreply.github.com>
 Date: Wed, 18 Nov 2026 10:43:21 +0800
-Subject: [PATCH 34/39] qwen27: a startup margin that scales with the working
+Subject: [PATCH 34/44] qwen27: a startup margin that scales with the working
  set, a looped model's every execution charged
 
 The fixed 8 GiB margin refused every 16 GB and 8 GB Mac whatever the weights. The margin is now an eighth of

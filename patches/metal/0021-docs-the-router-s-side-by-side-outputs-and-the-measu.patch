@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Jay Leaton <58495321+jayleaton@users.noreply.github.com>
 Date: Wed, 18 Nov 2026 04:58:35 +0800
-Subject: [PATCH 21/39] docs: the router's side-by-side outputs, and the
+Subject: [PATCH 21/44] docs: the router's side-by-side outputs, and the
  measured cost that remains
 
 Decode 33.19 tok/s through the served API against 123.7 for the plain control and
@@ -17,7 +17,7 @@ diff --git a/docs/recipes/sensenova-loop-9b-metal.md b/docs/recipes/sensenova-lo
 index 46927f8e0..bac04ffae 100644
 --- a/docs/recipes/sensenova-loop-9b-metal.md
 +++ b/docs/recipes/sensenova-loop-9b-metal.md
-@@ -61,18 +61,23 @@
+@@ -61,18 +61,23 @@ Through the served API with `tools/bench_openai.py`, 64 tokens, two repetitions,
  
  | metric | looped | plain 32-layer control |
  | --- | --- | --- |

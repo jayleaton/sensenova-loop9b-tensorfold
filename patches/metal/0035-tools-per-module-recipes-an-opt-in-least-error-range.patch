@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Jay Leaton <58495321+jayleaton@users.noreply.github.com>
 Date: Wed, 18 Nov 2026 10:44:13 +0800
-Subject: [PATCH 35/39] tools: per-module recipes, an opt-in least-error range
+Subject: [PATCH 35/44] tools: per-module recipes, an opt-in least-error range
  search, and MLX's bitstream for 3, 5 and 6-bit codes
 
 The converter packed whole codes a word, which is right only for 2, 4 and 8 bits; MLX packs a continuous

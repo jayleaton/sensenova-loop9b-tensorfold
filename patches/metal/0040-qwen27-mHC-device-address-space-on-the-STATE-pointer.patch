@@ -1,0 +1,32 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Jay Leaton <58495321+jayleaton@users.noreply.github.com>
+Date: Wed, 18 Nov 2026 18:41:58 +0700
+Subject: [PATCH 40/44] qwen27 mHC: device address space on the STATE pointers,
+ so MSL 4.0 and 3.2 compile it
+
+---
+ zig/kernels/metal/qwen27/mhc.metal | 4 ++--
+ 1 file changed, 2 insertions(+), 2 deletions(-)
+
+diff --git a/zig/kernels/metal/qwen27/mhc.metal b/zig/kernels/metal/qwen27/mhc.metal
+index 50aac32fc..fd2a53291 100644
+--- a/zig/kernels/metal/qwen27/mhc.metal
++++ b/zig/kernels/metal/qwen27/mhc.metal
+@@ -84,7 +84,7 @@ template <uint FS>
+   threadgroup_barrier(mem_flags::mem_threadgroup);
+   // the merge kernel reads these later, so device memory gets its own copy after the shared ones are final
+   if (tid == 0) {
+-    float* st = STATE + uint64_t(row) * n;
++    device float* st = STATE + uint64_t(row) * n;
+     for (uint i = 0; i < n; ++i) st[i] = coef[i];
+   }
+   for (uint d = tid; d < H; d += 256u) {
+@@ -109,7 +109,7 @@ kernel void tf_mhc_merge(device const bfloat* BRANCH [[buffer(0)]],
+                          uint2 at [[thread_position_in_grid]]) {
+   const uint row = at.y, d = at.x, S = FS != 0u ? FS : a.streams, H = a.hidden;
+   if (d >= H || S != a.streams) return;
+-  const float* st = STATE + uint64_t(row) * a.outs;
++  const device float* st = STATE + uint64_t(row) * a.outs;
+   const float b = float(BRANCH[row * H + d]);
+   float ins[4];
+   for (uint t = 0; t < S; ++t) ins[t] = float(HS[row * S * H + t * H + d]);

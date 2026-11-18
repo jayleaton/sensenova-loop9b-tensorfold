@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Jay Leaton <58495321+jayleaton@users.noreply.github.com>
 Date: Wed, 18 Nov 2026 02:06:09 +0800
-Subject: [PATCH 04/39] tools: fold Qwen3.5's zero-centred norm weights
+Subject: [PATCH 04/44] tools: fold Qwen3.5's zero-centred norm weights
 
 Qwen3_5RMSNorm stores a zero-initialized weight and multiplies by (1 + w);
 Qwen3_5RMSNormGated (linear_attn.norm) multiplies by w alone. The converter

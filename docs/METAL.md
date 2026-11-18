@@ -7,8 +7,8 @@ checkpoint. The series also carries the recipe TensorFold keeps for it,
 | | |
 | --- | --- |
 | Hardware | Mac Studio M5 Ultra, macOS 27.2 |
-| Engine | upstream TensorFold `6d0a128b0cde35aa091bda933577cfced3519b8a` (on `main`, 2026-11-17) + [`patches/metal/`](../patches/metal/) `0001`-`0039` |
-| Engine tree | `bd326a4c58374fa9063f4e011e6004696ee53640`: the measured text engine (`0001`-`0025`), the image path (`0026`-`0033`), small-Mac support (`0034`-`0038`) and `0039`'s formatting fixes |
+| Engine | upstream TensorFold `6d0a128b0cde35aa091bda933577cfced3519b8a` (on `main`, 2026-11-17) + [`patches/metal/`](../patches/metal/) `0001`-`0044` |
+| Engine tree | `d33e2d93ea37f0b3ed1f208599a24ac00b3de16e`: the text engine (`0001`-`0025`), the image path (`0026`-`0033`), small-Mac support (`0034`-`0038`), `0039`'s formatting fixes, and macOS 26 support, multi-stream state and copy drafts (`0040`-`0043`), and the engine recipe's serve step (`0044`) |
 | Weights | MLX affine 4-bit g64, vision tower bf16 ([CONVERT](CONVERT.md)) |
 
 ## Build
@@ -33,7 +33,7 @@ which runs, with the profile in [`config/metal/serve.args`](../config/metal/serv
 
 ```bash
 engine-metal/zig-out/native/bin/tensorfold-native serve loop9b-mlx4 --name loop9b --port 8090 \
-  --context 2048 --prompt-cache-gib 0 --no-drafts
+  --context 33024 --parallel 4 --prompt-cache-gib 0
 ```
 
 The converted tree carries the vision tower (5.57 GiB in all); without `--vision` the tower is not loaded. The text
@@ -42,8 +42,33 @@ numbers below were measured on a text-only tree of 4.72 GiB. Load takes about 1.
 and 42 linear slots. Raise `--context` for longer prompts; admission caps it at 262,144 although the checkpoint
 advertises 524,288 positions.
 
-`--no-drafts` is the only supported mode: the checkpoint ships no drafter, and the loop's second visit is not a
-speculative path. Do not enable MTP or DFlash2 against it.
+**Copy drafts are on by default** (`0042`, `0043`): a stream drafts from its own context when it repeats text, and the
+target verifies every draft, so the tokens are the same with drafts on or off. The startup log says `lane copies=on`;
+`--no-drafts` turns them off (`lane copies=off`). The checkpoint ships no MTP head; do not enable MTP against it.
+
+`tool_choice: "required"`, a named function and `response_format` need `libtfgrammar.dylib` beside the server; without
+it those requests get HTTP 400 and everything else is served. Build it from xgrammar v0.2.8:
+
+```bash
+git clone --branch v0.2.8 --recurse-submodules https://github.com/mlc-ai/xgrammar.git xgrammar-src
+(cd engine-metal && zig build grammar -Dxgrammar="$PWD/../xgrammar-src")   # zig-out/native/lib/libtfgrammar.dylib
+```
+
+Check it: a request with tools and `"tool_choice": "required"` returns `finish_reason: "tool_calls"`, not HTTP 400.
+
+```bash
+curl -s http://127.0.0.1:8090/v1/chat/completions -H 'Content-Type: application/json' -d '{"model": "loop9b",
+  "messages": [{"role": "user", "content": "Look up the population of Paris."}], "tool_choice": "required",
+  "tools": [{"type": "function", "function": {"name": "lookup", "parameters": {"type": "object",
+    "properties": {"q": {"type": "string"}}, "required": ["q"]}}}],
+  "chat_template_kwargs": {"enable_thinking": false}}' | python3 -c 'import json,sys; print(json.load(sys.stdin)["choices"][0]["finish_reason"])'
+```
+
+**Thinking budget and answer room.** `--thinking-budget N` closes the thinking block after N reasoning tokens, but
+`max_tokens` counts reasoning and answer together: a budget at or above the request's `max_tokens` never closes
+before the reply runs out, so the reply ends with `finish_reason: "length"` and no answer. Keep the budget well under
+`max_tokens`, or add `--thinking-reserve N`, which keeps the request's `max_tokens` for the answer and lets reasoning
+take up to N tokens more (capped by the context window). The startup log says which of the two `max_tokens` means.
 
 ## Images
 
@@ -108,9 +133,46 @@ checks.
 
 ## Results
 
+### Copy drafts
+
+Mac Studio M5 Ultra, 4-bit, the profile above (`--parallel 4`), greedy chat, `enable_thinking: false`, 256 tokens a
+reply, streamed. tok/s is the reply's own decode rate:
+
+| chats at once | prompt | drafts off | copy drafts | gain |
+| --- | --- | ---: | ---: | ---: |
+| 1 | story | 59.6 | 59.7 | 1.00x |
+| 1 | repeat a paragraph | 59.5 | **362.3** | **6.08x** |
+| 1 | code edit (rename a variable, return the file) | 59.5 | **87.4** | **1.47x** |
+| 1 | prose | 59.6 | **94.0** | **1.58x** |
+| 2 | repeat / code edit / prose | 58.9 / 58.5 / 58.9 | 326.7 / 85.0 / 92.0 | 5.5x / 1.45x / 1.56x |
+| 4 | story | 56.8 | 55.1 | 0.97x |
+| 4 | repeat / code edit / prose | 57.9 / 55.8 / 56.1 | 268.0 / 82.7 / 82.6 | 4.6x / 1.48x / 1.47x |
+
+All 16 reply pairs (4 prompts at 1, 2 and 4 chats, and at `--parallel 1`) are token-identical between drafts on and
+off. Free-form text that never repeats gains nothing and loses at most 3% at four chats.
+
+### Tool calls and reasoning
+
+With `libtfgrammar.dylib`: 10/10 tool-call cases (required, auto with and without a call, named, two calls in one turn,
+a multi-turn call chain, and auto at 8K, 32K and 64K prompts) and 4/4 with four chats taking a tool turn at once; every
+call parsed and named an offered tool. `--thinking-budget N` is honoured: a prompt that reasoned past a 2,048-token
+reply without answering answers within budgets of 256 and 1,024.
+
+### Other Macs
+
+| Mac | memory | decode, 4-bit, one chat | note |
+| --- | ---: | ---: | --- |
+| Mac Studio M5 Ultra | 96 GB | 59.5-60.0 tok/s | the numbers on this page |
+| MacBook Pro M4 Pro (20-core GPU) | 24 GB | 26.7 tok/s | macOS 26.3, drafts off; measured on the development branch these patches come from; needs `0040` |
+
+On macOS 26 and 15 the Metal compiler (MSL 4.0 and 3.2) refused the mHC library until `0040` declared its state
+pointers `device`; no arithmetic changed.
+
+### Text fidelity and speed, drafts off
+
 Measured on a Mac Studio M5 Ultra (macOS 27.2), 4-bit, drafts off.
 
-### Task gate
+#### Task gate
 
 Against transformers at the pinned revision, run on the **same 4-bit weights** (`attn_implementation=sdpa`), 64
 greedy tokens from three fixed prompts:
@@ -126,7 +188,7 @@ reference itself diverges from its fp32 twin at the same token, so 19/64 there i
 defect. Its per-execution error curve is continuous rather than stepped, like the prompts that pass. A 512-token prompt
 agrees for 14 of its first 16 tokens. Going above that floor would need the fp32 run as the reference.
 
-### Speed
+#### Speed
 
 Cold prefill through the served API, `--prompt-cache-gib 0`, `max_tokens 1`, counting only requests that report
 `cached_tokens 0`; one fresh server per arm, chunk 2048 (the M5 default), 2 repetitions that agree to 0.3%. Prompts are

@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Jay Leaton <58495321+jayleaton@users.noreply.github.com>
 Date: Wed, 18 Nov 2026 09:36:36 +0800
-Subject: [PATCH 25/39] docs: SenseNova-Loop-9B cold prefill at 512 to 32k, its
+Subject: [PATCH 25/44] docs: SenseNova-Loop-9B cold prefill at 512 to 32k, its
  controls, and the router's bit-identical speedup
 
 ---
@@ -23,7 +23,7 @@ index 632b607f4..72bbd67af 100644
  
  ## The model
  
-@@ -55,44 +55,56 @@
+@@ -55,44 +55,56 @@ Each visit owns its KV and recurrent state, 14 attention and 42 linear slots.
  `--no-drafts` is the only supported mode: this checkpoint ships no drafter, and the loop's second visit is not a
  speculative path. Do not enable MTP or DFlash2 against it.
  
@@ -108,7 +108,7 @@ index 632b607f4..72bbd67af 100644
  
  ## Fidelity
  
-@@ -122,7 +134,7 @@
+@@ -122,7 +134,7 @@ recipe measures against.
  - images and video: the 27-block vision tower is not converted or loaded, and image parts are refused.
  - contexts past 262144: the checkpoint advertises 524288 positions, but admission caps at 262144.
  - concurrent streams: every number here is one stream.
