@@ -31,7 +31,7 @@ More in [CREDITS](docs/CREDITS.md); license terms in [LICENSING](docs/LICENSING.
 | Architecture | Qwen3.5 dense hybrid attention; physical layers `[4, 28)` run twice (56 executions from 32 weight sets), wrapped in a two-stream mHC ([MODEL](docs/MODEL.md)) |
 | Weights served | MLX affine g64, 4-bit (or 8-bit), converted with [`tools/sensenova_loop_mlx.py`](docs/CONVERT.md) from the patch series |
 | CUDA | 1x DGX Spark (GB10), TP=1: upstream TensorFold [`038e4a278`](config/cuda/tensorfold.rev) + [`patches/cuda/`](patches/cuda/) `0001`-`0009` |
-| Metal | Mac Studio M5 Ultra: upstream TensorFold [`6d0a128b0`](config/metal/tensorfold.rev) + [`patches/metal/`](patches/metal/) `0001`-`0034` |
+| Metal | Mac Studio M5 Ultra: upstream TensorFold [`6d0a128b0`](config/metal/tensorfold.rev) + [`patches/metal/`](patches/metal/) `0001`-`0039` |
 | Input | text on both; **images on Metal** ([METAL](docs/METAL.md#images)); CUDA images [in progress](#in-progress) |
 
 The two series sit on different upstream commits, so each backend keeps its own pin. Each pin is the upstream commit
@@ -60,6 +60,10 @@ pin, but that tree has not been measured. See [ENGINE](docs/ENGINE.md).
 blocks track the reference within 0.2% rms, M-RoPE positions match `get_rope_index` on 513 of 513 cells, and it reads
 all seven labels of a benchmark chart. Asked to name models on a chart with no legend, it invents names
 ([METAL](docs/METAL.md#images)).
+
+**Small Macs.** A 16 GB Mac runs the same 4-bit tree: 5.07 GB on disk, peak 7.60 / 7.82 / 9.13 GiB at 4k / 8k /
+32k, 2,719 tok/s prefill at 8k and 58 tok/s decode, measured on the M5 Ultra with Metal's working set capped to a
+16 GB Mac's. 8 GB Macs are not yet supported ([METAL](docs/METAL.md#small-macs)).
 
 **Quantized on CUDA:** q8 cosine 0.980 with 18/31 greedy agreement, q4 19/31. A stock
 `mlx-community/Qwen3.5-2B-MLX-4bit` through the same binary scores cosine 0.927 and 4/15 against its own BF16, so this

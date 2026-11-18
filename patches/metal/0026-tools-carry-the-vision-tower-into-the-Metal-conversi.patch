@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Jay Leaton <58495321+jayleaton@users.noreply.github.com>
 Date: Wed, 18 Nov 2026 08:59:52 +0800
-Subject: [PATCH 26/34] tools: carry the vision tower into the Metal conversion
+Subject: [PATCH 26/39] tools: carry the vision tower into the Metal conversion
 
 The 4-bit conversion dropped model.visual.*, so --vision had no tower to load.
 The 333 tensor tower is Qwen3.5-VL's and qwen_vl reads it through the mlx-vlm

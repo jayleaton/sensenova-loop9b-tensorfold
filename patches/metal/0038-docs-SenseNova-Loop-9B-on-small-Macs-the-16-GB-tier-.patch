@@ -1,0 +1,114 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Jay Leaton <58495321+jayleaton@users.noreply.github.com>
+Date: Wed, 18 Nov 2026 11:23:16 +0800
+Subject: [PATCH 38/39] docs: SenseNova-Loop-9B on small Macs, the 16 GB tier
+ is q4 and no 2-bit pack passes for 8 GB
+
+---
+ docs/recipes/sensenova-loop-9b-metal.md | 68 +++++++++++++++++++++++++
+ docs/small-quant-candidates.md          |  9 +++-
+ 2 files changed, 75 insertions(+), 2 deletions(-)
+
+diff --git a/docs/recipes/sensenova-loop-9b-metal.md b/docs/recipes/sensenova-loop-9b-metal.md
+index 9e382b326..ad77016ad 100644
+--- a/docs/recipes/sensenova-loop-9b-metal.md
++++ b/docs/recipes/sensenova-loop-9b-metal.md
+@@ -210,6 +210,74 @@
+ Known gap: raising the engine above that floor would need the reference to be the fp32 run, not the bf16 one this
+ recipe measures against.
+ 
++## Small Macs
++
++16 GB Macs run the existing 4-bit checkpoint. No pack ships for 8 GB Macs: the only recipes that fit, at 2 bits,
++lose the task on code and reasoning, and a stock Qwen3.5-9B converted the same way loses it just as badly.
++
++| tier | recipe | ships | disk | 4k | 8k | 32k |
++| --- | --- | --- | --- | --- | --- | --- |
++| 16 GB | `q4` (no recipe) | **yes** | 5.07 GB | 7.60 GiB | 7.82 GiB | 9.13 GiB |
++| 16 GB | `s16.json` | no: q4 matches its quality at twice the prefill | 5.70 GB | 8.22 GiB | 8.43 GiB | 9.75 GiB |
++| 8 GB | `s8-b.json` | no: wrong code and reasoning | 3.23 GB | 4.65 GiB | refused | refused |
++| 8 GB | `s8-d.json` | no: repeats itself on code | 3.02 GB | 4.45 GiB | 4.67 GiB | refused |
++
++Memory is the peak process footprint (`tensorfold:process_footprint_peak_bytes`) after one request of about half the
++context. Each run uses `--parallel 1 --prompt-cache-gib 0 --no-drafts`, with the working set capped by
++`TF_QWEN27_WORKING_SET_BYTES` to what Metal grants a 16 GB Mac (11453251584) or an 8 GB Mac (5726623744). The 16 GB
++runs pick 512 prompt rows; the 8 GB runs pick 128. RSS stays flat per pack (q4 5.07, s16 5.68, s8-b 3.36,
++s8-d 3.17 GiB) because the KV and prompt scratch are GPU-private. "refused" means startup refuses the context
++beside the weights and the margin. The targets are about 10.5 GB at 8k and about 5.0 GB at 4k. Both 16 GB packs
++are well under the target, and both 8 GB packs fit at 4k.
++
++### Convert
++
++```bash
++python3 tools/sensenova_loop_mlx.py --source SenseNova-Loop-9B --out loop9b-mlx4
++python3 tools/sensenova_loop_mlx.py --source SenseNova-Loop-9B --out loop9b-s16 \
++  --recipe docs/small-quant-recipes/s16.json --clip-search 10
++```
++
++`docs/small-quant-candidates.md` lists each recipe's per-module widths. The same command converts stock
++`Qwen/Qwen3.5-9B` for the control.
++
++### Quality
++
++Each figure is teacher-forced top-1 agreement over 64 positions on the three fixed prompts (prose, code,
++reasoning), against each model's own BF16 continuation. The SenseNova reference comes from transformers. The
++control's reference comes from stock BF16 run greedily through transformers on MPS.
++
++| recipe | SenseNova vs BF16 | SenseNova vs q4 | stock Qwen3.5-9B vs BF16 |
++| --- | --- | --- | --- |
++| `q4` | 57 / 62 / 61 | - | 64 / 64 / 58 |
++| `s16` | 58 / 61 / 62 | 57 / 56 / 62 | - |
++| `s8-b` | 50 / 44 / 53 | 55 / 36 / 54 | 64 / 44 / 44 |
++| `s8-d` | 52 / 38 / 47 | 48 / 25 / 47 | 61 / 45 / 44 |
++
++Prose / code / reasoning, out of 64. At 2 bits the loss on code and reasoning matches the control's, so it is normal
++2-bit loss, not something the loop adds. It is still a collapse. Free-running greedy on `def fib(n): ... return`
++gives `fib(n-1)` with unclosed calls (`s8-b`) or `None` and the function repeated (`s8-d`, and the stock `s8-b`).
++On the train question, `s8-b` invents answer choices. 3 bits fits neither tier: about 3.9 GB of weights plus about
++1.85 GiB of 4k overhead is over the 8 GB budget. `s16` adds nothing over q4 that the gate can resolve.
++
++### Speed
++
++Measured on the M5 Ultra at its own working set. Prefill is cold CLI prefill (`tf-qwen27-run`, chunk 2048).
++TTFT is a served streaming request that follows a short unrelated one, with `--context 33024 --parallel 1`.
++Decode is a served stream of 256 tokens. Each is 2 repetitions, which agree to 0.5% for prefill and TTFT and to
++4% for decode.
++
++| recipe | prefill 4k / 8k / 32k tok/s | TTFT 4k / 8k / 32k | decode tok/s |
++| --- | --- | --- | --- |
++| `q4` | 2754 / 2719 / 2465 | 1.50 / 3.04 / 13.35 s | 58 |
++| `s16` | 1409 / 1394 / 1327 | 2.89 / 5.81 / 24.47 s | 49 |
++| `s8-b` | 844 / 839 / 815 | 4.84 / 9.70 / 40.07 s | 46 |
++| `s8-d` | 836 / 833 / 808 | 4.91 / 9.85 / 40.58 s | 45 |
++
++Only 4-bit group-64 weights take the tuned prompt and decode kernels (`projection.zig`, `quant_gpu.zig`). Every
++other width falls back to the general path, so fewer bits run slower. A fast 2- or 3-bit prompt kernel would be
++needed before a smaller pack could win on speed. That still would not fix the quality loss above.
++
+ ## What is not covered
+ 
+ - video: the processor's video path is not wired, and video parts are refused.
+diff --git a/docs/small-quant-candidates.md b/docs/small-quant-candidates.md
+index 072f42649..c2b948762 100644
+--- a/docs/small-quant-candidates.md
++++ b/docs/small-quant-candidates.md
+@@ -24,8 +24,8 @@
+   squared error after bf16 rounding of scale and bias. 0 (default) reproduces the previous min/max quantizer.
+ - 3, 5 and 6-bit codes are packed as MLX's continuous little-endian bitstream (codes cross u32 edges); 2, 4 and
+   8-bit output is unchanged. Earlier commits packed 3/5/6-bit wrongly; use this branch.
+-- MTP (`mtp.`), vision (`model.visual.`) and `loop_gate` tensors are skipped. The same script converts stock
+-  `Qwen/Qwen3.5-9B` for the control.
++- MTP (`mtp.`) and `loop_gate` tensors are skipped; the vision tower is written as bf16 `vision_tower.*`. The same
++  script converts stock `Qwen/Qwen3.5-9B` for the control.
+ 
+ All groups are 64. The mHC routers (f32), norms, `A_log`, `dt_bias` and `conv1d` stay unquantized.
+ 
+@@ -52,3 +52,8 @@
+ Teacher-forced top-1 agreement over 64 positions on the three gate prompts (`p0-plain`, `p1-code`, `p2-reason`)
+ against the BF16 reference continuation. Metal q4 against BF16: plain 57/64, code 62/64, reasoning 61/64. Control:
+ stock Qwen3.5-9B through the same converter and recipe against its own BF16 continuation.
++
++## Outcome
++
++Measured on Metal: the 16 GB tier ships as the existing `q4`, and no 8 GB tier ships. The numbers are in the
++"Small Macs" section of `docs/recipes/sensenova-loop-9b-metal.md`.

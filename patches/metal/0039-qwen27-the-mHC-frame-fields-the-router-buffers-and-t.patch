@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Jay Leaton <58495321+jayleaton@users.noreply.github.com>
 Date: Wed, 18 Nov 2026 09:52:00 +0700
-Subject: [PATCH 34/34] qwen27: the mHC frame fields, the router buffers and
+Subject: [PATCH 39/39] qwen27: the mHC frame fields, the router buffers and
  their checks as zig fmt writes them
 
 Formatting and comments only, the same tokens: the frame's Field enum stays on

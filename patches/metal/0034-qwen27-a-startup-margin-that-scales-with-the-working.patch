@@ -1,0 +1,235 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Jay Leaton <58495321+jayleaton@users.noreply.github.com>
+Date: Wed, 18 Nov 2026 10:43:21 +0800
+Subject: [PATCH 34/39] qwen27: a startup margin that scales with the working
+ set, a looped model's every execution charged
+
+The fixed 8 GiB margin refused every 16 GB and 8 GB Mac whatever the weights. The margin is now an eighth of
+Metal's working set, 1 GiB at least and 8 GiB from a 64 GiB set, so the largest Macs keep theirs; a served request
+measured 0.53 GiB of footprint beyond the device's own count. The fit counts KV and recurrent state per execution,
+and a frame that cannot fit 512 rows steps down to 128 before it refuses.
+---
+ zig/src/families/qwen27/prompt_memory.zig | 23 ++++---
+ zig/src/native/qwen27_served.zig          |  6 +-
+ zig/src/qwen27_memory_test.zig            | 81 +++++++++++++++++------
+ 3 files changed, 78 insertions(+), 32 deletions(-)
+
+diff --git a/zig/src/families/qwen27/prompt_memory.zig b/zig/src/families/qwen27/prompt_memory.zig
+index 2de2cbb07..16adbf08a 100644
+--- a/zig/src/families/qwen27/prompt_memory.zig
++++ b/zig/src/families/qwen27/prompt_memory.zig
+@@ -5,7 +5,11 @@ const frame = @import("gpu_frame.zig");
+ const planning = @import("attention_plan.zig");
+ const Budget = @import("gdn_pool.zig").Budget;
+ 
+-const margin: usize = 8 << 30;
++pub fn margin(set: usize) usize {
++    return std.math.clamp(set / 8, 1 << 30, 8 << 30);
++}
++
++pub const least_rows: u32 = 128;
+ /// RAM a suggested wired limit leaves outside the GPU for macOS and other processes.
+ const floor: usize = 4 << 30;
+ 
+@@ -22,8 +26,8 @@ pub fn frameBytes(c: Config, rows: u32) usize {
+ /// Frame bytes already belong to the model; these are the runner's future bytes at its peak (`planes`: its tap planes).
+ pub fn runnerBytes(c: Config, context: u32, slots: u32, rows: u32, shared: bool, ring: usize, planes: usize) !usize {
+     var attention: usize = 0;
+-    for (0..c.layers) |i| attention += @intFromBool(c.kind(i) == .attention);
+-    const linear = c.layers - attention;
++    for (0..c.steps()) |e| attention += @intFromBool(c.kind(c.physical(e)) == .attention);
++    const linear = c.steps() - attention;
+     const g = try planning.Geometry.fromConfig(c, shared);
+     const limits = .{ .rows = rows, .streams = slots, .keys = context, .shared_prefix = shared, .geometry = g };
+     const scratch = @import("attention_memory.zig").Layout.init(limits);
+@@ -51,8 +55,10 @@ pub const Fit = struct {
+     }
+ 
+     pub fn choose(f: Fit, requested: u32, explicit: bool) !u32 {
+-        if (explicit or requested <= 512) return requested;
+-        return if (try f.cost(requested, f.slots) <= f.left) requested else 512;
++        if (explicit) return requested;
++        var rows = if (requested <= 512 or try f.cost(requested, f.slots) <= f.left) requested else 512;
++        while (rows > least_rows and try f.cost(rows, f.slots) > f.left) rows /= 2;
++        return @max(rows, @min(requested, least_rows));
+     }
+ 
+     pub fn streams(f: Fit, rows: u32, fixed: bool) !u32 {
+@@ -75,12 +81,13 @@ pub fn workingSet(real: usize, text: ?[]const u8) !usize {
+ 
+ /// The same margin guards startup, cache growth and the first use of a later slot.
+ pub fn room(real: usize, used: usize, cap: ?[]const u8) !usize {
+-    return (try workingSet(real, cap)) -| used -| margin;
++    const set = try workingSet(real, cap);
++    return set -| used -| margin(set);
+ }
+ 
+ /// The iogpu.wired_limit_mb that fits `need` beside `used` and the margin while leaving the floor; null if RAM cannot.
+ pub fn wiredRaise(used: usize, need: usize, ram: usize) ?usize {
+-    const total = used +| need +| margin;
++    const total = used +| need +| margin(ram -| floor);
+     const mb = std.math.divCeil(usize, total, 1 << 20) catch unreachable;
+     return if (mb *| (1 << 20) <= ram -| floor) mb else null;
+ }
+@@ -103,7 +110,7 @@ pub const Advice = union(enum) {
+ /// What a refusal should advise for one stream, from the set and margin the startup room counted.
+ pub fn advice(real: usize, used: usize, cap: ?[]const u8, one: usize, ram: ?usize) Advice {
+     const set = workingSet(real, cap) catch return .lower;
+-    if (set != real or one <= set -| used -| margin) return .lower;
++    if (set != real or one <= set -| used -| margin(set)) return .lower;
+     if (ram) |r| if (wiredRaise(used, one, r)) |mb| return .{ .raise = .{ .set = set, .mb = mb } };
+     return .{ .no_raise = ram };
+ }
+diff --git a/zig/src/native/qwen27_served.zig b/zig/src/native/qwen27_served.zig
+index ecde8c3e4..232681da8 100644
+--- a/zig/src/native/qwen27_served.zig
++++ b/zig/src/native/qwen27_served.zig
+@@ -193,7 +193,7 @@ fn shareRoom(h: *const Host, why: *[]const u8) !u64 {
+     return share_fit.room(cache_fit.ram(), cache_fit.footprint(), try laterFootprint(h), guards);
+ }
+ 
+-/// Room left beside the weights and an 8 GiB margin.
++/// Room left beside the weights and the working set's margin.
+ fn room(model: *const q.model.Model) usize {
+     const dev = model.device;
+     return q.prompt_memory.room(dev.maxWorkingSet(), dev.allocated(), cap()) catch 0;
+@@ -210,7 +210,7 @@ fn takeRoom(cache: ?*pc.Store, free: usize, bytes: usize, restoring: ?pc.Saved,
+     const ok = if (cache) |c| c.giveBack(restoring, prompt, Left{ .room = free, .store = c, .held = held, .bytes = bytes }) else free >= bytes;
+     const freed = held - (if (cache) |c| c.held else 0);
+     if (!builtin.is_test and freed > 0) std.log.info("Qwen3.8-27B: kept prompt states gave {d:.1} GiB back for a stream's slot", .{cache_fit.gibs(freed)});
+-    if (!builtin.is_test and !ok) std.log.info("Qwen3.8-27B: a slot needs {d:.1} GiB and {d:.1} GiB is free beside the weights and an 8 GiB margin: the request waits for a stream to end", .{ cache_fit.gibs(bytes), cache_fit.gibs(free + freed) });
++    if (!builtin.is_test and !ok) std.log.info("Qwen3.8-27B: a slot needs {d:.1} GiB and {d:.1} GiB is free beside the weights and the margin: the request waits for a stream to end", .{ cache_fit.gibs(bytes), cache_fit.gibs(free + freed) });
+     return ok;
+ }
+ 
+@@ -353,7 +353,7 @@ pub fn attach(parent: Allocator, io: std.Io, model: *q.model.Model, drafter: ?*q
+         const dev = model.device;
+         const ram: ?usize = if (cache_fit.ram()) |r| @intCast(r) else null;
+         const tail = memory.advice(dev.maxWorkingSet(), dev.allocated(), cap(), try fit_prompt.cost(rows, 1), ram);
+-        why.* = try std.fmt.allocPrint(a, "--parallel {d} needs {d:.1} GiB for its streams and {d}-row prompt scratch at a {d}-token context; {d:.1} GiB remains beside the weights and an 8 GiB margin{f}", .{ o.streams, cache_fit.gibs(try fit_prompt.cost(rows, @max(o.streams, 1))), rows, capacity, cache_fit.gibs(fit_prompt.left), tail });
++        why.* = try std.fmt.allocPrint(a, "--parallel {d} needs {d:.1} GiB for its streams and {d}-row prompt scratch at a {d}-token context; {d:.1} GiB remains beside the weights and a {d:.1} GiB margin{f}", .{ o.streams, cache_fit.gibs(try fit_prompt.cost(rows, @max(o.streams, 1))), rows, capacity, cache_fit.gibs(fit_prompt.left), cache_fit.gibs(memory.margin(memory.workingSet(dev.maxWorkingSet(), cap()) catch dev.maxWorkingSet())), tail });
+         return err;
+     };
+     if (model.frame.capacity != rows) {
+diff --git a/zig/src/qwen27_memory_test.zig b/zig/src/qwen27_memory_test.zig
+index 1864580ba..c7cbe9024 100644
+--- a/zig/src/qwen27_memory_test.zig
++++ b/zig/src/qwen27_memory_test.zig
+@@ -67,57 +67,96 @@ test "qwen27 memory: the development working-set cap cannot raise real capacity"
+     for ([_][]const u8{ "", "0", "-1", "1.5", "18446744073709551616" }) |text| try std.testing.expectError(error.BadWorkingSetCap, memory.workingSet(real, text));
+ }
+ 
+-test "qwen27 memory: working sets account for weights and the unchanged 8 GiB margin" {
++test "qwen27 memory: the margin is an eighth of the working set, 1 GiB on the smallest Macs and 8 GiB from 64 GiB" {
++    try std.testing.expectEqual(@as(usize, 1 << 30), memory.margin(5_726_623_744));
++    try std.testing.expectEqual(@as(usize, 11_453_251_584 / 8), memory.margin(11_453_251_584));
++    try std.testing.expectEqual(@as(usize, 8 << 30), memory.margin(64 << 30));
++    try std.testing.expectEqual(@as(usize, 8 << 30), memory.margin(192 << 30));
++}
++
++test "qwen27 memory: working sets account for weights and the margin" {
+     var f = fixture();
+-    const weights: usize = 16 << 30;
++    const weights: usize = 48 << 30;
+     const wide = weights + (8 << 30) + try f.cost(2048, 2);
+     const narrow = weights + (8 << 30) + try f.cost(512, 2);
+     for ([_]usize{ wide, wide - 1, narrow }, [_]u32{ 2048, 512, 512 }) |working, want| {
+         f.left = try memory.room(working, weights, null);
+         try std.testing.expectEqual(want, try f.choose(2048, false));
+     }
+-    try std.testing.expectEqual(@as(usize, 0), try memory.room(20 << 30, weights, null));
+-    try std.testing.expectEqual(@as(usize, 16 << 30), try memory.room(192 << 30, weights, "42949672960"));
++    try std.testing.expectEqual(@as(usize, (20 << 30) - (16 << 30) - (20 << 30) / 8), try memory.room(20 << 30, 16 << 30, null));
++    try std.testing.expectEqual(@as(usize, (40 << 30) - (16 << 30) - (5 << 30)), try memory.room(192 << 30, 16 << 30, "42949672960"));
+     try std.testing.expectEqual(@as(usize, 0), try memory.room(192 << 30, 200 << 30, null));
+ }
+ 
++test "qwen27 memory: a frame that cannot fit 512 rows steps down to the narrowest that fits, never below 128" {
++    var f = fixture();
++    f.context = 4096;
++    f.slots = 1;
++    f.left = try f.cost(256, 1);
++    try std.testing.expectEqual(@as(u32, 256), try f.choose(2048, false));
++    try std.testing.expectEqual(@as(u32, 256), try f.choose(512, false));
++    f.left -= 1;
++    try std.testing.expectEqual(@as(u32, 128), try f.choose(512, false));
++    f.left = 0;
++    try std.testing.expectEqual(@as(u32, 128), try f.choose(512, false));
++    try std.testing.expectEqual(@as(u32, 64), try f.choose(64, false));
++    try std.testing.expectEqual(@as(u32, 1024), try f.choose(1024, true));
++}
++
++test "qwen27 memory: a looped model charges every execution's KV and recurrent state, not each physical layer once" {
++    var f = fixture();
++    f.slots = 1;
++    const plain = try memory.runnerBytes(f.config, f.context, 1, 512, true, 0, 5);
++    var looped = f.config;
++    looped.plan = .{ .layers = 64, .start = 4, .end = 28, .passes = 2 };
++    var n: usize = 0;
++    for ([_][2]usize{ .{ 0, 4 }, .{ 4, 28 }, .{ 4, 28 }, .{ 28, 64 } }) |range| for (range[0]..range[1]) |i| {
++        looped.plan.order[n] = @intCast(i);
++        n += 1;
++    };
++    looped.plan.len = n;
++    const twice = try memory.runnerBytes(looped, f.context, 1, 512, true, 0, 5);
++    const kv = memory.buffers([_]usize{ @as(usize, f.context) * f.config.kvDim() * 2, @as(usize, f.context) * f.config.kvDim() * 2 });
++    try std.testing.expect(twice > plain + 6 * kv);
++}
++
+ test "qwen27 memory: a wired-limit raise fits one stream only above the floor and rounds up to a whole MiB" {
+     const mib: usize = 1 << 20;
+-    const used: usize = 10 << 30;
++    const used: usize = 60 << 30;
+     const need: usize = 5 << 30;
+     const total = used + need + (8 << 30);
+     const least = total + (4 << 30); // the least RAM whose suggested limit leaves exactly the floor
+     try std.testing.expectEqual(@as(?usize, total / mib), memory.wiredRaise(used, need, least));
+     try std.testing.expectEqual(@as(?usize, null), memory.wiredRaise(used, need, least - 1));
+-    // One stream fits this RAM, but the limit it needs would leave less than the floor.
+     try std.testing.expectEqual(@as(?usize, null), memory.wiredRaise(used, need, total + (1 << 30)));
+     try std.testing.expectEqual(@as(?usize, total / mib + 1), memory.wiredRaise(used, need + 1, least + mib));
+ }
+ 
+-test "qwen27 memory: the issue's 32 GB Mac needs a raise under 29696 MB, and 16 GB of RAM cannot" {
++test "qwen27 memory: the issue's 32 GB Mac now fits one stream, and a stream twice that size needs a raise" {
+     const real: usize = 22_870_000_000; // Metal's working set on a 32 GB Mac
+     const used: usize = 11_381_000_000; // weights and buffers
+     const one: usize = 4_617_000_000; // one stream's scratch at this context
+-    try std.testing.expect(one > try memory.room(real, used, null)); // 2.7 GiB remains: the refusal
+-    const mb = memory.wiredRaise(used, one, 32 << 30) orelse return error.NoRaise;
+-    try std.testing.expect(mb <= 29696); // the issue's fix
+-    try std.testing.expect(mb * (1 << 20) >= used + one + (8 << 30));
+-    try std.testing.expectEqual(@as(?usize, null), memory.wiredRaise(used, one, 16 << 30));
++    try std.testing.expect(one <= try memory.room(real, used, null));
++    const big: usize = 10_000_000_000;
++    try std.testing.expect(big > try memory.room(real, used, null));
++    const mb = memory.wiredRaise(used, big, 32 << 30) orelse return error.NoRaise;
++    try std.testing.expectEqual(@as(usize, 23975), mb);
++    try std.testing.expectEqual(@as(?usize, null), memory.wiredRaise(used, big, 16 << 30));
+ }
+ 
+ test "qwen27 memory: a refusal advises lowering parallel, the raise, or lowering context when RAM cannot" {
+     const real: usize = 22_870_000_000;
+     const used: usize = 11_381_000_000;
+-    const one: usize = 4_617_000_000;
++    const big: usize = 10_000_000_000;
+     const cases = [_]struct { advice: memory.Advice, text: []const u8 }{
+-        .{ .advice = memory.advice(real, used, null, 1, 32 << 30), .text = ": lower --parallel or --context" },
+-        .{ .advice = memory.advice(real, used, null, one, 32 << 30), .text = ": Metal lets this Mac use 21.3 GiB; sudo sysctl iogpu.wired_limit_mb=23449 raises that limit enough for one stream at this context until reboot (or lower --context)" },
+-        .{ .advice = memory.advice(real, used, null, one, 16 << 30), .text = ": no wired-limit raise fits one stream and leaves 4 GiB of this Mac's 16.0 GiB of RAM to the system: lower --context" },
+-        .{ .advice = memory.advice(real, used, null, one, 26 << 30), .text = ": no wired-limit raise fits one stream and leaves 4 GiB of this Mac's 26.0 GiB of RAM to the system: lower --context" },
+-        .{ .advice = memory.advice(real, used, "10737418240", one, 32 << 30), .text = ": lower --parallel or --context" },
+-        .{ .advice = memory.advice(real, used, "1.5", one, 32 << 30), .text = ": lower --parallel or --context" },
+-        .{ .advice = memory.advice(real, used, "274877906944", one, 32 << 30), .text = ": Metal lets this Mac use 21.3 GiB; sudo sysctl iogpu.wired_limit_mb=23449 raises that limit enough for one stream at this context until reboot (or lower --context)" },
+-        .{ .advice = memory.advice(real, used, null, one, null), .text = ": no wired-limit raise is known to fit one stream: lower --context" },
++        .{ .advice = memory.advice(real, used, null, 4_617_000_000, 32 << 30), .text = ": lower --parallel or --context" },
++        .{ .advice = memory.advice(real, used, null, big, 32 << 30), .text = ": Metal lets this Mac use 21.3 GiB; sudo sysctl iogpu.wired_limit_mb=23975 raises that limit enough for one stream at this context until reboot (or lower --context)" },
++        .{ .advice = memory.advice(real, used, null, big, 16 << 30), .text = ": no wired-limit raise fits one stream and leaves 4 GiB of this Mac's 16.0 GiB of RAM to the system: lower --context" },
++        .{ .advice = memory.advice(real, used, null, big, 26 << 30), .text = ": no wired-limit raise fits one stream and leaves 4 GiB of this Mac's 26.0 GiB of RAM to the system: lower --context" },
++        .{ .advice = memory.advice(real, used, "10737418240", big, 32 << 30), .text = ": lower --parallel or --context" },
++        .{ .advice = memory.advice(real, used, "1.5", big, 32 << 30), .text = ": lower --parallel or --context" },
++        .{ .advice = memory.advice(real, used, "274877906944", big, 32 << 30), .text = ": Metal lets this Mac use 21.3 GiB; sudo sysctl iogpu.wired_limit_mb=23975 raises that limit enough for one stream at this context until reboot (or lower --context)" },
++        .{ .advice = memory.advice(real, used, null, big, null), .text = ": no wired-limit raise is known to fit one stream: lower --context" },
+     };
+     for (cases) |c| {
+         var buf: [512]u8 = undefined;

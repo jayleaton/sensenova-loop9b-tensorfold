@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Jay Leaton <58495321+jayleaton@users.noreply.github.com>
 Date: Wed, 18 Nov 2026 09:21:45 +0800
-Subject: [PATCH 27/34] tools: the vision reference harness
+Subject: [PATCH 27/39] tools: the vision reference harness
 
 Captures what a vision port must match: the tower's own output, the pixels the
 processor made, the image grid, and 64 greedy tokens, over a chart, a photo and

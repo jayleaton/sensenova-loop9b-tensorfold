@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Jay Leaton <58495321+jayleaton@users.noreply.github.com>
 Date: Wed, 18 Nov 2026 04:02:15 +0800
-Subject: [PATCH 15/34] qwen27: one comment line for the window's fold
+Subject: [PATCH 15/39] qwen27: one comment line for the window's fold
 
 ---
  zig/src/families/qwen27/forward.zig | 3 +--

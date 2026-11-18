@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Jay Leaton <58495321+jayleaton@users.noreply.github.com>
 Date: Wed, 18 Nov 2026 10:36:55 +0800
-Subject: [PATCH 33/34] recipe: image input is supported, with the numbers
+Subject: [PATCH 33/39] recipe: image input is supported, with the numbers
  behind it
 
 Rewrites the Images section so it stands alone: what the tower is and the one

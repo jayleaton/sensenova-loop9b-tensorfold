@@ -7,8 +7,8 @@ checkpoint. The series also carries the recipe TensorFold keeps for it,
 | | |
 | --- | --- |
 | Hardware | Mac Studio M5 Ultra, macOS 27.2 |
-| Engine | upstream TensorFold `6d0a128b0cde35aa091bda933577cfced3519b8a` (on `main`, 2026-11-17) + [`patches/metal/`](../patches/metal/) `0001`-`0034` |
-| Engine tree | `4a9c746f081054a4bc8837ac101d53306f26db81`: the measured text engine (`0001`-`0025`), the image path (`0026`-`0033`) and `0034`'s formatting fixes |
+| Engine | upstream TensorFold `6d0a128b0cde35aa091bda933577cfced3519b8a` (on `main`, 2026-11-17) + [`patches/metal/`](../patches/metal/) `0001`-`0039` |
+| Engine tree | `bd326a4c58374fa9063f4e011e6004696ee53640`: the measured text engine (`0001`-`0025`), the image path (`0026`-`0033`), small-Mac support (`0034`-`0038`) and `0039`'s formatting fixes |
 | Weights | MLX affine 4-bit g64, vision tower bf16 ([CONVERT](CONVERT.md)) |
 
 ## Build
@@ -168,10 +168,52 @@ decoded and served tokens):
 `tools/router_fp64.py` checks the router's reduction orders against FP64 on 528 real rows: all at fp32 rounding.
 Decode is 60 tok/s against 83 for 56 executions without the window; at one row the router is a single threadgroup.
 
+## Small Macs
+
+**16 GB Macs: supported, with the same 4-bit tree.** Patch `0034` makes that possible: startup used to keep a fixed
+8 GiB margin, which refused every 16 GB Mac whatever the weights. The margin is now an eighth of Metal's working set
+(1 GiB at least, 8 GiB from a 64 GiB set), the fit charges KV and recurrent state per execution, and a frame that
+cannot fit 512 prompt rows steps down to 128 before it refuses.
+
+**8 GB Macs: not yet supported.** 2-bit packs fit, but they lose code and reasoning badly, as stock Qwen3.5-9B does
+at 2 bits. A follow-up is being tried.
+
+These numbers come from the M5 Ultra with Metal's working set capped by `TF_QWEN27_WORKING_SET_BYTES` to what Metal
+grants a 16 GB Mac (11453251584) or an 8 GB Mac (5726623744), not from a 16 GB or 8 GB machine. Each run is
+`--parallel 1 --prompt-cache-gib 0 --no-drafts`. Memory is the peak process footprint
+(`tensorfold:process_footprint_peak_bytes`) after one request of about half the context.
+
+| tier | pack | disk | peak 4k | peak 8k | peak 32k | prefill 8k | decode |
+| --- | --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| **16 GB** | **`q4`, the tree above** | **5.07 GB** | **7.60 GiB** | **7.82 GiB** | **9.13 GiB** | **2,719 tok/s** | **58 tok/s** |
+| 16 GB | `s16` (6-8 bit attention, embed and head) | 5.70 GB | 8.22 GiB | 8.43 GiB | 9.75 GiB | 1,394 tok/s | 49 tok/s |
+| 8 GB | `s8-b` (2-bit MLP) | 3.23 GB | 4.65 GiB | refused | refused | 839 tok/s | 46 tok/s |
+| 8 GB | `s8-d` (2-bit, smallest) | 3.02 GB | 4.45 GiB | 4.67 GiB | refused | 833 tok/s | 45 tok/s |
+
+Quality, as teacher-forced top-1 agreement over 64 positions on the three task-gate prompts against each model's own
+BF16 continuation (prose / code / reasoning):
+
+| pack | SenseNova-Loop-9B | stock Qwen3.5-9B, same conversion |
+| --- | --- | --- |
+| `q4` | **57 / 62 / 61** | 64 / 64 / 58 |
+| `s16` | 58 / 61 / 62 | |
+| `s8-b` | 50 / 44 / 53 | 64 / 44 / 44 |
+| `s8-d` | 52 / 38 / 47 | 61 / 45 / 44 |
+
+`s16` adds nothing over `q4` that the gate can resolve, at half the prefill, so `q4` is the 16 GB pack. At 2 bits the
+code and reasoning loss matches the stock control's, so it is ordinary 2-bit loss and not the loop's, but it is still
+a collapse: greedy code leaves calls unclosed or repeats the function. 3 bits fits neither tier. Only 4-bit group-64
+weights take the tuned prompt and decode kernels, so smaller packs also run slower.
+
+The `s16` and `s8` recipes and the converter options behind them (`--recipe`, `--clip-search`, 3/5/6-bit codes) are in
+the patched checkout: `docs/small-quant-recipes/`, `docs/small-quant-candidates.md` and the recipe's own "Small Macs"
+section. The small-Mac runs used a text-only tree; this repo's converter also writes the 0.85 GiB vision tower,
+which is loaded only with `--vision`. Images on a 16 GB Mac are not measured.
+
 ### Not covered
 
 - Video: the processor's video path is not wired, and video parts are refused.
 - More than one image a request: the path is written for it, untested here.
 - Contexts past 262,144 tokens.
 - Concurrent streams: every Metal number here is one stream.
-- Other Apple chips.
+- Other Apple chips; 16 GB and 8 GB Macs only through the working-set cap above.

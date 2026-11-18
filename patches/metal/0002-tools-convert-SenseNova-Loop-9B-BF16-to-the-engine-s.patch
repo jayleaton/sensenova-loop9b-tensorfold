@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Jay Leaton <58495321+jayleaton@users.noreply.github.com>
 Date: Wed, 18 Nov 2026 01:46:11 +0800
-Subject: [PATCH 02/34] tools: convert SenseNova-Loop-9B BF16 to the engine's
+Subject: [PATCH 02/39] tools: convert SenseNova-Loop-9B BF16 to the engine's
  MLX affine format
 
 Quantizes every projection, the embedding and the head to affine codes at

@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Jay Leaton <58495321+jayleaton@users.noreply.github.com>
 Date: Wed, 18 Nov 2026 04:52:48 +0800
-Subject: [PATCH 20/34] qwen27: run the mHC router's outputs side by side, bit
+Subject: [PATCH 20/39] qwen27: run the mHC router's outputs side by side, bit
  for bit
 
 The router was one simdgroup a row, computing its eight outputs one after

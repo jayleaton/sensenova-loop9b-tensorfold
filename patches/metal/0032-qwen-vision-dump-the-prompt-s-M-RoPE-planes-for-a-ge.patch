@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Jay Leaton <58495321+jayleaton@users.noreply.github.com>
 Date: Wed, 18 Nov 2026 10:35:34 +0800
-Subject: [PATCH 32/34] qwen vision: dump the prompt's M-RoPE planes for a
+Subject: [PATCH 32/39] qwen vision: dump the prompt's M-RoPE planes for a
  get_rope_index check
 
 TF_QWEN_ROPE_DUMP writes the layout's (t, h, w) for every prompt row beside

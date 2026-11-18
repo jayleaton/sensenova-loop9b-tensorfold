@@ -1,0 +1,24 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Jay Leaton <58495321+jayleaton@users.noreply.github.com>
+Date: Wed, 18 Nov 2026 10:59:58 +0800
+Subject: [PATCH 37/39] tools: stock Qwen3.5's f32 gated norm stored as the
+ bf16 the engine reads
+
+---
+ tools/sensenova_loop_mlx.py | 3 +++
+ 1 file changed, 3 insertions(+)
+
+diff --git a/tools/sensenova_loop_mlx.py b/tools/sensenova_loop_mlx.py
+index bafa1cf72..309f39e24 100644
+--- a/tools/sensenova_loop_mlx.py
++++ b/tools/sensenova_loop_mlx.py
+@@ -239,6 +239,9 @@ def main():
+             elif zero_centered(out):
+                 # the engine multiplies by the stored weight, as mlx checkpoints do: fold the model's `1 + w`
+                 pending[out] = (t.float() + 1.0).to(torch.bfloat16).contiguous()
++            elif out.endswith("linear_attn.norm.weight"):
++                # the gated norm is read as bf16; stock Qwen3.5 ships it f32
++                pending[out] = t.to(torch.bfloat16).contiguous()
+             elif out.endswith("A_log"):
+                 # the GDN kernel reads a bf16 decay weight; the checkpoint's A_log is f32
+                 pending[out] = t.to(torch.bfloat16).contiguous()

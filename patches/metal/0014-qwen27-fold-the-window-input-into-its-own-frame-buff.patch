@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Jay Leaton <58495321+jayleaton@users.noreply.github.com>
 Date: Wed, 18 Nov 2026 04:01:41 +0800
-Subject: [PATCH 14/34] qwen27: fold the window input into its own frame buffer
+Subject: [PATCH 14/39] qwen27: fold the window input into its own frame buffer
 
 The fold wrote into s.hidden, which the residual swap had already made the normed
 buffer, so enter expanded rows that were not the layer-3 residual at all: the

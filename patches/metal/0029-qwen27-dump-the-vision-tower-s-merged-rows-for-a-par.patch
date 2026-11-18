@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Jay Leaton <58495321+jayleaton@users.noreply.github.com>
 Date: Wed, 18 Nov 2026 09:48:37 +0800
-Subject: [PATCH 29/34] qwen27: dump the vision tower's merged rows for a
+Subject: [PATCH 29/39] qwen27: dump the vision tower's merged rows for a
  parity check
 
 A vision port needs the tower's own output, not just the tokens it produces.

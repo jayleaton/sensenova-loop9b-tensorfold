@@ -3,8 +3,9 @@
 On CUDA, TensorFold serves a converted checkpoint: a plain BF16 Qwen3.5 tree is decision-only there and is refused for
 serving. On Metal, the dense loader reads BF16 too, but the measured profile serves 4-bit. Both backends load the same
 converted tree. The converter is `tools/sensenova_loop_mlx.py`, carried in both patch series
-(`patches/cuda/0008`, `patches/metal/0002`-`0004` and `0026`), so it is in every patched engine checkout. The Metal
-copy also writes the vision tower; the CUDA copy is text only until CUDA images are qualified.
+(`patches/cuda/0008`, `patches/metal/0002`-`0004`, `0026`, `0035` and `0037`), so it is in every patched engine
+checkout. The Metal copy also writes the vision tower and takes per-module recipes (`--recipe`, `--clip-search`, see
+[METAL](METAL.md#small-macs)); the CUDA copy is text only and 2/4/8-bit until CUDA images are qualified.
 
 ## Commands
 

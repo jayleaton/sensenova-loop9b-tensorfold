@@ -1,0 +1,110 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Jay Leaton <58495321+jayleaton@users.noreply.github.com>
+Date: Wed, 18 Nov 2026 10:44:13 +0800
+Subject: [PATCH 36/39] docs: SenseNova-Loop-9B small-Mac quant candidates,
+ their recipes and the budgets they target
+
+---
+ docs/small-quant-candidates.md     | 54 ++++++++++++++++++++++++++++++
+ docs/small-quant-recipes/s16.json  |  5 +++
+ docs/small-quant-recipes/s8-b.json |  6 ++++
+ docs/small-quant-recipes/s8-d.json |  4 +++
+ 4 files changed, 69 insertions(+)
+ create mode 100644 docs/small-quant-candidates.md
+ create mode 100644 docs/small-quant-recipes/s16.json
+ create mode 100644 docs/small-quant-recipes/s8-b.json
+ create mode 100644 docs/small-quant-recipes/s8-d.json
+
+diff --git a/docs/small-quant-candidates.md b/docs/small-quant-candidates.md
+new file mode 100644
+index 000000000..072f42649
+--- /dev/null
++++ b/docs/small-quant-candidates.md
+@@ -0,0 +1,54 @@
++# SenseNova-Loop-9B small-Mac quant candidates
++
++Candidate specs for the 16 GB and 8 GB Mac tiers, published before the Metal measurements finish so a CUDA sweep can
++run in parallel. The Mac owns memory, speed and the final Metal gate; numbers land in
++`docs/recipes/sensenova-loop-9b-metal.md` when measured.
++
++Source: `sensenova/SenseNova-Loop-9B` @ `329a65f701ba8c48b73c30d0cbaa6f0449733673`, BF16. Format: MLX affine
++(u32 bitstream codes, bf16 scales and biases), the same format the Metal loader reads per module.
++
++## Converter
++
++`tools/sensenova_loop_mlx.py` on this branch:
++
++```bash
++python3 tools/sensenova_loop_mlx.py --source SenseNova-Loop-9B --out OUT \
++  --recipe docs/small-quant-recipes/RECIPE.json --clip-search 10
++```
++
++- `--recipe`: top-level `bits`/`group` are the global width; the first `rules[].match` regex that matches the
++  engine-side module path (`language_model.model.layers.N.mlp.down_proj`, `language_model.model.embed_tokens`,
++  `language_model.lm_head`) sets that tensor's `bits`/`group`. Overrides are written as MLX per-module
++  `quantization` entries in `config.json`.
++- `--clip-search N`: per group, N shrink steps of the min/max range from 1.0 to 0.5, keeping the step with the least
++  squared error after bf16 rounding of scale and bias. 0 (default) reproduces the previous min/max quantizer.
++- 3, 5 and 6-bit codes are packed as MLX's continuous little-endian bitstream (codes cross u32 edges); 2, 4 and
++  8-bit output is unchanged. Earlier commits packed 3/5/6-bit wrongly; use this branch.
++- MTP (`mtp.`), vision (`model.visual.`) and `loop_gate` tensors are skipped. The same script converts stock
++  `Qwen/Qwen3.5-9B` for the control.
++
++All groups are 64. The mHC routers (f32), norms, `A_log`, `dt_bias` and `conv1d` stay unquantized.
++
++## Tiers
++
++| recipe | tier | global | lm_head | embed | self_attn q/k/v/o | linear_attn in_proj_a/b | other linear_attn | MLP | weights |
++|-|-|-|-|-|-|-|-|-|-|
++| `q4` (no recipe, no search) | 16 GB | 4 | 4 | 4 | 4 | 4 | 4 | 4 | 4.70 GiB |
++| `s16.json` | 16 GB, higher quality | 4 | 6 | 6 | 6 | 8 | 4 | 4 | 5.29 GiB |
++| `s8-b.json` | 8 GB | 2 | 3 | 2 | 4 | 8 | 3 (in_proj_qkv, out_proj); 2 (in_proj_z) | 2 | 2.99 GiB |
++| `s8-d.json` | 8 GB, smallest | 2 | 3 | 2 | 3 | 8 | 2 | 2 | 2.80 GiB |
++
++`s8-*` and `s16` are converted with `--clip-search 10`; `q4` is the existing checkpoint (min/max, no search).
++
++## Budgets these target (measured on Metal, simulated with `TF_QWEN27_WORKING_SET_BYTES`)
++
++- 16 GB Mac: about 10.5 GB at 8k context. The current q4 peaks at 7.60 / 7.82 / 9.13 GiB at 4k / 8k / 32k,
++  `--parallel 1`, 512 prompt rows.
++- 8 GB Mac: about 5.0 GB (4.66 GiB) at 4k. Non-weight overhead at 4k with 128 prompt rows is about 1.85 GiB, so the
++  weights must be at most about 2.8 GiB. Both `s8` recipes sit at that edge; quality decides whether either ships.
++
++## Quality gate to compare against
++
++Teacher-forced top-1 agreement over 64 positions on the three gate prompts (`p0-plain`, `p1-code`, `p2-reason`)
++against the BF16 reference continuation. Metal q4 against BF16: plain 57/64, code 62/64, reasoning 61/64. Control:
++stock Qwen3.5-9B through the same converter and recipe against its own BF16 continuation.
+diff --git a/docs/small-quant-recipes/s16.json b/docs/small-quant-recipes/s16.json
+new file mode 100644
+index 000000000..76dd83ede
+--- /dev/null
++++ b/docs/small-quant-recipes/s16.json
+@@ -0,0 +1,5 @@
++{"bits": 4, "group": 64, "rules": [
++ {"match": "lm_head$", "bits": 6},
++ {"match": "embed_tokens$", "bits": 6},
++ {"match": "self_attn\\.", "bits": 6},
++ {"match": "linear_attn\\.in_proj_[ab]$", "bits": 8}]}
+diff --git a/docs/small-quant-recipes/s8-b.json b/docs/small-quant-recipes/s8-b.json
+new file mode 100644
+index 000000000..9402b1661
+--- /dev/null
++++ b/docs/small-quant-recipes/s8-b.json
+@@ -0,0 +1,6 @@
++{"bits": 2, "group": 64, "rules": [
++ {"match": "lm_head$", "bits": 3},
++ {"match": "embed_tokens$", "bits": 2},
++ {"match": "self_attn\\.", "bits": 4},
++ {"match": "linear_attn\\.in_proj_[ab]$", "bits": 8},
++ {"match": "linear_attn\\.(in_proj_qkv|out_proj)$", "bits": 3}]}
+diff --git a/docs/small-quant-recipes/s8-d.json b/docs/small-quant-recipes/s8-d.json
+new file mode 100644
+index 000000000..a42af5b1b
+--- /dev/null
++++ b/docs/small-quant-recipes/s8-d.json
+@@ -0,0 +1,4 @@
++{"bits": 2, "group": 64, "rules": [
++ {"match": "lm_head$", "bits": 3},
++ {"match": "self_attn\\.", "bits": 3},
++ {"match": "linear_attn\\.in_proj_[ab]$", "bits": 8}]}

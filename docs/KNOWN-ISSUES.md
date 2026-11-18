@@ -34,5 +34,7 @@
 - **Prose greedy agreement 19/64**, at the reference's own bf16/fp32 noise floor ([METAL](METAL.md#task-gate)).
 - **Decode is 60 tok/s against 83 for 56 executions without the window**: at one row the router is a single
   threadgroup.
+- **8 GB Macs are not supported yet.** 2-bit packs fit but lose code and reasoning; 16 GB numbers come from a
+  working-set cap on the M5 Ultra, not a 16 GB machine.
 - **One stream.** Concurrency is not measured.
 - **M5 Ultra only.** Other Apple chips are not measured.
