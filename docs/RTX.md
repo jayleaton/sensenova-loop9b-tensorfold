@@ -166,7 +166,8 @@ only run on Linux and WSL2, which is that same path with the Windows driver serv
 3. **Build** with this recipe: `scripts/build-engine.sh rtx engine-rtx` (several minutes of nvcc, no GPU needed). It
    fetches the pinned upstream commit, applies both series and checks the tree.
 4. **The pack** goes on ext4 under your home directory, never under `/mnt/c`, where the checkpoint reader's `O_DIRECT`
-   does not reach. Check every file against the pack's `sha256` list (13 entries).
+   does not reach. Download it with `hf download jayleaton/SenseNova-Loop-9B-EXL3-6.0bpw --local-dir sn-6.0`
+   (or `-5.0bpw`, `-4.0bpw`); the card lists the weight files' sha256.
 5. **Serve** as above. It listens on `http://127.0.0.1:8090/v1`; add `--host 0.0.0.0` to reach it from Windows. Close
    other GPU work first: a busy desktop halved decode on the first run.
 6. **Check:** one greedy chat, and the card's peak while it runs:
@@ -188,5 +189,5 @@ only run on Linux and WSL2, which is that same path with the Windows driver serv
 exllamav3 cannot trace this model (`sensenova_loop` is not a registered architecture, and its `qwen3_5` forward has no
 loop or mHC), so the chain captures Hessians from the real looped model with transformers, one per unique weight summed
 over both visits, and lets exllamav3 quantize from them. The steps, pinned versions and recipes are in the patched
-engine: `docs/exl3-sensenova-quantize.md`, `docs/exl3-recipes/` and `tools/exl3_sensenova_chain.sh`. No packs are
-published.
+engine: `docs/exl3-sensenova-quantize.md`, `docs/exl3-recipes/` and `tools/exl3_sensenova_chain.sh`. The packs this page measured are
+on Hugging Face: [6.0](https://huggingface.co/jayleaton/SenseNova-Loop-9B-EXL3-6.0bpw), [5.0](https://huggingface.co/jayleaton/SenseNova-Loop-9B-EXL3-5.0bpw), [4.0](https://huggingface.co/jayleaton/SenseNova-Loop-9B-EXL3-4.0bpw).

@@ -42,7 +42,6 @@
   the window is bounded by the card (212,992 fp8 tokens for `sn-6.0` at one chat).
 - **Measured on one card in WSL2.** RTX 5070 Ti 16 GB only; native Windows and other cards are untested. `sn-4.0`'s
   tool calls were not run on the card. Decode varies with desktop load and clock decay (about 39-47 tok/s for `sn-6.0`).
-- **No packs published.** You quantize them yourself with exllamav3 ([RTX](RTX.md#quantize)).
 
 ## Metal
 

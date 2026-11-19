@@ -8,7 +8,8 @@ A recipe for serving [SenseNova-Loop-9B](https://huggingface.co/sensenova/SenseN
 [TensorFold](https://github.com/ashhart/TensorFold) on two backends: CUDA on one NVIDIA DGX Spark (TP=1) or a 16 GB RTX
 card, and Metal on Apple Silicon. It ships an exact upstream TensorFold pin and a patch series for each backend, a converter from the
 published BF16 checkpoint to the engine's MLX affine format, serving profiles, and the measurements behind them.
-No weights are included or published: you download the checkpoint from SenseNova and convert it yourself.
+The measured weight trees are on Hugging Face ([Weights on Hugging Face](#weights-on-hugging-face)), or convert the
+checkpoint yourself.
 
 ## Credits
 
@@ -42,7 +43,7 @@ Each row is a recipe that was built and run end to end. Every build checks the e
 | **Mac Studio M5 Ultra** | 4-bit MLX g64 (vision tower carried) | `metal`: pin `6d0a128b0` + `patches/metal` `0001`-`0044` | decode 59.5-60.0 tok/s; prefill 2,709-2,752 tok/s to 8k, 2,461 at 32k; copy drafts: re-quote 362, code 87, prose 94 tok/s | task gate: code 64/64, reasoning 64/64, prose 19/64 (the reference's noise floor) | one image a request; default window 33,024 (4,096 with images) |
 | **16 GB Mac** (M-series) | the same 4-bit tree, 5.07 GB | `metal` | 58 tok/s decode; 2,719 tok/s prefill at 8k; peak 7.60 / 7.82 / 9.13 GiB at 4k / 8k / 32k | same tree as the Studio | measured under a 16 GB working-set cap on the M5 Ultra; 8 GB Macs not supported |
 | **MacBook Pro M4 Pro** (24 GB) | the same 4-bit tree | `metal` | 26.7 tok/s decode; prefill about 230 tok/s (32k prompt: 166 s to first token) | same tree as the Studio | slow prefill on long prompts; quality not separately measured |
-| **RTX 5070 Ti 16 GB** (WSL2) | EXL3 `sn-6.0` (8.29 GB) you quantize; `sn-4.0` for speed | `rtx`: pin `038e4a278` + `patches/cuda` `0001`-`0022` + `patches/rtx` `0001`-`0002` | `sn-6.0` 44-47 tok/s at 4k, 39-44 at 32k, prefill 2,232 tok/s; copy drafts re-quote 660, code 534 tok/s; host prompt cache restores 109K tokens in 4.5 s (30x) | gate cosine 0.99931, top-1 290/298; 36/36 tool calls; 30-minute soak, 0 failures | no live KV in host RAM (212,992-token fp8 window); packs not published; native Windows untested |
+| **RTX 5070 Ti 16 GB** (WSL2) | EXL3 `sn-6.0` (8.29 GB); `sn-4.0` for speed | `rtx`: pin `038e4a278` + `patches/cuda` `0001`-`0022` + `patches/rtx` `0001`-`0002` | `sn-6.0` 44-47 tok/s at 4k, 39-44 at 32k, prefill 2,232 tok/s; copy drafts re-quote 660, code 534 tok/s; host prompt cache restores 109K tokens in 4.5 s (30x) | gate cosine 0.99931, top-1 290/298; 36/36 tool calls; 30-minute soak, 0 failures | no live KV in host RAM (212,992-token fp8 window); native Windows untested |
 
 **DGX Spark** ([CUDA](docs/CUDA.md)), CUDA 13 toolkit and Zig 0.17.0:
 
@@ -75,6 +76,25 @@ scripts/serve.sh rtx engine-rtx sn-6.0                       # --parallel 1 --kv
 ```
 
 Every command above needs the checkpoint downloaded first ([Quick start](#quick-start)).
+
+## Weights on Hugging Face
+
+The trees the tables above were measured on, byte for byte, so you can skip the conversion. Each card has the serve
+line, the measurements and the sha256 of its weight files. Apache-2.0, SenseNova's model license.
+
+| repository | what | device | engine (`config/`) | size |
+| --- | --- | --- | --- | ---: |
+| [SenseNova-Loop-9B-MLX-8bit-vision](https://huggingface.co/jayleaton/SenseNova-Loop-9B-MLX-8bit-vision) | 8-bit MLX g64 + BF16 vision tower, YaRN 4 (`loop9b-q8-vis`) | DGX Spark | `cuda`, `cuda-v6` | 10.46 GB |
+| [SenseNova-Loop-9B-MLX-4bit](https://huggingface.co/jayleaton/SenseNova-Loop-9B-MLX-4bit) | 4-bit MLX g64, vision tower carried (`loop9b-mlx4`) | Macs, 16 GB and up | `metal` | 5.98 GB |
+| [SenseNova-Loop-9B-EXL3-6.0bpw](https://huggingface.co/jayleaton/SenseNova-Loop-9B-EXL3-6.0bpw) | EXL3 `sn-6.0` | 16 GB RTX | `rtx` | 8.29 GB |
+| [SenseNova-Loop-9B-EXL3-5.0bpw](https://huggingface.co/jayleaton/SenseNova-Loop-9B-EXL3-5.0bpw) | EXL3 `sn-5.0` | 16 GB RTX | `rtx` | 7.17 GB |
+| [SenseNova-Loop-9B-EXL3-4.0bpw](https://huggingface.co/jayleaton/SenseNova-Loop-9B-EXL3-4.0bpw) | EXL3 `sn-4.0` | 16 GB RTX | `rtx` | 6.31 GB |
+
+```bash
+hf download jayleaton/SenseNova-Loop-9B-MLX-8bit-vision --local-dir loop9b-q8-vis   # then scripts/serve.sh cuda engine-cuda loop9b-q8-vis
+hf download jayleaton/SenseNova-Loop-9B-MLX-4bit --local-dir loop9b-mlx4            # then scripts/serve.sh metal engine-metal loop9b-mlx4
+hf download jayleaton/SenseNova-Loop-9B-EXL3-6.0bpw --local-dir sn-6.0              # then scripts/serve.sh rtx engine-rtx sn-6.0
+```
 
 ## Versions
 
@@ -135,8 +155,8 @@ MacBook Pro (24 GB) decodes at 26.7 tok/s ([METAL](docs/METAL.md#copy-drafts)).
 ([RTX](docs/RTX.md)): the 6.0-bit pack decodes at 44-47 tok/s at 4k and 39-44 at 32k with drafts off, prefills at
 2,232 tok/s, passes 36/36 tool calls and a 30-minute soak, and its gate logits equal the DGX Spark's run of the same
 pack. Copy drafts take a re-quote to 660 tok/s and a code edit to 534, token-identical; the host-RAM prompt cache
-restores a 109,313-token prefix in 4.48 s against 133.6 s cold. The 4.0-bit pack decodes at 59.1 tok/s. No packs are
-published; you quantize them yourself.
+restores a 109,313-token prefix in 4.48 s against 133.6 s cold. The 4.0-bit pack decodes at 59.1 tok/s. The packs are
+[on Hugging Face](#weights-on-hugging-face), or quantize them yourself.
 
 **Tool calls need `libtfgrammar`.** `tool_choice: "required"`, a named function and `response_format` need
 `libtfgrammar` (`.so` on Linux, `.dylib` on macOS) beside the server, built from xgrammar v0.2.8 with
