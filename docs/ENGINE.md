@@ -3,15 +3,16 @@
 Each backend builds upstream [TensorFold](https://github.com/ashhart/TensorFold) at an exact commit with this recipe's
 patch series applied in order. The pin, the series length and the resulting tree are recorded in `config/<backend>/`:
 
-| file | CUDA | Metal |
-| --- | --- | --- |
-| `tensorfold.repo` | `https://github.com/ashhart/TensorFold.git` | same |
-| `tensorfold.rev` | `038e4a27872eaa018adc67b1b5ddffd16820c498` | `6d0a128b0cde35aa091bda933577cfced3519b8a` |
-| `tensorfold.patches` | `0022` | `0044` |
-| `tensorfold.tree` | `d5938b12bbcc1294e6a24600111cbd4c8d86f159` | `d33e2d93ea37f0b3ed1f208599a24ac00b3de16e` |
+| config | pin (`tensorfold.rev`) | series | `tensorfold.tree` |
+| --- | --- | --- | --- |
+| `config/cuda/` (served) | `038e4a27872eaa018adc67b1b5ddffd16820c498` | `patches/cuda/` `0001`-`0022` | `d5938b12bbcc1294e6a24600111cbd4c8d86f159` |
+| `config/cuda-v6/` (validated, not yet served) | same | `patches/cuda/` `0001`-`0027` | `9bac6ecbdef1c03861d824e930799edcb3b3de16` |
+| `config/rtx/` | same | `patches/cuda/` `0001`-`0022`, then `patches/rtx/` `0001`-`0002` | `0f61f4723db864b510f9a278b6dd5d679b344acb` |
+| `config/metal/` | `6d0a128b0cde35aa091bda933577cfced3519b8a` | `patches/metal/` `0001`-`0044` | `d33e2d93ea37f0b3ed1f208599a24ac00b3de16e` |
 
-RTX (`config/rtx/`) reuses the CUDA pin and the series through `0019`: `tensorfold.series` lists `cuda:0019 rtx:0002`, applied in that
-order, and the result is checked against `8b937545caec6714b0d33b853c2bd31c9f2ab65f`.
+Every repo is `https://github.com/ashhart/TensorFold.git`. A config with `tensorfold.patches` applies its own directory
+`0001`..`LAST`; one with `tensorfold.series` applies each `DIR:LAST` word in order (`cuda-v6`: `cuda:0027`; `rtx`:
+`cuda:0022 rtx:0002`).
 
 Both pins are on upstream `main` (2026-11-17); `038e4a278` is 36 commits older than `6d0a128b0`.
 `scripts/fetch-engine.sh BACKEND DEST [SOURCE]` fetches the pin, applies `patches/BACKEND/0001`..`LAST` with `git am`
@@ -24,10 +25,10 @@ the pin.
 The CUDA work started from `038e4a278` and the Metal work from `6d0a128b0`. Each pin is the commit its backend was
 measured on, so each series gives back the measured tree exactly. The two series touch disjoint files (CUDA:
 `zig/src/families/qwen3_5/`, its kernels and contract; Metal: `zig/src/families/qwen27/`, `zig/kernels/metal/qwen27/`
-and a few shared core, build and Metal runtime files), and the CUDA series also applies cleanly on `6d0a128b0`. That tree is not measured, so
+and a few shared core, build and Metal runtime files), and the CUDA series (as first measured) also applied cleanly on `6d0a128b0`. That tree is not measured, so
 it is not the pin.
 
-## CUDA series, `patches/cuda/` (43 files, +1690 / -68)
+## CUDA series, `patches/cuda/`
 
 | patch | change |
 | --- | --- |
@@ -49,6 +50,13 @@ it is not the pin.
 | `0016` | the CUDA disk tier's staging permit is sized for the longest kept state |
 | `0017`-`0019` | shared rounds' copy windows start at three rows and widen as copies land; never where rows are priced or for a drafter's proposals |
 | `0020`-`0022` | a shared round's copy rows fill the room left in the backend's 16-row tile (a round past it costs about twice as much), split across its chats by recent acceptance; a single chat and a drafter are unchanged |
+| `0023` | the mHC streams collapse at the loop seam on every visit, as the reference does; `TF_Q35_MHC_CARRY=1` keeps the old carry for A/B. Changes served tokens (closer to the reference) |
+| `0024` | `TF_QWEN_PREFILL_FP8=1`: kv8 whole-cache prompt attention on e4m3 tensor cores. Opt-in, off by default: it flips 2-3% of top-1 tokens |
+| `0025`, `0026` | `TF_QWEN_PREFILL_TUNE=1`: the same prompt attention with one barrier an item (same bits); the integer widening `0025` also tried measured slower and `0026` drops it |
+| `0027` | the one-barrier prompt attention is the default (same bits); `TF_QWEN_PREFILL_TUNE=0` restores the second barrier |
+
+`0001`-`0022` is the served engine (`config/cuda/`). `0023`-`0027` are the validated next build (`config/cuda-v6/`):
+the seam fix changes tokens, the rest leaves them bit-identical to `0023` alone, and nothing past `0022` is served yet.
 
 The tree after `0001`-`0022` is the served CUDA engine with the converter added: its `zig/` source is that build's,
 byte for byte, and the converter (`0008`) is the only difference. `zig/` after `0001`-`0007` is identical to the engine
@@ -102,7 +110,7 @@ Each patch is one engine commit with its own message. TensorFold asks for one ch
 order; the patch messages and [CUDA](CUDA.md#engine-checks) / [METAL](METAL.md) record which of those receipts
 exist. The series are this recipe's, not upstream pull requests.
 
-## RTX series, `patches/rtx/` (on top of the CUDA series)
+## RTX series, `patches/rtx/` (on top of the CUDA series through `0022`)
 
 | patch | change |
 | --- | --- |
@@ -110,4 +118,6 @@ exist. The series are this recipe's, not upstream pull requests.
 | `0002` | `zig/src/native/cuda.zig` back to TensorFold's 600-line rule: a family's own model_type and its aliases in one registry pass |
 
 `0001` squashes the archive's `sensenova/loop9b-exl3` engine commits (`bb2c8e4f8`, `863dbb692`, `42e0a733d`); one test
-conflict against the CUDA series (`cuda_loop_plan_test.zig`) keeps both tests.
+conflict against the CUDA series (`cuda_loop_plan_test.zig`) keeps both tests. On `cuda:0022` the RTX tree's engine
+source equals the build the RTX copy-draft and host-cache numbers were measured on; the only differences are the
+converter in `tools/` and the equivalent registry loop of `0002`. RTX does not take `0023`-`0027` yet.

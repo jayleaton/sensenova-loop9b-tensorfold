@@ -1,0 +1,1 @@
+--parallel 4 --context 1048576 --kv-cache fp8 --max-tokens 32768 --thinking-budget 4096 --decode-share 0.5 --prompt-cache-gib 24 --spill-gib 256 --learn-daily-gib 256 --checkpoint-slots 8 --vision

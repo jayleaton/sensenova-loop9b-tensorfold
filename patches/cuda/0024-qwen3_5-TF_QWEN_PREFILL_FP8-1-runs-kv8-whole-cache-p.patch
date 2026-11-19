@@ -1,0 +1,330 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Jay Leaton <58495321+jayleaton@users.noreply.github.com>
+Date: Thu, 19 Nov 2026 08:22:22 +0700
+Subject: [PATCH 24/27] qwen3_5: TF_QWEN_PREFILL_FP8=1 runs kv8 whole-cache
+ prompt attention on e4m3 tensor cores (opt-in, default off)
+
+---
+ zig/kernels/cuda/prefill_attention.cu     |   2 +
+ zig/kernels/cuda/prefill_attention_f8.cuh | 237 ++++++++++++++++++++++
+ zig/src/families/qwen3_5/cuda_prompt.zig  |  13 +-
+ zig/src/platform/environment.zig          |   1 +
+ 4 files changed, 249 insertions(+), 4 deletions(-)
+ create mode 100644 zig/kernels/cuda/prefill_attention_f8.cuh
+
+diff --git a/zig/kernels/cuda/prefill_attention.cu b/zig/kernels/cuda/prefill_attention.cu
+index 1c6e0f073..8aeefc738 100644
+--- a/zig/kernels/cuda/prefill_attention.cu
++++ b/zig/kernels/cuda/prefill_attention.cu
+@@ -359,3 +359,5 @@ template __global__ void tf_prefill_attention::hpattn_whole_kernel<256, 8, 2, 2>
+ template __global__ void tf_prefill_attention::hpattn8_whole_kernel<256, 8, 2, 2>(const __nv_bfloat16* __restrict__,
+     const uint8_t* __restrict__, const uint8_t* __restrict__, const float* __restrict__, const float* __restrict__,
+     __nv_bfloat16* __restrict__, int, int, int, int, int, float, int);
++
++#include "prefill_attention_f8.cuh"
+diff --git a/zig/kernels/cuda/prefill_attention_f8.cuh b/zig/kernels/cuda/prefill_attention_f8.cuh
+new file mode 100644
+index 000000000..1d11de189
+--- /dev/null
++++ b/zig/kernels/cuda/prefill_attention_f8.cuh
+@@ -0,0 +1,237 @@
++// TF_QWEN_PREFILL_FP8: whole-cache kv8 prompt attention on e4m3 tensor cores (queries and weights scaled a row).
++#pragma once
++
++namespace tf_prefill_attention {
++
++constexpr int F8D = 256, F8_KROW = F8D + 16, F8_VROW = BN + 16;  // padded rows: ldmatrix's eight rows in eight banks
++constexpr int F8_K = BN * F8_KROW, F8_V = F8D * F8_VROW, F8_BUF = F8_K + F8_V + 2 * BN * 4;
++static_assert(2 * F8_BUF == 76800, "cuda_prompt.zig f8_smem");
++
++__device__ __forceinline__ void mma_e4m3(float (&d)[4], const uint32_t (&a)[4], uint32_t b0, uint32_t b1) {
++#if __CUDA_ARCH__ >= 890
++    asm("mma.sync.aligned.m16n8k32.row.col.f32.e4m3.e4m3.f32 {%0, %1, %2, %3}, {%4, %5, %6, %7}, {%8, %9}, "
++        "{%0, %1, %2, %3};\n"
++        : "+f"(d[0]), "+f"(d[1]), "+f"(d[2]), "+f"(d[3])
++        : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]), "r"(b0), "r"(b1));
++#else
++    __trap();
++#endif
++}
++
++__device__ __forceinline__ uint32_t e4m3x4(float a, float b, float c, float d) {
++    const uint32_t lo = __nv_cvt_float2_to_fp8x2(make_float2(a, b), __NV_SATFINITE, __NV_E4M3);
++    const uint32_t hi = __nv_cvt_float2_to_fp8x2(make_float2(c, d), __NV_SATFINITE, __NV_E4M3);
++    return lo | (hi << 16);
++}
++
++// A tile key's slot in the value rows: keys 8n + 2q + i of a 32-key chunk sit where the weights' A fragment reads them.
++__device__ __forceinline__ int f8_slot(int key) {
++    const int c = key / 32, n = (key % 32) / 8, q = (key % 8) / 2, i = key % 2;
++    return 32 * c + 16 * (n / 2) + 4 * q + 2 * (n % 2) + i;
++}
++
++template <int WARPS, int HPC>
++__global__ void __launch_bounds__(32 * WARPS, 1)
++hpattn8_f8_whole_kernel(const __nv_bfloat16* __restrict__ q, const uint8_t* __restrict__ kc,
++                        const uint8_t* __restrict__ vc, const float* __restrict__ ks, const float* __restrict__ vs,
++                        __nv_bfloat16* __restrict__ out, int p0, int W, int H, int HK, int G, float scale, int CAP) {
++    constexpr int D = F8D, RB = WARPS / HPC, THREADS = 32 * WARPS, NB = D / 8;
++    extern __shared__ uint4 smem[];
++    unsigned char* base = reinterpret_cast<unsigned char*>(smem);
++    const int warp = threadIdx.x / 32, lane = threadIdx.x % 32, g = lane / 4, qd = lane % 4, mt = lane / 8;
++    const int groups = G / HPC, hk = blockIdx.y / groups, hg = blockIdx.y % groups;
++    const int row0 = blockIdx.x * 16 * RB, last = min(row0 + 16 * RB, W) - 1;
++    const int head = hk * G + hg * HPC + warp % HPC, wrow = row0 + (warp / HPC) * 16;
++    const int tiles = (p0 + last) / BN + 1, limit = p0 + W;
++    const int64_t hrow = (int64_t)hk * CAP;
++    uint32_t vr[4][4];
++    float sr = 0.0f;
++    auto fetch = [&](int t) {  // tile t's value words and one scale a thread, into registers
++#pragma unroll
++        for (int j = 0; j < 4; ++j) {
++            const int b = threadIdx.x + j * THREADS, dg = b % (D / 4), key = t * BN + (b / (D / 4)) * 4;
++#pragma unroll
++            for (int i = 0; i < 4; ++i)
++                vr[j][i] = key + i < limit ? __ldg(reinterpret_cast<const uint32_t*>(vc + (hrow + key + i) * D) + dg) : 0u;
++        }
++        const int key = t * BN + threadIdx.x % BN;
++        sr = threadIdx.x < 2 * BN && key < limit ? __ldg((threadIdx.x < BN ? ks : vs) + hrow + key) : 0.0f;
++    };
++    auto put = [&](int t) {  // the fetched values transposed to dims a row, keys in f8_slot order; the scales
++        unsigned char* buf = base + (t & 1) * F8_BUF;
++#pragma unroll
++        for (int j = 0; j < 4; ++j) {
++            const int b = threadIdx.x + j * THREADS, dg = b % (D / 4), k0 = (b / (D / 4)) * 4;
++            const int s0 = f8_slot(k0), s1 = f8_slot(k0 + 2);
++#pragma unroll
++            for (int d = 0; d < 4; ++d) {
++                unsigned char* row = buf + F8_K + (4 * dg + d) * F8_VROW;
++                *reinterpret_cast<uint16_t*>(row + s0) = (uint16_t)__byte_perm(vr[j][0], vr[j][1], d | ((d + 4) << 4));
++                *reinterpret_cast<uint16_t*>(row + s1) = (uint16_t)__byte_perm(vr[j][2], vr[j][3], d | ((d + 4) << 4));
++            }
++        }
++        if (threadIdx.x < 2 * BN) reinterpret_cast<float*>(buf + F8_K + F8_V)[threadIdx.x] = sr;
++    };
++    auto keys = [&](int t) {  // tile t's key codes into its slot, 16 bytes a copy
++        unsigned char* buf = base + (t & 1) * F8_BUF;
++        for (int i = threadIdx.x; i < BN * (D / 16); i += THREADS) {
++            const int r = i / (D / 16), c = i % (D / 16), key = t * BN + r;
++            cp16z(buf + r * F8_KROW + c * 16, kc + (hrow + (key < limit ? key : 0)) * D + c * 16, key < limit);
++        }
++        commit();
++    };
++    uint32_t qa[D / 32][4];
++    float qs0, qs1;
++    {
++        const int r0 = wrow + g, r1 = r0 + 8;
++        const __nv_bfloat16* q0 = q + ((int64_t)min(r0, W - 1) * H + head) * D;
++        const __nv_bfloat16* q1 = q + ((int64_t)min(r1, W - 1) * H + head) * D;
++        float x0[D / 32][8], x1[D / 32][8], m0 = 0.0f, m1 = 0.0f;
++#pragma unroll
++        for (int s = 0; s < D / 32; ++s)
++#pragma unroll
++            for (int h = 0; h < 2; ++h) {
++                const int d = 32 * s + 16 * h + 4 * qd;
++                const uint2 w0 = r0 < W ? *reinterpret_cast<const uint2*>(q0 + d) : make_uint2(0u, 0u);
++                const uint2 w1 = r1 < W ? *reinterpret_cast<const uint2*>(q1 + d) : make_uint2(0u, 0u);
++                const __nv_bfloat162* b0 = reinterpret_cast<const __nv_bfloat162*>(&w0);
++                const __nv_bfloat162* b1 = reinterpret_cast<const __nv_bfloat162*>(&w1);
++#pragma unroll
++                for (int k = 0; k < 2; ++k) {
++                    const float2 f0 = __bfloat1622float2(b0[k]), f1 = __bfloat1622float2(b1[k]);
++                    x0[s][4 * h + 2 * k] = f0.x, x0[s][4 * h + 2 * k + 1] = f0.y;
++                    x1[s][4 * h + 2 * k] = f1.x, x1[s][4 * h + 2 * k + 1] = f1.y;
++                    m0 = fmaxf(m0, fmaxf(fabsf(f0.x), fabsf(f0.y)));
++                    m1 = fmaxf(m1, fmaxf(fabsf(f1.x), fabsf(f1.y)));
++                }
++            }
++        for (int x = 1; x <= 2; x *= 2) {
++            m0 = fmaxf(m0, __shfl_xor_sync(0xffffffffu, m0, x));
++            m1 = fmaxf(m1, __shfl_xor_sync(0xffffffffu, m1, x));
++        }
++        qs0 = m0 > 0.0f ? m0 / 448.0f : 1.0f;
++        qs1 = m1 > 0.0f ? m1 / 448.0f : 1.0f;
++        const float i0 = 1.0f / qs0, i1 = 1.0f / qs1;
++#pragma unroll
++        for (int s = 0; s < D / 32; ++s) {
++            qa[s][0] = e4m3x4(x0[s][0] * i0, x0[s][1] * i0, x0[s][2] * i0, x0[s][3] * i0);
++            qa[s][1] = e4m3x4(x1[s][0] * i1, x1[s][1] * i1, x1[s][2] * i1, x1[s][3] * i1);
++            qa[s][2] = e4m3x4(x0[s][4] * i0, x0[s][5] * i0, x0[s][6] * i0, x0[s][7] * i0);
++            qa[s][3] = e4m3x4(x1[s][4] * i1, x1[s][5] * i1, x1[s][6] * i1, x1[s][7] * i1);
++        }
++    }
++    float o[NB][4];
++#pragma unroll
++    for (int i = 0; i < NB; ++i) o[i][0] = o[i][1] = o[i][2] = o[i][3] = 0.0f;
++    float m0 = -INFINITY, m1 = -INFINITY, l0 = 0.0f, l1 = 0.0f;
++    const int pos0 = p0 + wrow + g, pos1 = pos0 + 8;
++    keys(0);
++    fetch(0);
++    put(0);
++    for (int t = 0; t < tiles; ++t) {
++        cp_wait<0>();
++        __syncthreads();  // tile t's keys, values and scales landed; every warp is done with tile t - 1's buffer
++        const bool more = t + 1 < tiles;
++        if (more) keys(t + 1);
++        const unsigned char* buf = base + (t & 1) * F8_BUF;
++        const float* kscale = reinterpret_cast<const float*>(buf + F8_K + F8_V);
++        const float* vscale = kscale + BN;
++        float sc[8][4];
++#pragma unroll
++        for (int s = 0; s < D / 32; ++s)
++#pragma unroll
++            for (int n = 0; n < 8; n += 2) {
++                uint32_t b[4];
++                ldmatrix4(b, buf + (8 * n + 8 * (mt / 2) + lane % 8) * F8_KROW + 32 * s + 16 * (mt % 2));
++                if (s == 0) sc[n][0] = sc[n][1] = sc[n][2] = sc[n][3] = sc[n + 1][0] = sc[n + 1][1] = sc[n + 1][2] = sc[n + 1][3] = 0.0f;
++                mma_e4m3(sc[n], qa[s], b[0], b[1]);
++                mma_e4m3(sc[n + 1], qa[s], b[2], b[3]);
++            }
++        if (more) {
++            fetch(t + 1);
++            put(t + 1);
++        }
++        const int kb = t * BN + 2 * qd;
++        float tm0 = -INFINITY, tm1 = -INFINITY;
++#pragma unroll
++        for (int n = 0; n < 8; ++n) {
++            const int c = kb + 8 * n;
++            const float k0 = kscale[8 * n + 2 * qd] * scale, k1 = kscale[8 * n + 2 * qd + 1] * scale;
++            sc[n][0] = c <= pos0 ? sc[n][0] * qs0 * k0 : -INFINITY;
++            sc[n][1] = c + 1 <= pos0 ? sc[n][1] * qs0 * k1 : -INFINITY;
++            sc[n][2] = c <= pos1 ? sc[n][2] * qs1 * k0 : -INFINITY;
++            sc[n][3] = c + 1 <= pos1 ? sc[n][3] * qs1 * k1 : -INFINITY;
++            tm0 = fmaxf(tm0, fmaxf(sc[n][0], sc[n][1]));
++            tm1 = fmaxf(tm1, fmaxf(sc[n][2], sc[n][3]));
++        }
++        for (int x = 1; x <= 2; x *= 2) {
++            tm0 = fmaxf(tm0, __shfl_xor_sync(0xffffffffu, tm0, x));
++            tm1 = fmaxf(tm1, __shfl_xor_sync(0xffffffffu, tm1, x));
++        }
++        const bool act0 = tm0 != -INFINITY, act1 = tm1 != -INFINITY;
++        const float n0 = act0 ? fmaxf(m0, tm0) : m0, n1 = act1 ? fmaxf(m1, tm1) : m1;
++        const float a0 = act0 ? (m0 == -INFINITY ? 0.0f : texp(m0 - n0)) : 1.0f;
++        const float a1 = act1 ? (m1 == -INFINITY ? 0.0f : texp(m1 - n1)) : 1.0f;
++        float c0[8], c1[8], w0 = 0.0f, w1 = 0.0f;
++#pragma unroll
++        for (int n = 0; n < 8; ++n) {
++            const int c = kb + 8 * n;
++            const float v0 = vscale[8 * n + 2 * qd], v1 = vscale[8 * n + 2 * qd + 1];
++            const float p00 = act0 && c <= pos0 ? texp(sc[n][0] - n0) : 0.0f;
++            const float p01 = act0 && c + 1 <= pos0 ? texp(sc[n][1] - n0) : 0.0f;
++            const float p10 = act1 && c <= pos1 ? texp(sc[n][2] - n1) : 0.0f;
++            const float p11 = act1 && c + 1 <= pos1 ? texp(sc[n][3] - n1) : 0.0f;
++            c0[n] = p00 + p01;
++            c1[n] = p10 + p11;
++            sc[n][0] = p00 * v0, sc[n][1] = p01 * v1, sc[n][2] = p10 * v0, sc[n][3] = p11 * v1;
++            w0 = fmaxf(w0, fmaxf(sc[n][0], sc[n][1]));
++            w1 = fmaxf(w1, fmaxf(sc[n][2], sc[n][3]));
++        }
++        for (int x = 1; x <= 2; x *= 2) {
++            w0 = fmaxf(w0, __shfl_xor_sync(0xffffffffu, w0, x));
++            w1 = fmaxf(w1, __shfl_xor_sync(0xffffffffu, w1, x));
++        }
++        l0 = l0 * a0 + rowsum(c0);
++        l1 = l1 * a1 + rowsum(c1);
++        m0 = n0;
++        m1 = n1;
++        const float s0 = w0 > 0.0f ? w0 / 448.0f : 1.0f, s1 = w1 > 0.0f ? w1 / 448.0f : 1.0f;
++        const float i0 = 1.0f / s0, i1 = 1.0f / s1, f0 = a0 * i0, f1 = a1 * i1;
++#pragma unroll
++        for (int i = 0; i < NB; ++i) {
++            o[i][0] *= f0, o[i][1] *= f0, o[i][2] *= f1, o[i][3] *= f1;
++        }
++#pragma unroll
++        for (int c = 0; c < 2; ++c) {
++            const int n = 4 * c;
++            const uint32_t pa[4] = {e4m3x4(sc[n][0] * i0, sc[n][1] * i0, sc[n + 1][0] * i0, sc[n + 1][1] * i0),
++                                    e4m3x4(sc[n][2] * i1, sc[n][3] * i1, sc[n + 1][2] * i1, sc[n + 1][3] * i1),
++                                    e4m3x4(sc[n + 2][0] * i0, sc[n + 2][1] * i0, sc[n + 3][0] * i0, sc[n + 3][1] * i0),
++                                    e4m3x4(sc[n + 2][2] * i1, sc[n + 2][3] * i1, sc[n + 3][2] * i1, sc[n + 3][3] * i1)};
++#pragma unroll
++            for (int i = 0; i < NB; i += 2) {
++                uint32_t b[4];
++                ldmatrix4(b, buf + F8_K + (8 * i + 8 * (mt / 2) + lane % 8) * F8_VROW + 32 * c + 16 * (mt % 2));
++                mma_e4m3(o[i], pa, b[0], b[1]);
++                mma_e4m3(o[i + 1], pa, b[2], b[3]);
++            }
++        }
++#pragma unroll
++        for (int i = 0; i < NB; ++i) {
++            o[i][0] *= s0, o[i][1] *= s0, o[i][2] *= s1, o[i][3] *= s1;
++        }
++    }
++    const int r0 = wrow + g, r1 = r0 + 8;
++#pragma unroll
++    for (int i = 0; i < NB; ++i) {
++        const int d = 8 * i + 2 * qd;
++        if (r0 < W) *reinterpret_cast<uint32_t*>(out + ((int64_t)r0 * H + head) * D + d) = pack(tdiv(o[i][0], l0), tdiv(o[i][1], l0));
++        if (r1 < W) *reinterpret_cast<uint32_t*>(out + ((int64_t)r1 * H + head) * D + d) = pack(tdiv(o[i][2], l1), tdiv(o[i][3], l1));
++    }
++}
++
++}  // namespace tf_prefill_attention
++
++template __global__ void tf_prefill_attention::hpattn8_f8_whole_kernel<8, 2>(const __nv_bfloat16* __restrict__,
++    const uint8_t* __restrict__, const uint8_t* __restrict__, const float* __restrict__, const float* __restrict__,
++    __nv_bfloat16* __restrict__, int, int, int, int, int, float, int);
+diff --git a/zig/src/families/qwen3_5/cuda_prompt.zig b/zig/src/families/qwen3_5/cuda_prompt.zig
+index d6e4fdd0b..0c0a3a31b 100644
+--- a/zig/src/families/qwen3_5/cuda_prompt.zig
++++ b/zig/src/families/qwen3_5/cuda_prompt.zig
+@@ -14,26 +14,30 @@ pub const page_ids: u32 = 768;
+ const hpc = 2;
+ const block_rows = 16 * (8 / hpc);
+ 
+-pub const Fns = struct { bf16: cuda.Function, fp8: cuda.Function, bf16_whole: cuda.Function, fp8_whole: cuda.Function, bf16_p256: cuda.Function, bf16_p256_ids: cuda.Function, chain: cuda.Function };
++pub const Fns = struct { bf16: cuda.Function, fp8: cuda.Function, bf16_whole: cuda.Function, fp8_whole: cuda.Function, f8_whole: ?cuda.Function, bf16_p256: cuda.Function, bf16_p256_ids: cuda.Function, chain: cuda.Function };
+ 
+ pub const symbols = struct {
+     pub const bf16 = "_ZN20tf_prefill_attention13hpattn_kernelILi256ELi8ELi2ELi2EEEvPK13__nv_bfloat16S3_S3_PS1_iiiiifiPKixi";
+     pub const fp8 = "_ZN20tf_prefill_attention14hpattn8_kernelILi256ELi8ELi2ELi2EEEvPK13__nv_bfloat16PKhS5_PKfS7_PS1_iiiiifiPKixi";
+     pub const bf16_whole = "_ZN20tf_prefill_attention19hpattn_whole_kernelILi256ELi8ELi2ELi2EEEvPK13__nv_bfloat16S3_S3_PS1_iiiiifi";
+     pub const fp8_whole = "_ZN20tf_prefill_attention20hpattn8_whole_kernelILi256ELi8ELi2ELi2EEEvPK13__nv_bfloat16PKhS5_PKfS7_PS1_iiiiifi";
++    pub const f8_whole = "_ZN20tf_prefill_attention23hpattn8_f8_whole_kernelILi8ELi2EEEvPK13__nv_bfloat16PKhS5_PKfS7_PS1_iiiiifi";
+     pub const bf16_p256 = "_ZN20tf_prefill_attention18hpattn_p256_kernelILi256ELi8ELi2ELi2EEEvPK13__nv_bfloat16S3_S3_PS1_iiiiifiPKixi";
+     pub const bf16_p256_ids = "_ZN20tf_prefill_attention22hpattn_p256_ids_kernelILi256ELi8ELi2ELi2EEEvPK13__nv_bfloat16S3_S3_PS1_iiiiifiPKixi";
+     pub const chain = "_ZN14tf_gdn_prefill12chain_kernelI13__nv_bfloat16S1_Li64ELi32EEEvPKT_S4_PKS1_PKfPKT0_S8_PfPS1_iii";
+ };
++/// hpattn8_f8_whole_kernel's two buffers: a tile's keys, transposed values and scales (prefill_attention_f8.cuh).
++pub const f8_smem: u32 = 76800;
+ /// gdn_prefill.cu's value rows a block (two threads a row).
+ const chain_rows = 64;
+ 
+ pub fn resolve(attention: cuda.Module, gdn: cuda.Module) !Fns {
+-    const f: Fns = .{ .bf16 = try attention.function(symbols.bf16), .fp8 = try attention.function(symbols.fp8), .bf16_whole = try attention.function(symbols.bf16_whole), .fp8_whole = try attention.function(symbols.fp8_whole), .bf16_p256 = try attention.function(symbols.bf16_p256), .bf16_p256_ids = try attention.function(symbols.bf16_p256_ids), .chain = try gdn.function(symbols.chain) };
++    const f: Fns = .{ .bf16 = try attention.function(symbols.bf16), .fp8 = try attention.function(symbols.fp8), .bf16_whole = try attention.function(symbols.bf16_whole), .fp8_whole = try attention.function(symbols.fp8_whole), .f8_whole = if (try @import("sys").environment.read(bool, "TF_QWEN_PREFILL_FP8", false)) try attention.function(symbols.f8_whole) else null, .bf16_p256 = try attention.function(symbols.bf16_p256), .bf16_p256_ids = try attention.function(symbols.bf16_p256_ids), .chain = try gdn.function(symbols.chain) };
+     try f.bf16.allowDynamicShared(smem);
+     try f.fp8.allowDynamicShared(smem);
+     try f.bf16_whole.allowDynamicShared(smem);
+     try f.fp8_whole.allowDynamicShared(smem);
++    if (f.f8_whole) |k| try k.allowDynamicShared(f8_smem);
+     try f.bf16_p256.allowDynamicShared(smem);
+     try f.bf16_p256_ids.allowDynamicShared(smem + 4 * page_ids);
+     return f;
+@@ -94,10 +98,11 @@ pub fn runFrom(e: *E.Engine, layer: usize, from: usize, end: usize) !void {
+     const paged = sg.pt != 0;
+     var a = arguments(e, sg, layer, rows, from * g.q_heads * head_dim * 2);
+     const ids = if (p256(e, sg)) pageIds(sg, rows) else 0;
+-    const cfg: cuda.Config = .{ .grid = .{ .x = @intCast((rows + block_rows - 1) / block_rows), .y = @intCast(g.kv_heads * (group / hpc)) }, .block = .{ .x = 256 }, .shared = smem + 4 * ids };
++    const f8 = if (!paged and e.kv8) e.prompt_attn.f8_whole else null;
++    const cfg: cuda.Config = .{ .grid = .{ .x = @intCast((rows + block_rows - 1) / block_rows), .y = @intCast(g.kv_heads * (group / hpc)) }, .block = .{ .x = 256 }, .shared = if (f8 != null) f8_smem else smem + 4 * ids };
+     // 256-position pages: the kernel with the page size a constant, page ids in shared memory if they fit
+     const f = if (paged) (if (e.kv8) e.prompt_attn.fp8 else if (sg.ptok == 256) (if (ids > 0) e.prompt_attn.bf16_p256_ids else e.prompt_attn.bf16_p256) else e.prompt_attn.bf16) else (if (e.kv8) e.prompt_attn.fp8_whole else e.prompt_attn.bf16_whole);
+-    try cuda.launch.launch(f, cfg, e.stream, &a);
++    try cuda.launch.launch(f8 orelse f, cfg, e.stream, &a);
+ }
+ 
+ /// Linear layer `layer`'s delta rule: e.q, e.k, e.v, e.g_, e.beta into e.y, the stream's recurrence updated in place.
+diff --git a/zig/src/platform/environment.zig b/zig/src/platform/environment.zig
+index 24ff873e9..44cac2c91 100644
+--- a/zig/src/platform/environment.zig
++++ b/zig/src/platform/environment.zig
+@@ -32,6 +32,7 @@ pub fn isReal(kind: Kind) bool {
+ 
+ pub const rules = [_]Rule{
+     .{ .name = "TF_CACHE_EVICT", .scope = .common, .kind = .word, .words = &.{ "main", "decayed_resume" }, .forms = "main or decayed_resume (default main)" },
++    .{ .name = "TF_QWEN_PREFILL_FP8", .scope = .cuda, .kind = .flag, .forms = "0 or 1 (1: kv8 whole-cache prompt attention on e4m3 tensor cores, not token-identical; default 0)" },
+     .{ .name = "TF_FLASHNEXT_BATCH_DRAWS", .scope = .cuda, .kind = .flag, .blank_default = false, .forms = "0 or 1 (0 restores per-stream Flash Next row draws; default 1)" },
+     .{ .name = "TF_STARTUP_RECEIPT", .scope = .common, .kind = .flag, .forms = "0 or 1 (opt-in startup and first completion receipts)" },
+     .{ .name = "TF_SHARED_PRICE_LOG", .scope = .common, .kind = .flag, .forms = "0 or 1 (1 logs the shared plain price, a line a round)" },

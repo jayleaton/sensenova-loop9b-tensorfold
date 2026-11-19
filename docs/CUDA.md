@@ -5,7 +5,7 @@ The `qwen3_5` CUDA family executes the loop plan and the two-stream mHC on one G
 | | |
 | --- | --- |
 | Hardware | 1x NVIDIA DGX Spark (GB10, 128 GB unified), CUDA 13.0 |
-| Engine | upstream TensorFold `038e4a27872eaa018adc67b1b5ddffd16820c498` (on `main`, 2026-11-17) + [`patches/cuda/`](../patches/cuda/) `0001`-`0022` |
+| Engine | upstream TensorFold `038e4a27872eaa018adc67b1b5ddffd16820c498` (on `main`, 2026-11-17) + [`patches/cuda/`](../patches/cuda/) `0001`-`0022` (served, `config/cuda/`); `0001`-`0027` is the validated next build ([v6](#v6-the-loop-seam-and-one-barrier-prefill), `config/cuda-v6/`) |
 | Engine tree | `d5938b12bbcc1294e6a24600111cbd4c8d86f159`: the serving engine (`0001`-`0022`, without `0008`, is the build behind the numbers below, byte for byte) plus the converter (`0008`); the rows marked `0019` were measured on `0001`-`0019`, whose tokens are the same |
 | Weights served | MLX affine 8-bit g64 text weights ([CONVERT](CONVERT.md)) and the BF16 vision tower, YaRN factor 4 (1,048,576 positions) |
 
@@ -24,6 +24,10 @@ That runs `scripts/fetch-engine.sh cuda engine-cuda` (fetch the pin, `git am` th
 zig build native -Dnvcc=/usr/local/cuda/bin/nvcc        # zig-out/native/bin/tensorfold-native
 zig build qwen35-cuda -Dnvcc=/usr/local/cuda/bin/nvcc   # tf-qwen35-cuda, the parity tool
 ```
+
+For the validated v6 build, `scripts/build-engine.sh cuda-v6 engine-cuda-v6` (the series through `0027`, tree
+`9bac6ecbdef1c03861d824e930799edcb3b3de16`); it serves with the same tree and profile
+(`scripts/serve.sh cuda-v6 engine-cuda-v6 loop9b-q8-vis`).
 
 Set `NVCC=` to use another `nvcc`. `NVCC=none` builds the host code without kernel images; use it only to check that the
 series compiles on a machine without CUDA.
@@ -113,8 +117,65 @@ Measured on the build above, the tree above and these flags, on one DGX Spark:
 | disk tier during the soak | 39 states saved, 19 read back, 0 refusals, 0 restore fallbacks |
 | thinking budget | a runaway-prone prompt stopped thinking at 4,097 tokens |
 
+Long context on the served build (2026-11-18, the profile above):
+
+| check | result |
+| --- | --- |
+| decode, one chat | 14.35 tok/s at a short context, 12.53 after 63,735 tokens |
+| cold prefill, 63,716 / 223,827 / 492,251 tokens | 42.47 / 227.01 / 785.3 s |
+| 1,048,576-token window, cold prefill | 2,825 s; then 4.5 tok/s decode, and 4.3 s to restore the cached prefix |
+| recall at YaRN factor 4, greedy | 231K, 300K and 362K tokens: 4/4 each; 500K: 4, 4, 4, 3 (follow-up 3/4); 1M: 4/4 (follow-up 4/4) |
+| token check (6 fixed prompts) | 6/6 |
+
 8-bit is the served width because 4-bit loses too much on this model through the CUDA affine path: against the
 engine's own BF16, q8 keeps top-1 on 246 of 249 positions (cosine 0.9963 at worst), q4 on 220.
+
+## v6: the loop seam and one-barrier prefill
+
+`0023`-`0027` (`config/cuda-v6/`) were validated on 2026-11-19 with the served tree and flags, and are **not yet
+served**. Served output differs from the `0022` build because of the seam fix.
+
+- **`0023`, the loop seam.** The two mHC streams now collapse at the seam on every visit, as the reference does.
+  Against the HF BF16 reference over 14 prompts, 736 teacher-forced positions, `0022` to `0027`: mean KL 0.0244 to
+  0.0186 (lower on 13 of 14 prompts), mean `|Δlogit|` 0.342 to 0.317, top-1 707 to 717 of 736, agreement with HF's
+  greedy token 708 to 716, top-8 set equal 216 to 247.
+- **`0025`-`0027`, one barrier.** The kv8 whole-cache prompt attention drops its second barrier, with bit-identical
+  output: cold prefill 1.04x / 1.09x / 1.13x faster at 64K / 224K / 492K tokens (40.99 / 208.42 / 694.8 s).
+- **Checks:** token check 6/6, every token hash equal to the seam-only build; strict tool gate pass; 231K-token
+  recall greedy 4/4 with the follow-up correct. Decode is unchanged by construction and was not re-measured.
+- **Rollback switches:** `TF_Q35_MHC_CARRY=1` restores the old seam carry; `TF_QWEN_PREFILL_TUNE=0` restores the
+  second barrier. Put either in the environment or in `config/cuda-v6/serve.env`.
+
+### FP8 prompt attention (opt-in, off)
+
+`0024` adds `TF_QWEN_PREFILL_FP8=1`: the kv8 whole-cache prompt attention on e4m3 tensor cores. The kernel is 1.27x
+faster, but it is not exact: top-1 holds on 500 of 512 positions at 4K (97.7%), 497 of 512 at 16K and 1,003 of 1,024
+at 60K, so it flips 2-3% of top-1 tokens. End-to-end prefill with it was not timed. It stays off by default.
+
+## Task benchmarks
+
+On the served `0022` engine with the converter's **4-bit** tree (not the served 8-bit one), greedy, copy drafts on,
+`--parallel 4 --context 33024`; 104.2 tok/s aggregate over the run:
+
+| benchmark | score |
+| --- | --- |
+| HumanEval+ | 126/164 (76.8%) |
+| MBPP+ | 239/378 (63.2%) |
+| GSM8K, thinking off / on | 282/300 (94.0%) / 283/300 (94.3%) |
+| MATH, thinking off / on | 171/200 (85.5%) / 182/200 (91.0%) |
+| BFCL | 116/200 (58.0%) |
+
+Of BFCL's 84 misses, 72 answer in prose with no tool call, 4 name the function without arguments and 8 call the wrong
+function or arguments ([KNOWN-ISSUES](KNOWN-ISSUES.md#cuda)).
+
+**Agentic coding (OpenCode).** On an earlier build of the same series: 3 of 10 tasks done with four sessions at once, 2
+of 5 alone (Snake 2/2, a todo app 1/2, Tetris, a numeric tools module and a big-number calculator 0/2). Failures come
+from the 30-minute cap a task gets and the throughput behind it; 9.3% of tool calls failed, mostly `edit` calls whose `oldString` did
+not match. A smoke run on `0022`: 20.4 tok/s and 3.7 s TTFT at the median, 1 of 5 graded.
+
+**Images.** The CUDA image path matches transformers' bf16 rounding. Four images in one request, drawn in an ordinary
+font, read 4/4; one image sent alone was misread; a 5x7 pixel block font the model cannot read at all. The engine
+caps a request at 4 images. The served image gate passes; a parity test for the image path is not in the series yet.
 
 The results below come from the earlier 4-bit, 32K profile on `0001`-`0009`, and have not been re-measured on the
 serving series.
@@ -207,6 +268,8 @@ numbers.
 - `zig fmt --check build.zig zig`: clean with `0009`. The measured tree (`0001`-`0007`) had three files zig fmt rewrites;
   `0009` is that rewrite and changes no code.
 - `python3 tools/zig/lean_check.py`: 221 findings at the pin and 221 with the series (0 new); `tools/pr_check.py`: 0.
+  Re-run on `0001`-`0027`: `zig fmt --check build.zig zig` clean, lean_check 221 (0 new), `pr_check` 0 errors (one
+  advisory: a changelog entry).
 - mHC kernel contract (`0007`, `zig/tests/cuda/contract_q35_mhc.zig`): five cases (router branch, router pre/post/mix,
   merge in place, enter, leave) at hidden 4096, rows 1 to 4096, FP64 references and one planted control each:
   `SUMMARY 5 kernels: 5 pass gates 1-4, 0 fail; 5 controls: 5 red as planted`.

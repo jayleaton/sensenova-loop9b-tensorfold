@@ -2,7 +2,7 @@ Follow me on X for more updates: https://x.com/jayleaton
 
 Support me here: https://buymeacoffee.com/jayleaton
 
-# SenseNova-Loop-9B on TensorFold: DGX Spark and Mac Studio
+# SenseNova-Loop-9B on TensorFold: DGX Spark, Macs and RTX
 
 A recipe for serving [SenseNova-Loop-9B](https://huggingface.co/sensenova/SenseNova-Loop-9B) with
 [TensorFold](https://github.com/ashhart/TensorFold) on two backends: CUDA on one NVIDIA DGX Spark (TP=1) or a 16 GB RTX
@@ -30,13 +30,75 @@ No weights are included or published: you download the checkpoint from SenseNova
 
 More in [CREDITS](docs/CREDITS.md); license terms in [LICENSING](docs/LICENSING.md) and [NOTICE](NOTICE).
 
+## Pick your device
+
+Each row is a recipe that was built and run end to end. Every build checks the exact engine tree before it compiles
+(`config/<config>/tensorfold.tree`). Numbers are one stream unless marked.
+
+| device | weights | engine (`config/`) | speed | quality | limits |
+| --- | --- | --- | --- | --- | --- |
+| **DGX Spark** (GB10, 128 GB), **served** | 8-bit MLX g64 + BF16 vision tower, YaRN 4 (1M context) | `cuda`: pin `038e4a278` + `patches/cuda` `0001`-`0022` | decode 14.4-18.0 tok/s one chat; copy drafts 15.3 / 33.3 / 54.5 tok/s aggregate at 1 / 2 / 4 chats; cold prefill 64K in 42.5 s | top-1 equal to BF16 HF; 8-bit top-1 246/249; token check 6/6; strict tool gate pass; recall 4/4 at 231K-362K and 1M | 0.05 parity gate not met; tool calls under `auto` often answer in prose |
+| **DGX Spark, v6** (validated, not yet served) | same tree | `cuda-v6`: the same + `0023`-`0027` | prefill 1.04x / 1.09x / 1.13x at 64K / 224K / 492K; decode unchanged | closer to HF: mean KL 0.0244 to 0.0186, top-1 717/736 (was 707); token check 6/6; tool gate pass | not served yet; decode not re-measured |
+| **Mac Studio M5 Ultra** | 4-bit MLX g64 (vision tower carried) | `metal`: pin `6d0a128b0` + `patches/metal` `0001`-`0044` | decode 59.5-60.0 tok/s; prefill 2,709-2,752 tok/s to 8k, 2,461 at 32k; copy drafts: re-quote 362, code 87, prose 94 tok/s | task gate: code 64/64, reasoning 64/64, prose 19/64 (the reference's noise floor) | one image a request; default window 33,024 (4,096 with images) |
+| **16 GB Mac** (M-series) | the same 4-bit tree, 5.07 GB | `metal` | 58 tok/s decode; 2,719 tok/s prefill at 8k; peak 7.60 / 7.82 / 9.13 GiB at 4k / 8k / 32k | same tree as the Studio | measured under a 16 GB working-set cap on the M5 Ultra; 8 GB Macs not supported |
+| **MacBook Pro M4 Pro** (24 GB) | the same 4-bit tree | `metal` | 26.7 tok/s decode; prefill about 230 tok/s (32k prompt: 166 s to first token) | same tree as the Studio | slow prefill on long prompts; quality not separately measured |
+| **RTX 5070 Ti 16 GB** (WSL2) | EXL3 `sn-6.0` (8.29 GB) you quantize; `sn-4.0` for speed | `rtx`: pin `038e4a278` + `patches/cuda` `0001`-`0022` + `patches/rtx` `0001`-`0002` | `sn-6.0` 44-47 tok/s at 4k, 39-44 at 32k, prefill 2,232 tok/s; copy drafts re-quote 660, code 534 tok/s; host prompt cache restores 109K tokens in 4.5 s (30x) | gate cosine 0.99931, top-1 290/298; 36/36 tool calls; 30-minute soak, 0 failures | no live KV in host RAM (212,992-token fp8 window); packs not published; native Windows untested |
+
+**DGX Spark** ([CUDA](docs/CUDA.md)), CUDA 13 toolkit and Zig 0.17.0:
+
+```bash
+scripts/build-engine.sh cuda engine-cuda                     # served v5; cuda-v6 for the validated v6
+python3 engine-cuda/tools/sensenova_loop_mlx.py --source SenseNova-Loop-9B --out loop9b-mlx8 --bits 8
+python3 scripts/serve-tree.py engine-cuda loop9b-mlx8 SenseNova-Loop-9B loop9b-q8-vis 4
+scripts/serve.sh cuda engine-cuda loop9b-q8-vis              # 1M context, 4 chats, fp8 KV, images, port 8090
+```
+
+v6: `scripts/build-engine.sh cuda-v6 engine-cuda-v6`, then `scripts/serve.sh cuda-v6 engine-cuda-v6 loop9b-q8-vis`
+on the same tree. `TF_Q35_MHC_CARRY=1` and `TF_QWEN_PREFILL_TUNE=0` roll back its two changes;
+`TF_QWEN_PREFILL_FP8=1` is an opt-in FP8 prompt attention that flips 2-3% of top-1 tokens and stays off.
+
+**Mac Studio, 16 GB Mac, MacBook Pro** ([METAL](docs/METAL.md)), Xcode with the macOS SDK and Metal toolchain:
+
+```bash
+scripts/build-engine.sh metal engine-metal
+python3 engine-metal/tools/sensenova_loop_mlx.py --source SenseNova-Loop-9B --out loop9b-mlx4
+scripts/serve.sh metal engine-metal loop9b-mlx4                  # --context 33024 --parallel 4, copy drafts on
+PROFILE=vision scripts/serve.sh metal engine-metal loop9b-mlx4   # image input
+```
+
+**RTX 16 GB** ([RTX](docs/RTX.md), with the WSL2 steps), CUDA 13 toolkit and Zig 0.17.0:
+
+```bash
+scripts/build-engine.sh rtx engine-rtx                       # SM=120 (RTX 50) by default
+# quantize sn-6.0 with exllamav3: see docs/RTX.md#quantize
+scripts/serve.sh rtx engine-rtx sn-6.0                       # --parallel 1 --kv-cache fp8 --context 212992
+```
+
+Every command above needs the checkpoint downloaded first ([Quick start](#quick-start)).
+
+## Versions
+
+| version | `config/` | upstream pin | patches | engine tree | verified | status | headline |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| CUDA v5 | `cuda` | `038e4a278` | `cuda` `0001`-`0022` | `d5938b12bbcc` | 2026-11-18 | **served** | 1M context, 4 chats; copy drafts 54.5 tok/s aggregate at 4 chats; recall 4/4 at 1M; tool gate pass |
+| CUDA v6 | `cuda-v6` | `038e4a278` | `cuda` `0001`-`0027` | `9bac6ecbdef1` | 2026-11-19 | **validated, not yet served** | loop-seam fix (mean KL 0.0244 to 0.0186); prefill up to 1.13x; same checks pass |
+| RTX | `rtx` | `038e4a278` | `cuda` `0001`-`0022`, `rtx` `0001`-`0002` | `0f61f4723db8` | 2026-11-19 | tested on an RTX 5070 Ti | `sn-6.0` 44-47 tok/s, 36/36 tools, copy drafts up to 660 tok/s |
+| Metal | `metal` | `6d0a128b0` | `metal` `0001`-`0044` | `d33e2d93ea37` | 2026-11-18 | tested on M5 Ultra and M4 Pro | q4 60 tok/s, task gate code and reasoning 64/64, images |
+
+Full tree hashes are in each `config/<config>/tensorfold.tree`. The `tensorfold-native` binaries measured had sha256
+`f2cde8048449c9f743122e1818eff31823fc0173e254724e96ebdba3f12362b5` (v5) and
+`7c7548eb1840afa62f68ed3e2d1b203c8ce41aedcb24d277a57a9996f2aaf473` (v6, version 1.2.9); your build of the same tree may hash
+differently with another toolchain. Details: [ENGINE](docs/ENGINE.md).
+
+## Overview
+
 | | |
 | --- | --- |
 | Model | [`sensenova/SenseNova-Loop-9B`](https://huggingface.co/sensenova/SenseNova-Loop-9B) @ `329a65f701ba8c48b73c30d0cbaa6f0449733673`, BF16, Apache-2.0 |
 | Architecture | Qwen3.5 dense hybrid attention; physical layers `[4, 28)` run twice (56 executions from 32 weight sets), wrapped in a two-stream mHC ([MODEL](docs/MODEL.md)) |
 | Weights served | MLX affine g64, converted with [`tools/sensenova_loop_mlx.py`](docs/CONVERT.md) from the patch series: 8-bit on CUDA, 4-bit on Metal |
-| CUDA | 1x DGX Spark (GB10), TP=1: upstream TensorFold [`038e4a278`](config/cuda/tensorfold.rev) + [`patches/cuda/`](patches/cuda/) `0001`-`0022` |
-| RTX | 16 GB RTX cards (tested on an RTX 5070 Ti, WSL2): the CUDA pin and series `0001`-`0019` + [`patches/rtx/`](patches/rtx/) `0001`-`0002`, EXL3 packs |
+| CUDA | 1x DGX Spark (GB10), TP=1: upstream TensorFold [`038e4a278`](config/cuda/tensorfold.rev) + [`patches/cuda/`](patches/cuda/) `0001`-`0022` (served); `0001`-`0027` validated ([`config/cuda-v6`](config/cuda-v6/)) |
+| RTX | 16 GB RTX cards (tested on an RTX 5070 Ti, WSL2): the CUDA pin and series `0001`-`0022` + [`patches/rtx/`](patches/rtx/) `0001`-`0002`, EXL3 packs |
 | Metal | Apple Silicon (measured on M5 Ultra and M4 Pro): upstream TensorFold [`6d0a128b0`](config/metal/tensorfold.rev) + [`patches/metal/`](patches/metal/) `0001`-`0044` |
 | Input | text and images on both ([CUDA](docs/CUDA.md#serve), [METAL](docs/METAL.md#images)) |
 | Drafts | copy drafts on by default on both: drafts from a stream's own context, verified, so tokens are unchanged |
@@ -70,9 +132,11 @@ runs at 362 tok/s, a code edit at 87 and prose at 94, all 16 reply pairs token-i
 MacBook Pro (24 GB) decodes at 26.7 tok/s ([METAL](docs/METAL.md#copy-drafts)).
 
 **RTX 16 GB: EXL3 packs.** Tested on an RTX 5070 Ti 16 GB in WSL2 with the CUDA series plus `patches/rtx/`
-([RTX](docs/RTX.md)): the 6.0-bit pack decodes at 46.6 tok/s at 4k and 43.9 at 32k with drafts off, prefills at 2,232
-tok/s, passes 36/36 tool calls and a 30-minute soak, and its gate logits equal the DGX Spark's run of the same pack.
-The 4.0-bit pack decodes at 59.1 tok/s. No packs are published; you quantize them yourself.
+([RTX](docs/RTX.md)): the 6.0-bit pack decodes at 44-47 tok/s at 4k and 39-44 at 32k with drafts off, prefills at
+2,232 tok/s, passes 36/36 tool calls and a 30-minute soak, and its gate logits equal the DGX Spark's run of the same
+pack. Copy drafts take a re-quote to 660 tok/s and a code edit to 534, token-identical; the host-RAM prompt cache
+restores a 109,313-token prefix in 4.48 s against 133.6 s cold. The 4.0-bit pack decodes at 59.1 tok/s. No packs are
+published; you quantize them yourself.
 
 **Tool calls need `libtfgrammar`.** `tool_choice: "required"`, a named function and `response_format` need
 `libtfgrammar` (`.so` on Linux, `.dylib` on macOS) beside the server, built from xgrammar v0.2.8 with
@@ -134,7 +198,8 @@ hf download sensenova/SenseNova-Loop-9B --revision 329a65f701ba8c48b73c30d0cbaa6
   --local-dir SenseNova-Loop-9B
 ```
 
-**CUDA, on a DGX Spark** (CUDA 13 toolkit; [CUDA](docs/CUDA.md)):
+Then build and serve for your device ([Pick your device](#pick-your-device)). **CUDA, on a DGX Spark** (CUDA 13
+toolkit; [CUDA](docs/CUDA.md)):
 
 ```bash
 scripts/build-engine.sh cuda engine-cuda                     # pin + patches/cuda, then zig build native -Dnvcc=...
@@ -162,7 +227,7 @@ curl -s http://127.0.0.1:8090/v1/chat/completions -H 'Content-Type: application/
 Thinking is on by default (the checkpoint's chat template); send `"chat_template_kwargs": {"enable_thinking": false}`
 to turn it off. A `--thinking-budget` at or above `max_tokens` never closes the thinking block (the reply ends with
 `length`); keep it under `max_tokens` or add `--thinking-reserve N`. Build `libtfgrammar` for required and named tool
-calls (see above). To check the patch series without building, run `scripts/fetch-engine.sh cuda|metal|rtx DIR`: it fetches
+calls (see above). To check the patch series without building, run `scripts/fetch-engine.sh cuda|cuda-v6|metal|rtx DIR`: it fetches
 the pin, applies the series and checks the resulting tree.
 
 ## Not yet
@@ -179,7 +244,7 @@ the pin, applies the series and checks the resulting tree.
 | [CUDA](docs/CUDA.md) | DGX Spark: build, the served 1M profile, parity, speed |
 | [METAL](docs/METAL.md) | Apple Silicon: build, serve, copy drafts, fidelity, speed |
 | [RTX](docs/RTX.md) | EXL3 packs on a 16 GB RTX card: results on an RTX 5070 Ti, pack choice, WSL2 steps |
-| [ENGINE](docs/ENGINE.md) | the pins and both patch series, patch by patch |
+| [ENGINE](docs/ENGINE.md) | the pins and the patch series, patch by patch |
 | [KNOWN-ISSUES](docs/KNOWN-ISSUES.md) | what is not solved |
 | [CREDITS](docs/CREDITS.md) / [LICENSING](docs/LICENSING.md) | who built what, and under which terms |
 

@@ -9,7 +9,7 @@ This project builds on third-party work that keeps its own license:
 
 TensorFold
   https://github.com/ashhart/TensorFold
-  Fetched at build time at the commits in config/cuda/tensorfold.rev and config/metal/tensorfold.rev; not included
+  Fetched at build time at the commits in config/*/tensorfold.rev; not included
   here. The files in patches/ are modifications of TensorFold source. The changes are this project's work under
   Apache-2.0; the TensorFold code they modify, and quote as diff context, stays under TensorFold's license, so keep
   TensorFold's copyright and permission notices with any copy of a patched tree. TensorFold's NOTICE, reproduced

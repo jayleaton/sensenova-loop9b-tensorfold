@@ -1,0 +1,90 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Jay Leaton <58495321+jayleaton@users.noreply.github.com>
+Date: Thu, 19 Nov 2026 08:58:52 +0700
+Subject: [PATCH 23/27] qwen3_5: mHC streams collapse at the loop seam on every
+ visit, as the reference (TF_Q35_MHC_CARRY=1 keeps the old carry for A/B)
+
+---
+ zig/src/families/qwen3_5/cuda_forward.zig        | 3 ++-
+ zig/src/families/qwen3_5/cuda_loop_plan_test.zig | 4 ++++
+ zig/src/families/qwen3_5/cuda_mhc.zig            | 5 +++++
+ zig/src/platform/environment.zig                 | 1 +
+ zig/src/platform/environment_test.zig            | 1 +
+ 5 files changed, 13 insertions(+), 1 deletion(-)
+
+diff --git a/zig/src/families/qwen3_5/cuda_forward.zig b/zig/src/families/qwen3_5/cuda_forward.zig
+index b54f684c9..3f556a94e 100644
+--- a/zig/src/families/qwen3_5/cuda_forward.zig
++++ b/zig/src/families/qwen3_5/cuda_forward.zig
+@@ -60,6 +60,7 @@ pub fn body(e: *E.Engine, shape: anytype) !void {
+     // every execution names a physical layer the engine loaded
+     for (0..steps) |i| if (g.physical(i) >= e.layers.len) return error.BadQwenPlan;
+     const mhc = g.mhc;
++    const carry = mhc != null and try @import("sys").environment.read(bool, "TF_Q35_MHC_CARRY", false);
+     var entered = false;
+     for (0..steps) |i| {
+         const ph = g.physical(i);
+@@ -172,7 +173,7 @@ pub fn body(e: *E.Engine, shape: anytype) !void {
+             const m = mhc.?;
+             try hyper.merge(e, total, m); // the FFN's r into the streams
+             const next: usize = if (i + 1 < steps) g.physical(i + 1) else g.layers;
+-            if (!m.holds(next)) {
++            if (hyper.leaves(m, ph, next, carry)) {
+                 try hyper.leave(e, total, m);
+                 entered = false;
+             }
+diff --git a/zig/src/families/qwen3_5/cuda_loop_plan_test.zig b/zig/src/families/qwen3_5/cuda_loop_plan_test.zig
+index ee2586952..6c3287203 100644
+--- a/zig/src/families/qwen3_5/cuda_loop_plan_test.zig
++++ b/zig/src/families/qwen3_5/cuda_loop_plan_test.zig
+@@ -30,6 +30,10 @@ test "SenseNova-Loop-9B: [4,28) twice over 32 layers is 56 executions, 14 attent
+     const m = g.mhc.?;
+     try std.testing.expectEqual(@as(usize, 8), m.outputs());
+     try std.testing.expect(m.holds(4) and m.holds(27) and !m.holds(3) and !m.holds(28));
++    // the streams collapse after 27 on both visits, and stay between interior layers
++    const leaves = @import("cuda_mhc.zig").leaves;
++    try std.testing.expect(leaves(m, 27, g.physical(28), false) and leaves(m, 27, g.physical(52), false));
++    try std.testing.expect(!leaves(m, 26, 27, false) and !leaves(m, 27, g.physical(28), true));
+     // a looped model has no physical stage slice, and a learned identity map is not what the kernels run
+     try std.testing.expectError(error.BadStageRange, g.stage(0, 16, false));
+     const fixed = try std.mem.replaceOwned(u8, a, json.items, "\"fixed_identity\":false", "\"fixed_identity\":true");
+diff --git a/zig/src/families/qwen3_5/cuda_mhc.zig b/zig/src/families/qwen3_5/cuda_mhc.zig
+index 13507a091..0c46c441d 100644
+--- a/zig/src/families/qwen3_5/cuda_mhc.zig
++++ b/zig/src/families/qwen3_5/cuda_mhc.zig
+@@ -22,6 +22,11 @@ pub fn enter(e: *E.Engine, rows: usize, m: geometry.Mhc, fold: bool) !void {
+     try launch(e, e.mhc_fns.mhc_enter, sig.mhc_enter, .{ (rows * e.g.hidden + 255) / 256, 1, 1 }, .{ 256, 1, 1 }, .{ geo, e.h, r, e.hs, @as(c_int, @intCast(rows)), @as(c_int, @intCast(m.streams)) });
+ }
+ 
++/// Whether the streams collapse after `physical`: at the window's last layer on every loop visit, as the reference.
++pub fn leaves(m: geometry.Mhc, physical: usize, next: usize, carry: bool) bool {
++    return !m.holds(next) or (!carry and physical + 1 == m.end);
++}
++
+ /// The streams' mean into h: the window's last execution.
+ pub fn leave(e: *E.Engine, rows: usize, m: geometry.Mhc) !void {
+     const geo = e.geo;
+diff --git a/zig/src/platform/environment.zig b/zig/src/platform/environment.zig
+index 78db02383..24ff873e9 100644
+--- a/zig/src/platform/environment.zig
++++ b/zig/src/platform/environment.zig
+@@ -71,6 +71,7 @@ pub const rules = [_]Rule{
+     .{ .name = "TF_QWEN27_METAL_KV_PAGES", .scope = .metal, .kind = .flag, .forms = "0 or 1 (1 puts the 27B's keys and values in core-pool pages; unset or blank is 0)" },
+     .{ .name = "TF_QWEN35_METAL_KV_PAGES", .scope = .metal, .kind = .flag, .forms = "0 or 1 (1 puts the streams' keys and values in core-pool pages; unset or blank is 0)" },
+     .{ .name = "TF_Q35_DEBUG", .scope = .cuda, .kind = .flag, .forms = "0 or 1 (1 prints a forward's execution plan, cache slots and mHC settings)" },
++    .{ .name = "TF_Q35_MHC_CARRY", .scope = .cuda, .kind = .flag, .forms = "0 or 1 (1 carries the mHC streams across the loop seam, for A/B against the reference collapse)" },
+     .{ .name = "TF_DSV41_SMALL", .scope = .metal, .kind = .flag, .forms = "0 or 1 (1 reads a DeepSeek-V4.1 Metal checkpoint's config at its own small shapes)" },
+     .{ .name = "TF_DSV41_ASSETS", .scope = .metal, .kind = .path, .forms = "a directory path without control characters holding DeepSeek-V4.1's Engram token map" },
+     .{ .name = "TF_DSV41_ENGRAM_DIR", .scope = .metal, .kind = .path, .forms = "a directory path without control characters holding DeepSeek-V4.1's packed Engram tables" },
+diff --git a/zig/src/platform/environment_test.zig b/zig/src/platform/environment_test.zig
+index 6031fea5e..15abbe9ce 100644
+--- a/zig/src/platform/environment_test.zig
++++ b/zig/src/platform/environment_test.zig
+@@ -127,6 +127,7 @@ const valid = [_]Case{
+     .{ .name = "TF_DSV41_ENGRAM_CACHE", .raw = "0", .n = 0 },
+     .{ .name = "TF_Q35_DEBUG", .raw = "1", .n = 1 },
+     .{ .name = "TF_Q35_DEBUG", .raw = "0", .n = 0 },
++    .{ .name = "TF_Q35_MHC_CARRY", .raw = "1", .n = 1 },
+ };
+ 
+ test "environment: valid forms remain raw numbers before existing consumer clamps and defaults" {

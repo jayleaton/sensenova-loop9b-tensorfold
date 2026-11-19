@@ -1,2 +1,4 @@
 # upstream TensorFold's spark25 model family, quoted as diff context in patches/rtx
 \bspark25\.native\b
+# upstream TensorFold's CONTRIBUTING line, quoted as diff context in patches/metal/0018
+For agent-assisted contributions, read the \[TensorFold contributor skill\]

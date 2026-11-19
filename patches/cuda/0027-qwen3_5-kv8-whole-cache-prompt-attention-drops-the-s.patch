@@ -1,0 +1,51 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Jay Leaton <58495321+jayleaton@users.noreply.github.com>
+Date: Thu, 19 Nov 2026 10:47:50 +0700
+Subject: [PATCH 27/27] qwen3_5: kv8 whole-cache prompt attention drops the
+ second barrier by default (same bits); TF_QWEN_PREFILL_TUNE=0 restores it
+
+---
+ zig/kernels/cuda/prefill_attention.cu    | 2 +-
+ zig/src/families/qwen3_5/cuda_prompt.zig | 2 +-
+ zig/src/platform/environment.zig         | 2 +-
+ 3 files changed, 3 insertions(+), 3 deletions(-)
+
+diff --git a/zig/kernels/cuda/prefill_attention.cu b/zig/kernels/cuda/prefill_attention.cu
+index 29c4c747a..2f91e7b8e 100644
+--- a/zig/kernels/cuda/prefill_attention.cu
++++ b/zig/kernels/cuda/prefill_attention.cu
+@@ -117,7 +117,7 @@ hpattn8_whole_kernel(const __nv_bfloat16* __restrict__ q, const uint8_t* __restr
+ #include "prefill_attention_rows.cuh"
+ }
+ 
+-// hpattn8_whole_kernel with TUNE: the same bits, one barrier an item (TF_QWEN_PREFILL_TUNE=1).
++// hpattn8_whole_kernel with TUNE: the same bits, one barrier an item (the default; TF_QWEN_PREFILL_TUNE=0 opts out).
+ template <int D, int WARPS, int HPC, int NS>
+ __global__ void __launch_bounds__(32 * WARPS, 1)
+ hpattn8_whole_tune_kernel(const __nv_bfloat16* __restrict__ q, const uint8_t* __restrict__ kc, const uint8_t* __restrict__ vc,
+diff --git a/zig/src/families/qwen3_5/cuda_prompt.zig b/zig/src/families/qwen3_5/cuda_prompt.zig
+index 436d0714d..821df3f86 100644
+--- a/zig/src/families/qwen3_5/cuda_prompt.zig
++++ b/zig/src/families/qwen3_5/cuda_prompt.zig
+@@ -34,7 +34,7 @@ pub const f8_smem: u32 = 76800;
+ const chain_rows = 64;
+ 
+ pub fn resolve(attention: cuda.Module, gdn: cuda.Module) !Fns {
+-    const f: Fns = .{ .bf16 = try attention.function(symbols.bf16), .fp8 = try attention.function(symbols.fp8), .bf16_whole = try attention.function(symbols.bf16_whole), .fp8_whole = try attention.function(symbols.fp8_whole), .f8_whole = if (try sys.environment.read(bool, "TF_QWEN_PREFILL_FP8", false)) try attention.function(symbols.f8_whole) else null, .tune_whole = if (try sys.environment.read(bool, "TF_QWEN_PREFILL_TUNE", false)) try attention.function(symbols.tune_whole) else null, .bf16_p256 = try attention.function(symbols.bf16_p256), .bf16_p256_ids = try attention.function(symbols.bf16_p256_ids), .chain = try gdn.function(symbols.chain) };
++    const f: Fns = .{ .bf16 = try attention.function(symbols.bf16), .fp8 = try attention.function(symbols.fp8), .bf16_whole = try attention.function(symbols.bf16_whole), .fp8_whole = try attention.function(symbols.fp8_whole), .f8_whole = if (try sys.environment.read(bool, "TF_QWEN_PREFILL_FP8", false)) try attention.function(symbols.f8_whole) else null, .tune_whole = if (try sys.environment.read(bool, "TF_QWEN_PREFILL_TUNE", true)) try attention.function(symbols.tune_whole) else null, .bf16_p256 = try attention.function(symbols.bf16_p256), .bf16_p256_ids = try attention.function(symbols.bf16_p256_ids), .chain = try gdn.function(symbols.chain) };
+     try f.bf16.allowDynamicShared(smem);
+     try f.fp8.allowDynamicShared(smem);
+     try f.bf16_whole.allowDynamicShared(smem);
+diff --git a/zig/src/platform/environment.zig b/zig/src/platform/environment.zig
+index 54669aca7..7f9aac6f2 100644
+--- a/zig/src/platform/environment.zig
++++ b/zig/src/platform/environment.zig
+@@ -32,7 +32,7 @@ pub fn isReal(kind: Kind) bool {
+ 
+ pub const rules = [_]Rule{
+     .{ .name = "TF_CACHE_EVICT", .scope = .common, .kind = .word, .words = &.{ "main", "decayed_resume" }, .forms = "main or decayed_resume (default main)" },
+-    .{ .name = "TF_QWEN_PREFILL_TUNE", .scope = .cuda, .kind = .flag, .forms = "0 or 1 (1: kv8 whole-cache prompt attention with one barrier an item, the same bits; default 0)" },
++    .{ .name = "TF_QWEN_PREFILL_TUNE", .scope = .cuda, .kind = .flag, .blank_default = false, .forms = "0 or 1 (0 restores two barriers an item in kv8 whole-cache prompt attention; the same bits; default 1)" },
+     .{ .name = "TF_QWEN_PREFILL_FP8", .scope = .cuda, .kind = .flag, .forms = "0 or 1 (1: kv8 whole-cache prompt attention on e4m3 tensor cores, not token-identical; default 0)" },
+     .{ .name = "TF_FLASHNEXT_BATCH_DRAWS", .scope = .cuda, .kind = .flag, .blank_default = false, .forms = "0 or 1 (0 restores per-stream Flash Next row draws; default 1)" },
+     .{ .name = "TF_STARTUP_RECEIPT", .scope = .common, .kind = .flag, .forms = "0 or 1 (opt-in startup and first completion receipts)" },
