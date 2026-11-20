@@ -1,0 +1,276 @@
+From 7a4d8be20222681df9da7509405eb434a888f13f Mon Sep 17 00:00:00 2001
+From: Jay Leaton <58495321+jayleaton@users.noreply.github.com>
+Date: Wed, 18 Nov 2026 02:06:09 +0800
+Subject: [PATCH 01/20] tools: convert SenseNova-Loop-9B BF16 to the engine's
+ MLX affine format
+
+A numpy writer of the engine's MLX affine codes (u32 words, bf16 scales and
+biases), with the checkpoint's zero-centred norms folded to 1 + w, the gated
+linear_attn.norm left as stored, conv1d as [qkv, kernel, 1] and the vision
+tower left out. Taken unchanged from the Metal series so both backends load
+the same converted tree.
+---
+ tools/sensenova_loop_mlx.py      | 206 +++++++++++++++++++++++++++++++
+ tools/sensenova_loop_mlx_test.py |  37 ++++++
+ 2 files changed, 243 insertions(+)
+ create mode 100644 tools/sensenova_loop_mlx.py
+ create mode 100644 tools/sensenova_loop_mlx_test.py
+
+diff --git a/tools/sensenova_loop_mlx.py b/tools/sensenova_loop_mlx.py
+new file mode 100644
+index 0000000..59de531
+--- /dev/null
++++ b/tools/sensenova_loop_mlx.py
+@@ -0,0 +1,206 @@
++#!/usr/bin/env python3
++"""SenseNova-Loop-9B BF16 to the qwen27 Metal engine's MLX affine format.
++
++The engine loads MLX affine codes: a `u32` word array `[n, k*bits/32]`, `bf16` scales and
++`bf16` biases at `[n, k/group]`, dequantized as `scale * code + bias`. This script reproduces
++`zig/src/core/affine4_host.zig`'s `quantizeMlx` word for word: the larger-magnitude group edge
++sets the signed scale and the bias, the step is `(max - min) / 15`, and codes round half away.
++
++  python3 tools/sensenova_loop_mlx.py --source DIR --out DIR [--bits 4] [--group 64]
++"""
++import argparse
++import json
++import os
++import shutil
++
++import numpy as np
++import torch
++from safetensors import safe_open
++from safetensors.torch import save_file
++
++SKIP_PREFIXES = ("model.visual.", "model.language_model.loop_gate.")
++QUANT_SUFFIXES = (
++    "embed_tokens.weight",
++    "lm_head.weight",
++    "mlp.gate_proj.weight",
++    "mlp.up_proj.weight",
++    "mlp.down_proj.weight",
++    "self_attn.q_proj.weight",
++    "self_attn.k_proj.weight",
++    "self_attn.v_proj.weight",
++    "self_attn.o_proj.weight",
++    "linear_attn.in_proj_qkv.weight",
++    "linear_attn.in_proj_z.weight",
++    "linear_attn.in_proj_b.weight",
++    "linear_attn.in_proj_a.weight",
++    "linear_attn.out_proj.weight",
++)
++def zero_centered(name):
++    """Whether a norm stores a zero-centred weight: Qwen3_5RMSNorm computes `x * (1 + w)`, the Gated one `x * w`."""
++    if "linear_attn.norm" in name:
++        return False
++    return name.endswith(("input_layernorm.weight", "post_attention_layernorm.weight", "model.norm.weight",
++                          "q_norm.weight", "k_norm.weight"))
++COPY = ("tokenizer.json", "tokenizer_config.json", "chat_template.jinja", "generation_config.json",
++        "preprocessor_config.json", "processor_config.json")
++
++
++def bf16_bits(x):
++    """Round f32 to the nearest bf16, ties to even; NaN keeps its quiet bit, as bf16_round.bits."""
++    u = x.astype(np.float32).view(np.uint32).astype(np.uint64)
++    return ((u + 0x7FFF + ((u >> 16) & 1)) >> 16).astype(np.uint16)
++
++
++def bf16_of(bits):
++    return (bits.astype(np.uint32) << 16).view(np.float32)
++
++
++def round_away(x):
++    return np.sign(x) * np.floor(np.abs(x) + 0.5)
++
++
++def quantize_rows(values, bits, group):
++    """Codes, scales and biases for `[rows, k]` f32: the group's larger-magnitude edge is the bias."""
++    rows, k = values.shape
++    assert k % group == 0 and (k * bits) % 32 == 0
++    g = values.reshape(rows, k // group, group)
++    lo, hi = g.min(-1), g.max(-1)
++    step = np.maximum((hi - lo) / (2**bits - 1), 1e-7)
++    low_edge = np.abs(lo) > np.abs(hi)
++    signed = np.where(low_edge, step, -step)
++    edge = np.where(low_edge, lo, hi)
++    q0 = round_away(edge / signed)
++    s = np.where(q0 == 0, signed, edge / np.where(q0 == 0, 1.0, q0))
++    b = np.where(q0 == 0, 0.0, edge)
++    s_bits, b_bits = bf16_bits(s), bf16_bits(b)
++    code = np.clip(round_away((g - b[..., None]) / s[..., None]), 0, 2**bits - 1).astype(np.uint32)
++    per_word = 32 // bits
++    words = np.zeros((rows, k // per_word), dtype=np.uint32)
++    flat = code.reshape(rows, k)
++    for i in range(per_word):
++        words |= flat[:, i::per_word] << np.uint32(bits * i)
++    return words, s_bits, b_bits
++
++
++def dequantize(words, s_bits, b_bits, bits, group, k):
++    per_word = 32 // bits
++    rows = words.shape[0]
++    mask = np.uint32(2**bits - 1)
++    codes = np.zeros((rows, k), dtype=np.uint32)
++    for i in range(per_word):
++        codes[:, i::per_word] = (words >> np.uint32(bits * i)) & mask
++    return bf16_of(s_bits).repeat(group, axis=1) * codes.astype(np.float32) + bf16_of(b_bits).repeat(group, axis=1)
++
++
++def main():
++    ap = argparse.ArgumentParser()
++    ap.add_argument("--source", required=True)
++    ap.add_argument("--out", required=True)
++    ap.add_argument("--bits", type=int, default=4)
++    ap.add_argument("--group", type=int, default=64)
++    ap.add_argument("--rows", type=int, default=2048)
++    ap.add_argument("--shard-bytes", type=int, default=1_800_000_000)
++    ap.add_argument("--check-tensors", type=int, default=3)
++    args = ap.parse_args()
++
++    os.makedirs(args.out, exist_ok=True)
++    weight_map = json.load(open(os.path.join(args.source, "model.safetensors.index.json")))["weight_map"]
++    cfg = json.load(open(os.path.join(args.source, "config.json")))
++    cfg["quantization"] = {"bits": args.bits, "group_size": args.group, "mode": "affine", "quant_method": "mlx"}
++    json.dump(cfg, open(os.path.join(args.out, "config.json"), "w"), indent=2)
++    for f in COPY:
++        src = os.path.join(args.source, f)
++        if os.path.exists(src):
++            shutil.copy(src, os.path.join(args.out, f))
++
++    out_map, pending, shard = {}, {}, 0
++    checked, report = 0, []
++
++    def flush():
++        nonlocal pending, shard
++        if not pending:
++            return
++        shard += 1
++        name = f"model-{shard:05d}.safetensors"
++        save_file(pending, os.path.join(args.out, name), metadata={"format": "pt"})
++        for k in pending:
++            out_map[k] = name
++        pending = {}
++
++    handles = {}
++    try:
++        for name in sorted(weight_map):
++            if name.startswith(SKIP_PREFIXES):
++                continue
++            shard_file = weight_map[name]
++            if shard_file not in handles:
++                handles[shard_file] = safe_open(os.path.join(args.source, shard_file), "pt")
++            t = handles[shard_file].get_tensor(name).contiguous()
++            out = name.replace("model.language_model.", "language_model.model.")
++            if name.startswith("lm_head."):
++                out = name.replace("lm_head.", "language_model.lm_head.", 1)
++            if any(name.endswith(s) for s in QUANT_SUFFIXES):
++                assert t.ndim == 2, (name, tuple(t.shape))
++                n, k = t.shape
++                assert n % 32 == 0 and k % args.group == 0, (name, tuple(t.shape))
++                words = np.zeros((n, k * args.bits // 32), dtype=np.uint32)
++                s_all = np.zeros((n, k // args.group), dtype=np.uint16)
++                b_all = np.zeros((n, k // args.group), dtype=np.uint16)
++                for r0 in range(0, n, args.rows):
++                    r1 = min(n, r0 + args.rows)
++                    chunk = t[r0:r1].float().numpy()
++                    w, s, b = quantize_rows(chunk, args.bits, args.group)
++                    words[r0:r1] = w
++                    s_all[r0:r1] = s
++                    b_all[r0:r1] = b
++                    if checked < args.check_tensors and r0 == 0:
++                        back = dequantize(w, s, b, args.bits, args.group, k)
++                        step = np.abs(bf16_of(s)).repeat(args.group, axis=1)
++                        ratio = np.abs(back - chunk) / np.maximum(step, 1e-12)
++                        report.append({
++                            "tensor": name,
++                            "rows": [r0, r1],
++                            "max_abs_err_over_step": float(ratio.max()),
++                            "p99_abs_err_over_step": float(np.percentile(ratio, 99)),
++                            "mse": float(((back - chunk).astype(np.float64) ** 2).mean()),
++                            "signal": float((chunk.astype(np.float64) ** 2).mean()),
++                        })
++                base = out[: -len(".weight")]
++                pending[f"{base}.weight"] = torch.from_numpy(words)
++                pending[f"{base}.scales"] = torch.from_numpy(s_all.view(np.int16)).view(torch.bfloat16)
++                pending[f"{base}.biases"] = torch.from_numpy(b_all.view(np.int16)).view(torch.bfloat16)
++                checked += 1
++            elif zero_centered(out):
++                # the engine multiplies by the stored weight, as mlx checkpoints do: fold the model's `1 + w`
++                pending[out] = (t.float() + 1.0).to(torch.bfloat16).contiguous()
++            elif out.endswith("A_log"):
++                # the GDN kernel reads a bf16 decay weight; the checkpoint's A_log is f32
++                pending[out] = t.to(torch.bfloat16).contiguous()
++            elif out.endswith("dt_bias"):
++                # the engine keeps dt_bias bf16; the checkpoint's is f32
++                pending[out] = t.to(torch.bfloat16).contiguous()
++            elif out.endswith("conv1d.weight") and t.ndim == 3:
++                # the engine reads [qkv, kernel, 1]; the checkpoint ships [qkv, 1, kernel]
++                pending[out] = t.permute(0, 2, 1).contiguous()
++            else:
++                pending[out] = t
++            used = sum(v.numel() * v.element_size() for v in pending.values())
++            if used >= args.shard_bytes:
++                flush()
++        flush()
++    finally:
++        for h in handles.values():
++            h.__exit__(None, None, None)
++
++    total = sum(os.path.getsize(os.path.join(args.out, f)) for f in set(out_map.values()))
++    json.dump({"metadata": {"total_size": total}, "weight_map": out_map},
++              open(os.path.join(args.out, "model.safetensors.index.json"), "w"), indent=2)
++    json.dump({"bits": args.bits, "group": args.group, "tensors": len(out_map), "shards": shard,
++               "bytes": total, "quantization_check": report},
++              open(os.path.join(args.out, "tensorfold-convert.json"), "w"), indent=2)
++    print(json.dumps({"tensors": len(out_map), "shards": shard, "bytes": total,
++                      "check": [r["max_abs_err_over_step"] for r in report], "mse": [r["mse"] for r in report]}))
++
++
++if __name__ == "__main__":
++    main()
+diff --git a/tools/sensenova_loop_mlx_test.py b/tools/sensenova_loop_mlx_test.py
+new file mode 100644
+index 0000000..5ba9d04
+--- /dev/null
++++ b/tools/sensenova_loop_mlx_test.py
+@@ -0,0 +1,37 @@
++"""The norm mapping that makes SenseNova-Loop-9B load with the right scale."""
++import numpy as np
++import torch
++
++from sensenova_loop_mlx import zero_centered
++
++
++def test_the_gated_norm_is_not_zero_centred():
++    assert not zero_centered("language_model.model.layers.0.linear_attn.norm.weight")
++
++
++def test_every_qwen3_5rmsnorm_weight_is_zero_centred():
++    for name in (
++        "language_model.model.layers.0.input_layernorm.weight",
++        "language_model.model.layers.0.post_attention_layernorm.weight",
++        "language_model.model.norm.weight",
++        "language_model.model.layers.3.self_attn.q_norm.weight",
++        "language_model.model.layers.3.self_attn.k_norm.weight",
++    ):
++        assert zero_centered(name), name
++
++
++def test_projections_and_the_embedding_are_left_alone():
++    for name in (
++        "language_model.model.embed_tokens.weight",
++        "language_model.model.layers.0.mlp.down_proj.weight",
++        "language_model.model.layers.0.linear_attn.in_proj_qkv.weight",
++        "language_model.lm_head.weight",
++    ):
++        assert not zero_centered(name), name
++
++
++def test_folding_one_turns_a_zero_centred_norm_into_a_multiplier():
++    # the released checkpoint's layer-0 input norm has rms 0.0492 and mean 0.0331; `1 + w` must land near one
++    w = torch.tensor([0.0331] * 4096)
++    assert abs(float((w.float() + 1.0).pow(2).mean().sqrt()) - 1.0336) < 1e-3
++    assert abs(float((w.float()).pow(2).mean().sqrt()) - 0.0331) < 1e-3
+-- 
+2.56.0
+

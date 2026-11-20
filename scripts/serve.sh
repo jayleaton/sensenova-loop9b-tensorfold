@@ -24,5 +24,7 @@ if [[ -f "$env_file" ]]; then
         [[ -n "${!key+x}" ]] || export "$key=$value"
     done < "$env_file"
 fi
-exec "$engine/zig-out/native/bin/tensorfold-native" serve "$model" --name "${NAME:-loop9b}" --port "${PORT:-8090}" \
+bin=$engine/zig-out/native/bin/tensorfold-native
+[[ -x "$bin" || ! -x "$engine/zig-out/native-hip/bin/tensorfold-native" ]] || bin=$engine/zig-out/native-hip/bin/tensorfold-native
+exec "$bin" serve "$model" --name "${NAME:-loop9b}" --port "${PORT:-8090}" \
     "${profile[@]}" "$@"

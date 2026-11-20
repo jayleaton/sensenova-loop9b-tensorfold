@@ -1,0 +1,164 @@
+From b25dcbce6d583daa1a20342feeb57392033dd407 Mon Sep 17 00:00:00 2001
+From: Jay Leaton <58495321+jayleaton@users.noreply.github.com>
+Date: Thu, 19 Nov 2026 19:28:44 +0800
+Subject: [PATCH 18/20] qwen3_5: the YaRN table builds where the core module
+ lives
+
+config.zig's own tree stays std-only, as every backend's standalone
+admissions build it: rope.zig resolves and validates the YaRN a tower
+declares (its factor and the window it was trained on) without reading
+core, and the HIP bridge builds transformers' table beside the model it
+uploads, where core is already imported. The three test modules the
+table's first placement pulled core into compile as they did before.
+
+The environment's two new HIP settings join the strict-reader test's
+valid forms, and its flags literal names the hip scope.
+---
+ zig/build/cuda_family_host.zig                   |  2 +-
+ .../qwen3_5/backend/hip/model/bridge.zig         | 14 +++++++++++++-
+ zig/src/families/qwen3_5/config.zig              |  2 +-
+ zig/src/families/qwen3_5/rope.zig                | 16 +++++-----------
+ zig/src/platform/environment_test.zig            |  6 +++++-
+ 5 files changed, 25 insertions(+), 15 deletions(-)
+
+diff --git a/zig/build/cuda_family_host.zig b/zig/build/cuda_family_host.zig
+index 2e9d768..f96afd6 100644
+--- a/zig/build/cuda_family_host.zig
++++ b/zig/build/cuda_family_host.zig
+@@ -4,7 +4,7 @@ const std = @import("std");
+ pub fn steps(b: *std.Build, cuda: *std.Build.Module, mods: anytype, step: *std.Build.Step) void {
+     const host = b.graph.host;
+     @import("prefill_widths_cuda.zig").tests(b, cuda, mods, step);
+-    const metal_scope = b.addRunArtifact(b.addTest(.{ .root_module = b.createModule(.{ .root_source_file = b.path("zig/src/families/qwen3_5/config.zig"), .target = host, .link_libc = true, .imports = &.{.{ .name = "core", .module = b.createModule(.{ .root_source_file = b.path("zig/src/core/root.zig"), .target = host, .link_libc = true }) }} }), .filters = &.{ "Metal 2B format scope:", "admit the affine 2B", "admit untied heads" } }));
++    const metal_scope = b.addRunArtifact(b.addTest(.{ .root_module = b.createModule(.{ .root_source_file = b.path("zig/src/families/qwen3_5/config.zig"), .target = host }), .filters = &.{ "Metal 2B format scope:", "admit the affine 2B", "admit untied heads" } }));
+     b.step("test-qwen35-metal-scope-host", "Metal 2B format admission without device or Metal compiler").dependOn(&metal_scope.step);
+     @import("load_prefetch_host.zig").tests(b, mods.core, step);
+     const captured = b.addRunArtifact(b.addTest(.{ .root_module = b.createModule(.{ .root_source_file = b.path("zig/src/cuda/aot_identity.zig"), .target = host, .link_libc = true }), .filters = &.{"persistence identity: captured CUDA"} }));
+diff --git a/zig/src/families/qwen3_5/backend/hip/model/bridge.zig b/zig/src/families/qwen3_5/backend/hip/model/bridge.zig
+index a0b9ad2..636aa0f 100644
+--- a/zig/src/families/qwen3_5/backend/hip/model/bridge.zig
++++ b/zig/src/families/qwen3_5/backend/hip/model/bridge.zig
+@@ -4,6 +4,7 @@ const std = @import("std");
+ const hip = @import("hip");
+ const view = @import("view.zig");
+ const weights = @import("weights.zig");
++const rope_yarn = @import("core").rope_yarn;
+ 
+ pub const Error = error{UnsupportedTables} || hip.Error || std.mem.Allocator.Error;
+ 
+@@ -77,7 +78,10 @@ pub const Bridge = struct {
+         b.k_weight = try hip.DeviceBuffer.fromHost(d, std.mem.sliceAsBytes(qs));
+         errdefer if (b.yarn) |*t| t.free();
+         if (s.yarn) |y| {
+-            b.yarn = try hip.DeviceBuffer.fromHost(d, std.mem.sliceAsBytes(&y.table));
++            // transformers' static table: the attention factor, then the 32 frequencies the kernels read
++            const t = rope_yarn.yarn(s.rope_theta, y.factor, y.trained);
++            var table: [33]f32 = .{t.scale} ++ t.freq;
++            b.yarn = try hip.DeviceBuffer.fromHost(d, std.mem.sliceAsBytes(&table));
+         }
+         b.model = .{
+             .spec = s,
+@@ -100,3 +104,11 @@ pub const Bridge = struct {
+         b.gpa.destroy(b);
+     }
+ };
++
++test "the bridge's YaRN table carries the attention factor before the frequencies" {
++    const y = rope_yarn.yarn(10000000, 2, 262144);
++    var table: [33]f32 = .{y.scale} ++ y.freq;
++    try std.testing.expectEqual(y.scale, table[0]);
++    try std.testing.expectEqualSlices(f32, &y.freq, table[1..]);
++    try std.testing.expectEqual(@as(f32, @floatCast(0.1 * @log(2.0) + 1)), table[0]);
++}
+diff --git a/zig/src/families/qwen3_5/config.zig b/zig/src/families/qwen3_5/config.zig
+index ab3b925..8b69444 100644
+--- a/zig/src/families/qwen3_5/config.zig
++++ b/zig/src/families/qwen3_5/config.zig
+@@ -290,7 +290,7 @@ pub const Spec = struct {
+     full_layers: [checks.max_layers]bool = @splat(false),
+     mrope: checks.Mrope = .{},
+     max_position: usize = 262144,
+-    /// The static YaRN the config declares, with the table its rope kernels read (null: plain rope).
++    /// The static YaRN the config declares: its factor and trained window (null: plain rope).
+     yarn: ?@import("rope.zig").Yarn = null,
+     /// The loop that repeats a range of physical layers; a looped forward runs `loop_plan.steps` executions.
+     loop: @import("loop_plan.zig").Loop = .{},
+diff --git a/zig/src/families/qwen3_5/rope.zig b/zig/src/families/qwen3_5/rope.zig
+index 1b021c8..53f7cd0 100644
+--- a/zig/src/families/qwen3_5/rope.zig
++++ b/zig/src/families/qwen3_5/rope.zig
+@@ -4,14 +4,11 @@ const std = @import("std");
+ const config = @import("config.zig");
+ const checks = config.checks;
+ const rope_config = @import("rope_config");
+-const rope_yarn = @import("core").rope_yarn;
+ 
+-/// A static YaRN: its factor and trained window, with the table the rope kernels read.
++/// The static YaRN a config declares: its factor and the window it was trained on; the bridge builds the table.
+ pub const Yarn = struct {
+     factor: f64,
+     trained: usize,
+-    /// The attention factor, then 32 frequencies: what the rope kernels read.
+-    table: [33]f32,
+ };
+ 
+ /// The tower's rope and window: plain rope stays within the trained 262,144, a yarn block names factor and window.
+@@ -38,8 +35,7 @@ pub fn resolve(spec: *config.Spec, tower: std.json.ObjectMap, rope: std.json.Obj
+     const ceiling = try checks.maxPosition(tower);
+     if (@as(f64, @floatFromInt(trained)) * factor != @as(f64, @floatFromInt(ceiling))) return error.InvalidRotary;
+     spec.max_position = ceiling;
+-    const y = rope_yarn.yarn(spec.rope_theta, factor, trained);
+-    spec.yarn = .{ .factor = factor, .trained = trained, .table = .{y.scale} ++ y.freq };
++    spec.yarn = .{ .factor = factor, .trained = trained };
+ }
+ 
+ fn number(v: std.json.Value) config.Error!f64 {
+@@ -71,7 +67,7 @@ fn specOf(a: std.mem.Allocator, text: []const u8) !config.Spec {
+     return try config.geometry(doc.object, 4, 64);
+ }
+ 
+-test "a yarn block resolves its factor, its window and transformers' exact table" {
++test "a yarn block resolves its factor and the window it was trained on" {
+     var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
+     defer arena.deinit();
+     const a = arena.allocator();
+@@ -80,10 +76,8 @@ test "a yarn block resolves its factor, its window and transformers' exact table
+     const y = spec.yarn.?;
+     try std.testing.expectEqual(@as(f64, 2), y.factor);
+     try std.testing.expectEqual(@as(usize, 262144), y.trained);
+-    const table = rope_yarn.yarn(10000000, 2, 262144);
+-    try std.testing.expectEqual(table.scale, y.table[0]);
+-    try std.testing.expectEqualSlices(f32, &table.freq, y.table[1..]);
+-    try std.testing.expectEqual(@as(f32, @floatCast(0.1 * @log(2.0) + 1)), y.table[0]);
++    // the factor over the trained window names the ceiling exactly
++    try std.testing.expectEqual(@as(f64, @floatFromInt(y.trained)) * y.factor, @as(f64, @floatFromInt(spec.max_position)));
+ }
+ 
+ test "plain rope keeps its trained window, and a yarn block without its fields is refused" {
+diff --git a/zig/src/platform/environment_test.zig b/zig/src/platform/environment_test.zig
+index de93848..b6feaec 100644
+--- a/zig/src/platform/environment_test.zig
++++ b/zig/src/platform/environment_test.zig
+@@ -3,7 +3,7 @@ const std = @import("std");
+ const e = @import("environment.zig");
+ const t = std.testing;
+ const a = t.allocator;
+-const all: e.Flags = .{ .cuda = true, .metal = true, .xpu = true, .slide = true, .hooks = true, .dsv41 = true, .gemma4 = true, .drama3 = true, .glm = true, .flashnext = true, .nemotron = true, .minimax_m3 = true };
++const all: e.Flags = .{ .cuda = true, .hip = true, .metal = true, .xpu = true, .slide = true, .hooks = true, .dsv41 = true, .gemma4 = true, .drama3 = true, .glm = true, .flashnext = true, .nemotron = true, .minimax_m3 = true };
+ const Env = struct {
+     name: []const u8,
+     raw: ?[]const u8,
+@@ -51,6 +51,10 @@ const valid = [_]Case{
+     .{ .name = "TENSORFOLD_RESTORE_PREFETCH_GIB", .raw = "16777217", .n = 16777217 },
+     .{ .name = "TENSORFOLD_RESTORE_PREFETCH_MS", .raw = "1099511627777", .n = 1099511627777 },
+     .{ .name = "TENSORFOLD_TOOL_ID_KEY_FILE", .raw = "/etc/tensorfold/tool id.key", .n = 0 },
++    .{ .name = "TF_Q35_DEBUG", .raw = "0", .n = 0 },
++    .{ .name = "TF_Q35_DEBUG", .raw = "1", .n = 1 },
++    .{ .name = "TF_Q35_MHC_CARRY", .raw = "0", .n = 0 },
++    .{ .name = "TF_Q35_MHC_CARRY", .raw = "1", .n = 1 },
+     .{ .name = "TF_STARTUP_RECEIPT", .raw = "0", .n = 0 },
+     .{ .name = "TF_STARTUP_RECEIPT", .raw = "1", .n = 1 },
+     .{ .name = "TF_SHARED_PRICE_LOG", .raw = "0", .n = 0 },
+-- 
+2.56.0
+

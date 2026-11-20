@@ -1,0 +1,1007 @@
+From cab4dde9b895ee75c31f69aa78baf6b2baa63a3e Mon Sep 17 00:00:00 2001
+From: Jay Leaton <58495321+jayleaton@users.noreply.github.com>
+Date: Thu, 19 Nov 2026 18:30:46 +0800
+Subject: [PATCH 16/20] qwen3_5 HIP: SenseNova-Loop's mHC kernels, their own
+ image and their contract
+
+The four mHC kernels land as the ops/mhc.hip group, a mechanical port
+of the SenseNova recipe's CUDA qwen35_mhc.cu into the HIP house style:
+the router routes 16/S rows a block (each row's norm scaling its dots
+after, the router's weights and the row read once), twenty log-space
+Sinkhorn passes fix the 2x2 mix, pre and post pass sigmoids, and the
+state's coefficients are read back through bf16 as the reference
+weights are. The merge folds a sublayer's output into the streams with
+the mix and post a (row, column) a thread; enter and leave move the
+residual in and its mean out. hipcc has not run here yet: the image
+compiles in phase B, with the code object this stub build already
+shapes.
+
+Their contract runs the five cases at the served width (the router's
+branch and state, merge, enter, leave) against the FP64 reference the
+CUDA contract computes, with a planted control each: the branch without
+its row norm, the state without Sinkhorn, the merge as an identity map,
+the enter without its fold and the leave over one stream. Gate-5 launch
+records wait for a real gfx1103 compile, as every record must.
+
+hip.zig's source table moves to hip_sources.zig to keep the build file
+inside its 600-line cap.
+---
+ zig/build/hip.zig                            |  46 +--
+ zig/build/hip_sources.zig                    |  39 ++
+ zig/kernels/hip/ops/mhc.hip                  | 183 +++++++++
+ zig/src/families/qwen3_5/backend/hip/mhc.zig |  81 ++++
+ zig/src/hip/kernels.zig                      |   1 +
+ zig/src/hip/launches.zig                     |  13 +
+ zig/src/hip/launches/mhc.zig                 |  81 ++++
+ zig/tests/hip/contract_main.zig              |  10 +
+ zig/tests/hip/contract_q35_mhc.zig           | 378 +++++++++++++++++++
+ 9 files changed, 792 insertions(+), 40 deletions(-)
+ create mode 100644 zig/build/hip_sources.zig
+ create mode 100644 zig/kernels/hip/ops/mhc.hip
+ create mode 100644 zig/src/families/qwen3_5/backend/hip/mhc.zig
+ create mode 100644 zig/src/hip/launches/mhc.zig
+ create mode 100644 zig/tests/hip/contract_q35_mhc.zig
+
+diff --git a/zig/build/hip.zig b/zig/build/hip.zig
+index 7d0da89..0ba7584 100644
+--- a/zig/build/hip.zig
++++ b/zig/build/hip.zig
+@@ -496,48 +496,14 @@ fn exactTool(b: *std.Build, target: std.Build.ResolvedTarget, e: Engine, family_
+         .imports = &.{ .{ .name = "hip", .module = e.hip }, .{ .name = "core", .module = e.hip.import_table.get("core").? }, .{ .name = "lighton_ocr", .module = e.lighton }, .{ .name = "qwen3_5", .module = e.family }, .{ .name = "lanes", .module = e.lanes }, .{ .name = "qwen_hip_vision", .module = e.family.import_table.get("qwen_hip_vision").? } },
+     }) });
+ }
+-/// A group's source and whether it compiles with IEEE arithmetic (`strict`: -O2 -fno-fast-math, IEEE denormals).
+-const Source = struct { path: []const u8, strict: bool = false };
+-/// The model-free kernels' source groups, in zig/src/hip/kernels.zig's Group order.
+-const groups = [_]Source{
+-    .{ .path = "ops/ops.hip" },
+-    .{ .path = "ops/act.hip" },
+-    .{ .path = "attention/attention.hip" },
+-    .{ .path = "recurrence/gated_delta.hip" },
+-    .{ .path = "attention/prefill.hip" },
+-    .{ .path = "decode/decode.hip" },
+-    .{ .path = "decode/plan.hip" },
+-    .{ .path = "tiles/dot2_tiles.hip" },
+-    .{ .path = "tiles/dot2.hip" },
+-    .{ .path = "flashnext/flashnext.hip" },
+-    .{ .path = "recurrence/mamba.hip" },
+-    .{ .path = "glm_ocr/pointwise.hip" },
+-    .{ .path = "joint_schema/joint_schema.hip" },
+-    .{ .path = "lighton_ocr.hip", .strict = true },
+-    .{ .path = "qwen_vision.hip", .strict = true },
+-    .{ .path = "draft/draft.hip" },
+-};
+-/// What the group sources include, so an edit to one rebuilds them.
+-const headers = [_][]const u8{
+-    "attention/attention_fa.hip", "attention/prefill.hpp", "decode/pages.hpp",      "decode/plan.hpp",               "ops/attention.hpp",
+-    "ops/common.hpp",             "ops/draw.hpp",          "ops/tp.hpp",            "ops/elementwise.hpp",           "ops/linear.hpp",
+-    "ops/moe.hpp",                "ops/norms.hpp",         "ops/rope.hpp",          "common/arch.hpp",               "common/dot2.hpp",
+-    "common/vec.hpp",             "common/wmma.hpp",       "quant/act.hpp",         "quant/mlx.hpp",                 "quant/mlx_decoder.hpp",
+-    "quant/mlx_pieces.hpp",       "quant/mlx_tiles.hpp",   "tiles/dot2.hpp",        "tiles/epilogue.hpp",            "tiles/gemm.hpp",
+-    "tiles/gemm_kp.hpp",          "tiles/matrix_gemm.hpp", "tiles/matrix_item.hpp", "tiles/plan.hpp",                "tiles/stream.hpp",
+-    "flashnext/streams.hpp",      "flashnext/ngram.hpp",   "flashnext/indexer.hpp", "flashnext/sparse.hpp",          "ops/nemotron_moe.hpp",
+-    "quant/bf16_decoder.hpp",     "quant/dense_tiles.hpp", "tiles/wmma12_gemm.hpp", "tiles/wmma12_gemm_k32_ref.hpp", "ops/columns.hpp",
+-    "columns_controls.hpp",       "ops/vision.hpp",        "ops/dense_text.hpp",    "ops/vl_position.hpp",           "flashnext/sparse_lanes.hpp",
+-};
+-/// The flags of the kernels' first build: no contraction, wave32 on RDNA, C++20.
+-const flags = [_][]const u8{ "-D__HIP_PLATFORM_AMD__=1", "-DUSE_ROCM=1", "-DHIPBLAS_V2", "-fPIC", "-DCUDA_HAS_FP16=1", "-DHIP_ENABLE_WARP_SYNC_BUILTINS=1", "-std=c++20", "-fno-gpu-rdc", "-mno-wavefrontsize64", "-ffp-contract=off" };
+-const stub = std.fmt.comptimePrint("pub const arch = \"\";\npub const images: [{d}][]align(8) const u8 = @splat(&.{{}});\n", .{groups.len});
++const sources = @import("hip_sources.zig");
++const stub = std.fmt.comptimePrint("pub const arch = \"\";\npub const images: [{d}][]align(8) const u8 = @splat(&.{{}});\n", .{sources.groups.len});
+ /// One code object a group for `arch`, built with the caps table's instruction switches, as the `hip_kernels` module.
+ pub fn kernelObjects(b: *std.Build, hipcc: []const u8, hipcc_resolved: []const u8, device_lib: ?[]const u8, relax_branches: bool, arch: []const u8) *std.Build.Module {
+     const files = objectFiles(b, .{ .name = hipcc, .resolved = hipcc_resolved, .device_lib = device_lib, .relax_branches = relax_branches }, arch);
+     var decls: []const u8 = "";
+     var refs: []const u8 = "";
+-    for (0..groups.len) |i| {
++    for (0..sources.groups.len) |i| {
+         decls = b.fmt("{s}const g{d} align(8) = @embedFile(\"group{d}.hsaco\").*;\n", .{ decls, i, i });
+         refs = b.fmt("{s}&g{d}, ", .{ refs, i });
+     }
+@@ -550,7 +516,7 @@ pub const Hipcc = struct { name: []const u8, resolved: []const u8, device_lib: ?
+ /// The groups' code objects for `arch` in one directory, group0.hsaco onward.
+ pub fn objectFiles(b: *std.Build, cc: Hipcc, arch: []const u8) *std.Build.Step.WriteFile {
+     const files = b.addWriteFiles();
+-    for (groups, 0..) |g, i| {
++    for (sources.groups, 0..) |g, i| {
+         const name = b.fmt("group{d}.hsaco", .{i});
+         const source = b.path(b.fmt("zig/kernels/hip/{s}", .{g.path}));
+         _ = files.addCopyFile(compileSource(b, cc, arch, source, name, g.strict), name);
+@@ -568,7 +534,7 @@ fn compileSource(b: *std.Build, cc: Hipcc, arch: []const u8, source: LazyPath, o
+     const c = caps.Caps.of(arch).?;
+     const root = std.fs.path.dirname(std.fs.path.dirname(cc.resolved) orelse ".") orelse ".";
+     const run = hipccRun(b, cc.name, &.{"--genco"});
+-    run.addArgs(&flags);
++    run.addArgs(&sources.flags);
+     if (strict) run.addArgs(&.{ "-O2", "-fno-fast-math", "-fdenormal-fp-math=ieee" });
+     run.addArg(b.fmt("-DTF_WAVE={d}", .{c.wave}));
+     run.addArg(b.fmt("-DTF_DOT2_F16={d}", .{@intFromBool(c.dot2_f16)}));
+@@ -584,7 +550,7 @@ fn compileSource(b: *std.Build, cc: Hipcc, arch: []const u8, source: LazyPath, o
+     // clang 21 leaves a branch of affine_dot2_stream_relu2_pair<Dot, 6, 1, 8> past simm16 on gfx1100 (#1521)
+     if (cc.relax_branches and std.mem.eql(u8, arch, "gfx1100")) run.addArgs(&.{ "-mllvm", "-amdgpu-s-branch-bits=15" });
+     run.addPrefixedDirectoryArg("-I", b.path("zig/kernels/hip"));
+-    for (headers) |h| run.addFileInput(b.path(b.fmt("zig/kernels/hip/{s}", .{h})));
++    for (sources.headers) |h| run.addFileInput(b.path(b.fmt("zig/kernels/hip/{s}", .{h})));
+     run.addArg("-o");
+     const object = run.addOutputFileArg(out);
+     run.addFileArg(source);
+diff --git a/zig/build/hip_sources.zig b/zig/build/hip_sources.zig
+new file mode 100644
+index 0000000..d2a7c76
+--- /dev/null
++++ b/zig/build/hip_sources.zig
+@@ -0,0 +1,39 @@
++//! The HIP kernels' source groups: their files, the headers they share, and the stub a host build embeds.
++const std = @import("std");
++
++/// A group's source and whether it compiles with IEEE arithmetic (`strict`: -O2 -fno-fast-math, IEEE denormals).
++const Source = struct { path: []const u8, strict: bool = false };
++/// The model-free kernels' source groups, in zig/src/hip/kernels.zig's Group order.
++pub const groups = [_]Source{
++    .{ .path = "ops/ops.hip" },
++    .{ .path = "ops/act.hip" },
++    .{ .path = "attention/attention.hip" },
++    .{ .path = "recurrence/gated_delta.hip" },
++    .{ .path = "attention/prefill.hip" },
++    .{ .path = "decode/decode.hip" },
++    .{ .path = "decode/plan.hip" },
++    .{ .path = "tiles/dot2_tiles.hip" },
++    .{ .path = "tiles/dot2.hip" },
++    .{ .path = "flashnext/flashnext.hip" },
++    .{ .path = "recurrence/mamba.hip" },
++    .{ .path = "glm_ocr/pointwise.hip" },
++    .{ .path = "joint_schema/joint_schema.hip" },
++    .{ .path = "lighton_ocr.hip", .strict = true },
++    .{ .path = "qwen_vision.hip", .strict = true },
++    .{ .path = "draft/draft.hip" },
++    .{ .path = "ops/mhc.hip" },
++};
++/// What the group sources include, so an edit to one rebuilds them.
++pub const headers = [_][]const u8{
++    "attention/attention_fa.hip", "attention/prefill.hpp", "decode/pages.hpp",      "decode/plan.hpp",               "ops/attention.hpp",
++    "ops/common.hpp",             "ops/draw.hpp",          "ops/tp.hpp",            "ops/elementwise.hpp",           "ops/linear.hpp",
++    "ops/moe.hpp",                "ops/norms.hpp",         "ops/rope.hpp",          "common/arch.hpp",               "common/dot2.hpp",
++    "common/vec.hpp",             "common/wmma.hpp",       "quant/act.hpp",         "quant/mlx.hpp",                 "quant/mlx_decoder.hpp",
++    "quant/mlx_pieces.hpp",       "quant/mlx_tiles.hpp",   "tiles/dot2.hpp",        "tiles/epilogue.hpp",            "tiles/gemm.hpp",
++    "tiles/gemm_kp.hpp",          "tiles/matrix_gemm.hpp", "tiles/matrix_item.hpp", "tiles/plan.hpp",                "tiles/stream.hpp",
++    "flashnext/streams.hpp",      "flashnext/ngram.hpp",   "flashnext/indexer.hpp", "flashnext/sparse.hpp",          "ops/nemotron_moe.hpp",
++    "quant/bf16_decoder.hpp",     "quant/dense_tiles.hpp", "tiles/wmma12_gemm.hpp", "tiles/wmma12_gemm_k32_ref.hpp", "ops/columns.hpp",
++    "columns_controls.hpp",       "ops/vision.hpp",        "ops/dense_text.hpp",    "ops/vl_position.hpp",           "flashnext/sparse_lanes.hpp",
++};
++/// The flags of the kernels' first build: no contraction, wave32 on RDNA, C++20.
++pub const flags = [_][]const u8{ "-D__HIP_PLATFORM_AMD__=1", "-DUSE_ROCM=1", "-DHIPBLAS_V2", "-fPIC", "-DCUDA_HAS_FP16=1", "-DHIP_ENABLE_WARP_SYNC_BUILTINS=1", "-std=c++20", "-fno-gpu-rdc", "-mno-wavefrontsize64", "-ffp-contract=off" };
+diff --git a/zig/kernels/hip/ops/mhc.hip b/zig/kernels/hip/ops/mhc.hip
+new file mode 100644
+index 0000000..24fb03f
+--- /dev/null
++++ b/zig/kernels/hip/ops/mhc.hip
+@@ -0,0 +1,183 @@
++
++#include <hip/hip_bfloat16.h>
++
++#include <cmath>
++
++// SenseNova-Loop's manifold-constrained hyper-connections: two or four residual streams over a looped range.
++
++namespace tf {
++namespace rocm {
++
++__device__ inline float widen(hip_bfloat16 v) { return static_cast<float>(v); }
++__device__ inline hip_bfloat16 narrow(float v) { return hip_bfloat16(v); }
++
++// A state coefficient read back as the reference's bf16 weights: rounded to bf16, then widened.
++__device__ inline float rbf(float x) { return static_cast<float>(hip_bfloat16(x)); }
++
++
++__device__ inline float warp_sum(float x) {
++#pragma unroll
++    for (int mask = 16; mask > 0; mask >>= 1) x += __shfl_xor(x, mask, 32);
++    return __shfl(x, 0, 32);
++}
++
++// The router: a block routes 16/S rows; STATE holds a row's S pre, S post and S*S mix coefficients as f32.
++template <int S>
++__device__ void mhc_branch_rows(const hip_bfloat16* __restrict__ hs, const float* __restrict__ w,
++                                const float* __restrict__ b, hip_bfloat16* __restrict__ branch,
++                                float* __restrict__ state, int rows, int hidden, int iters, float pre_scale) {
++    constexpr int RB = 16 / S, N = 2 * S + S * S, V = N + 1, WARPS = 8;
++    const int d = S * hidden, r0 = (int)blockIdx.x * RB;
++    const int nr = min(RB, rows - r0);
++    if (nr <= 0) return;
++    __shared__ float part[WARPS][RB * V];
++    __shared__ float sums[RB * V];
++    float acc[RB][V];
++#pragma unroll
++    for (int r = 0; r < RB; r++)
++#pragma unroll
++        for (int v = 0; v < V; v++) acc[r][v] = 0.f;
++    for (int i = threadIdx.x; i < d; i += blockDim.x) {
++        float row_w[N];
++#pragma unroll
++        for (int n = 0; n < N; n++) row_w[n] = w[(size_t)n * d + i];
++#pragma unroll
++        for (int r = 0; r < RB; r++) {
++            if (r < nr) {
++                const float x = widen(hs[(size_t)(r0 + r) * d + i]);
++                acc[r][N] += x * x;
++#pragma unroll
++                for (int n = 0; n < N; n++) acc[r][n] += row_w[n] * x;
++            }
++        }
++    }
++    const int lane = threadIdx.x & 31, warp = threadIdx.x >> 5;
++#pragma unroll
++    for (int r = 0; r < RB; r++)
++#pragma unroll
++        for (int v = 0; v < V; v++) {
++            float a = acc[r][v];
++            for (int mask = 16; mask > 0; mask >>= 1) a += __shfl_xor(a, mask, 32);
++            if (lane == 0) part[warp][r * V + v] = a;
++        }
++    __syncthreads();
++    for (int k = threadIdx.x; k < RB * V; k += blockDim.x) {
++        float a = 0.f;
++        for (int p = 0; p < WARPS; p++) a += part[p][k];
++        sums[k] = a;
++    }
++    __syncthreads();
++    if ((int)threadIdx.x < nr) {
++        const int r = threadIdx.x;
++        const float inv = rsqrtf(sums[r * V + N] / (float)d + 1e-6f);
++        float logits[N];
++        for (int n = 0; n < N; n++) logits[n] = sums[r * V + n] * inv + (b == nullptr ? 0.f : b[n]);
++        float* st = state + (size_t)(r0 + r) * N;
++        for (int s = 0; s < S; s++) {
++            st[s] = 1.f / (1.f + expf(-logits[s]));
++            st[S + s] = 2.f / (1.f + expf(-logits[S + s]));
++        }
++        // twenty Sinkhorn iterations in the log space, rows then columns, as the reference runs them
++        float m[S * S];
++        for (int i = 0; i < S * S; i++) m[i] = logits[2 * S + i];
++        for (int it = 0; it < iters; it++) {
++            for (int row = 0; row < S; row++) {
++                float mx = -INFINITY;
++                for (int c = 0; c < S; c++) mx = fmaxf(mx, m[row * S + c]);
++                float sum = 0.f;
++                for (int c = 0; c < S; c++) sum += expf(m[row * S + c] - mx);
++                const float lz = mx + logf(sum);
++                for (int c = 0; c < S; c++) m[row * S + c] -= lz;
++            }
++            for (int c = 0; c < S; c++) {
++                float mx = -INFINITY;
++                for (int row = 0; row < S; row++) mx = fmaxf(mx, m[row * S + c]);
++                float sum = 0.f;
++                for (int row = 0; row < S; row++) sum += expf(m[row * S + c] - mx);
++                const float lz = mx + logf(sum);
++                for (int row = 0; row < S; row++) m[row * S + c] -= lz;
++            }
++        }
++        for (int i = 0; i < S * S; i++) st[2 * S + i] = expf(m[i]);
++    }
++    __syncthreads();
++    for (int r = 0; r < nr; r++) {
++        const size_t base = (size_t)(r0 + r) * d;
++        const float* st = state + (size_t)(r0 + r) * N;
++        for (int h = threadIdx.x; h < hidden; h += blockDim.x) {
++            float out = 0.f;
++            for (int s = 0; s < S; s++) out += rbf(st[s]) * widen(hs[base + (size_t)s * hidden + h]);
++            if (pre_scale != 1.f) out *= pre_scale;
++            branch[(size_t)(r0 + r) * hidden + h] = narrow(out);
++        }
++    }
++}
++
++}  // namespace rocm
++}  // namespace tf
++
++// The router's branch out of the streams, with its pre, post and mix kept for the merge.
++extern "C" __global__ void __launch_bounds__(256)
++    tf_mhc_branch(const void* __restrict__ hs, const void* __restrict__ w, const void* __restrict__ b,
++                  void* __restrict__ branch, float* __restrict__ state, int rows, int streams, int hidden,
++                  int iters, float pre_scale) {
++    const hip_bfloat16* streams_in = static_cast<const hip_bfloat16*>(hs);
++    const float* weights = static_cast<const float*>(w);
++    const float* bias = static_cast<const float*>(b);
++    hip_bfloat16* out = static_cast<hip_bfloat16*>(branch);
++    if (streams == 2) {
++        tf::rocm::mhc_branch_rows<2>(streams_in, weights, bias, out, state, rows, hidden, iters, pre_scale);
++    } else {
++        tf::rocm::mhc_branch_rows<4>(streams_in, weights, bias, out, state, rows, hidden, iters, pre_scale);
++    }
++}
++
++// streams = mix @ streams + post * branch, a thread a (row, column), so no row reads what another thread rewrote.
++extern "C" __global__ void __launch_bounds__(256)
++    tf_mhc_merge(const void* __restrict__ branch, const float* __restrict__ state, void* __restrict__ hs,
++                 long long rows, int streams, int hidden) {
++    const hip_bfloat16* sub = static_cast<const hip_bfloat16*>(branch);
++    hip_bfloat16* streams_io = static_cast<hip_bfloat16*>(hs);
++    const int N = 2 * streams + streams * streams;
++    const size_t work = (size_t)rows * hidden;
++    for (size_t i = (size_t)blockIdx.x * blockDim.x + threadIdx.x; i < work; i += (size_t)gridDim.x * blockDim.x) {
++        const int r = (int)(i / hidden), h = (int)(i % hidden);
++        const float* st = state + (size_t)r * N;
++        const hip_bfloat16* row = streams_io + (size_t)r * streams * hidden + h;
++        const float mixed = tf::rocm::widen(sub[(size_t)r * hidden + h]);
++        float out[4];
++        for (int s = 0; s < streams; s++) {
++            float a = 0.f;
++            for (int t = 0; t < streams; t++) a += tf::rocm::rbf(st[2 * streams + s * streams + t]) * tf::rocm::widen(row[(size_t)t * hidden]);
++            out[s] = a + tf::rocm::rbf(st[streams + s]) * mixed;
++        }
++        for (int s = 0; s < streams; s++) streams_io[(size_t)r * streams * hidden + (size_t)s * hidden + h] = tf::rocm::narrow(out[s]);
++    }
++}
++
++// h into every stream at the window's entry (folding the previous layer's pending output), and its exit.
++extern "C" __global__ void __launch_bounds__(256)
++    tf_mhc_enter(const void* __restrict__ h, const void* __restrict__ r, void* __restrict__ hs,
++                 long long rows, int streams, int hidden) {
++    const hip_bfloat16* residual = static_cast<const hip_bfloat16*>(h);
++    const hip_bfloat16* pending = static_cast<const hip_bfloat16*>(r);
++    hip_bfloat16* streams_out = static_cast<hip_bfloat16*>(hs);
++    const size_t work = (size_t)rows * hidden;
++    for (size_t i = (size_t)blockIdx.x * blockDim.x + threadIdx.x; i < work; i += (size_t)gridDim.x * blockDim.x) {
++        const float v = tf::rocm::widen(residual[i]) + (pending == nullptr ? 0.f : tf::rocm::widen(pending[i]));
++        const hip_bfloat16 o = tf::rocm::narrow(v);
++        for (int s = 0; s < streams; s++) streams_out[(size_t)i / hidden * streams * hidden + (size_t)s * hidden + i % hidden] = o;
++    }
++}
++
++extern "C" __global__ void __launch_bounds__(256)
++    tf_mhc_leave(const void* __restrict__ hs, void* __restrict__ h, long long rows, int streams, int hidden) {
++    const hip_bfloat16* streams_in = static_cast<const hip_bfloat16*>(hs);
++    hip_bfloat16* residual = static_cast<hip_bfloat16*>(h);
++    const size_t work = (size_t)rows * hidden;
++    for (size_t i = (size_t)blockIdx.x * blockDim.x + threadIdx.x; i < work; i += (size_t)gridDim.x * blockDim.x) {
++        float a = 0.f;
++        for (int s = 0; s < streams; s++) a += tf::rocm::widen(streams_in[(size_t)i / hidden * streams * hidden + (size_t)s * hidden + i % hidden]);
++        residual[i] = tf::rocm::narrow(a / (float)streams);
++    }
++}
+diff --git a/zig/src/families/qwen3_5/backend/hip/mhc.zig b/zig/src/families/qwen3_5/backend/hip/mhc.zig
+new file mode 100644
+index 0000000..be0b452
+--- /dev/null
++++ b/zig/src/families/qwen3_5/backend/hip/mhc.zig
+@@ -0,0 +1,81 @@
++//! SenseNova-Loop's mHC: a window's streams on the arena, and the four launches a forward makes.
++
++const hip = @import("hip");
++const view = @import("model/view.zig");
++const fwd = @import("forward/forward.zig");
++const loop = @import("../../loop_plan.zig");
++
++const Ops = hip.ops.Ops;
++const Tensor = hip.ops.Tensor;
++const Error = hip.ops.Error;
++
++/// A window's streams over `rows` rows: the residual planes, and the router's per-row state.
++pub const Streams = struct {
++    hs: Tensor,
++    state: u64,
++};
++
++/// The streams and their router state, taken from the round's arena: they live until the round's forward ends.
++pub fn take(o: Ops, m: *const view.Model, rows: usize) Error!Streams {
++    const s = m.spec;
++    const mh = s.mhc orelse return error.BadShape;
++    return .{
++        .hs = try fwd.take(o, m.act, rows * mh.streams * s.hidden),
++        .state = try o.arena.of(f32, rows * mh.outputs()),
++    };
++}
++
++/// h into every stream at the window's entry; the folded residual is already in `h` (the eager add_rms chain).
++pub fn enter(o: Ops, m: *const view.Model, st: *const Streams, rows: usize, h: Tensor) Error!void {
++    const s = m.spec;
++    const mh = s.mhc orelse return error.BadShape;
++    try o.l.mhcEnter(p(h.ptr), null, pm(st.hs.ptr), @intCast(rows), @intCast(mh.streams), @intCast(s.hidden), o.stream);
++}
++
++/// A sublayer's branch out of the streams: its routers' weights and biases name the site (attn or ffn).
++pub fn branch(o: Ops, m: *const view.Model, st: *const Streams, routers: view.Mhc, rows: usize, out: Tensor) Error!void {
++    const s = m.spec;
++    const mh = s.mhc orelse return error.BadShape;
++    try o.l.mhcBranch(
++        p(st.hs.ptr),
++        p(routers.attn),
++        p(routers.attn_b),
++        pm(out.ptr),
++        pm(st.state),
++        @intCast(rows),
++        @intCast(mh.streams),
++        @intCast(s.hidden),
++        @intCast(mh.iterations),
++        mh.pre_scale,
++        o.stream,
++    );
++}
++
++/// The sublayer's output back into the streams: its branch and the streams mix, each read as bf16.
++pub fn merge(o: Ops, m: *const view.Model, st: *const Streams, sub: Tensor, rows: usize) Error!void {
++    const s = m.spec;
++    const mh = s.mhc orelse return error.BadShape;
++    try o.l.mhcMerge(p(sub.ptr), p(st.state), pm(st.hs.ptr), @intCast(rows), @intCast(mh.streams), @intCast(s.hidden), o.stream);
++}
++
++/// The streams' mean into `h`: the window's last execution, on every visit as the reference collapses the seam.
++pub fn leave(o: Ops, m: *const view.Model, st: *const Streams, rows: usize, h: Tensor) Error!void {
++    const s = m.spec;
++    const mh = s.mhc orelse return error.BadShape;
++    try o.l.mhcLeave(p(st.hs.ptr), pm(h.ptr), @intCast(rows), @intCast(mh.streams), @intCast(s.hidden), o.stream);
++}
++
++/// The streams collapse after `physical`: at the window's end every visit (`carry` keeps them for an A/B).
++pub fn leaves(mh: loop.Mhc, physical: usize, next: usize, carry: bool) bool {
++    return !mh.holds(next) or (!carry and physical + 1 == mh.end);
++}
++
++/// A device address as the kernel argument it is: the const face the streams and routers read.
++fn p(x: u64) ?*const anyopaque {
++    return @ptrFromInt(x);
++}
++
++/// A device address as the kernel argument it is: the face the launches write through.
++fn pm(x: u64) ?*anyopaque {
++    return @ptrFromInt(x);
++}
+diff --git a/zig/src/hip/kernels.zig b/zig/src/hip/kernels.zig
+index d18bbe6..179f825 100644
+--- a/zig/src/hip/kernels.zig
++++ b/zig/src/hip/kernels.zig
+@@ -19,6 +19,7 @@ pub const Group = enum {
+     lighton_ocr,
+     qwen_vision,
+     draft,
++    mhc,
+ };
+ pub const group_count = @typeInfo(Group).@"enum".field_names.len;
+ 
+diff --git a/zig/src/hip/launches.zig b/zig/src/hip/launches.zig
+index 3ac0f4e..bcede9f 100644
+--- a/zig/src/hip/launches.zig
++++ b/zig/src/hip/launches.zig
+@@ -46,6 +46,7 @@ const nemotron_moe = @import("launches/nemotron_moe.zig");
+ const columns = @import("launches/columns.zig");
+ const vision = @import("launches/vision.zig");
+ const dense_text = @import("launches/dense_text.zig");
++const mhc = @import("launches/mhc.zig");
+ pub const draft = @import("launches/draft.zig");
+ 
+ pub const ConvArgs = conv.ConvArgs;
+@@ -110,6 +111,8 @@ pub const Launcher = struct {
+     nemo: nemotron_moe.Fns,
+     /// The DFlash2 drafter's kernels (draft/draft.hip).
+     draft: draft.Fns,
++    /// The mHC kernels (ops/mhc.hip): a window's streams, their router, branch and merge.
++    mhc: mhc.Fns,
+ 
+     const PlanFns = struct {
+         kv_write: Function,
+@@ -234,6 +237,12 @@ pub const Launcher = struct {
+         l.columns = try columns.Functions.load(ops);
+         l.vision = try vision.Functions.load(ops, pre);
+         l.dense_text = try dense_text.Functions.load(ops);
++        l.mhc = .{
++            .branch = try l.mods[@backingInt(kernels.Group.mhc)].function("tf_mhc_branch"),
++            .merge = try l.mods[@backingInt(kernels.Group.mhc)].function("tf_mhc_merge"),
++            .enter = try l.mods[@backingInt(kernels.Group.mhc)].function("tf_mhc_enter"),
++            .leave = try l.mods[@backingInt(kernels.Group.mhc)].function("tf_mhc_leave"),
++        };
+         l.op = .{
+             .embed_rows = try ops.function("tf_embed_rows"),
+             .embed_dense = try ops.function("tf_embed_dense"),
+@@ -397,6 +406,10 @@ pub const Launcher = struct {
+     pub const pagesWrite = plan.pagesWrite;
+     pub const pagesGather = plan.pagesGather;
+     pub const planGather = plan.planGather;
++    pub const mhcBranch = mhc.mhcBranch;
++    pub const mhcMerge = mhc.mhcMerge;
++    pub const mhcEnter = mhc.mhcEnter;
++    pub const mhcLeave = mhc.mhcLeave;
+     pub const tf_gdn_gate_prefill = recurrence.tf_gdn_gate_prefill;
+     pub const tf_gnorm_silu = recurrence.tf_gnorm_silu;
+     pub const tf_embed_rows = elementwise.tf_embed_rows;
+diff --git a/zig/src/hip/launches/mhc.zig b/zig/src/hip/launches/mhc.zig
+new file mode 100644
+index 0000000..d49676c
+--- /dev/null
++++ b/zig/src/hip/launches/mhc.zig
+@@ -0,0 +1,81 @@
++//! The mHC launches: a window's streams entered and left, a sublayer's branch out of them, and its merge back.
++
++const Launcher = @import("../launches.zig").Launcher;
++const util = @import("util.zig");
++const Function = @import("../module.zig").Function;
++const S = util.S;
++const P = util.P;
++const C = util.C;
++const Args = util.Args;
++const Error = util.Error;
++const ad = util.ad;
++const dim = util.dim;
++const cdiv = util.cdiv;
++const invalid = util.invalid;
++
++pub const Fns = struct {
++    branch: Function,
++    merge: Function,
++    enter: Function,
++    leave: Function,
++};
++
++/// The rows one block of the router's launch covers: 16 a window's streams (ops/mhc.hip).
++pub fn blockRows(streams: c_int) usize {
++    return 16 / @as(usize, @intCast(streams));
++}
++
++/// The streams' router: `state` takes a row's pre, post and mix coefficients, `branch` the sublayer's input.
++pub fn mhcBranch(l: *const Launcher, hs: C, w: C, b: C, out: P, state: P, rows: c_int, streams: c_int, hidden: c_int, iters: c_int, pre_scale: f32, s: S) Error!void {
++    if ((streams != 2 and streams != 4) or rows < 1 or hidden < 1 or iters < 1 or iters > 64) return invalid("mhc branch");
++    var a: Args = .{};
++    try a.add(ad(hs));
++    try a.add(ad(w));
++    try a.add(ad(b));
++    try a.add(ad(out));
++    try a.add(ad(state));
++    try a.add(rows);
++    try a.add(streams);
++    try a.add(hidden);
++    try a.add(iters);
++    try a.add(pre_scale);
++    try l.go(l.mhc.branch, dim(cdiv(rows, blockRows(streams)), 1, 1), dim(256, 1, 1), 0, s, &a);
++}
++
++/// streams = mix @ streams + post * branch, a thread a (row, column), so no row reads what another rewrote.
++pub fn mhcMerge(l: *const Launcher, sub: C, state: C, hs: P, rows: c_longlong, streams: c_int, hidden: c_int, s: S) Error!void {
++    if ((streams != 2 and streams != 4) or rows < 1 or hidden < 1) return invalid("mhc merge");
++    var a: Args = .{};
++    try a.add(ad(sub));
++    try a.add(ad(state));
++    try a.add(ad(hs));
++    try a.add(rows);
++    try a.add(streams);
++    try a.add(hidden);
++    try l.go(l.mhc.merge, dim(cdiv(rows * hidden, 256), 1, 1), dim(256, 1, 1), 0, s, &a);
++}
++
++/// h into every stream at the window's entry, folding the previous layer's output when it is still pending.
++pub fn mhcEnter(l: *const Launcher, h: C, pending: C, hs: P, rows: c_longlong, streams: c_int, hidden: c_int, s: S) Error!void {
++    if ((streams != 2 and streams != 4) or rows < 1 or hidden < 1) return invalid("mhc enter");
++    var a: Args = .{};
++    try a.add(ad(h));
++    try a.add(ad(pending));
++    try a.add(ad(hs));
++    try a.add(rows);
++    try a.add(streams);
++    try a.add(hidden);
++    try l.go(l.mhc.enter, dim(cdiv(rows * hidden, 256), 1, 1), dim(256, 1, 1), 0, s, &a);
++}
++
++/// The streams' mean into h: the window's last execution.
++pub fn mhcLeave(l: *const Launcher, hs: C, h: P, rows: c_longlong, streams: c_int, hidden: c_int, s: S) Error!void {
++    if ((streams != 2 and streams != 4) or rows < 1 or hidden < 1) return invalid("mhc leave");
++    var a: Args = .{};
++    try a.add(ad(hs));
++    try a.add(ad(h));
++    try a.add(rows);
++    try a.add(streams);
++    try a.add(hidden);
++    try l.go(l.mhc.leave, dim(cdiv(rows * hidden, 256), 1, 1), dim(256, 1, 1), 0, s, &a);
++}
+diff --git a/zig/tests/hip/contract_main.zig b/zig/tests/hip/contract_main.zig
+index 9317e4d..8ea73ea 100644
+--- a/zig/tests/hip/contract_main.zig
++++ b/zig/tests/hip/contract_main.zig
+@@ -41,6 +41,7 @@ const pos_k = @import("contract_vl_position.zig");
+ const sparse_k = @import("contract_sparse_lanes.zig");
+ const skew_k = @import("contract_wmma_skew.zig");
+ const idx_k = @import("contract_idx_scores.zig");
++const mhc_k = @import("contract_q35_mhc.zig");
+ 
+ const g = core.contract.gates;
+ 
+@@ -254,6 +255,15 @@ fn run(a: std.mem.Allocator, io: std.Io) !usize {
+     for (&drafts, draft_modes) |*m, w| m.* = .init(a, &r, s, &l, w);
+     defer for (&drafts) |*m| m.deinit();
+     for (&drafts) |*m| try kernels.append(a, m.kernel());
++    // SenseNova-Loop's mHC: the router's two outputs and the three stream moves, each with its planted control
++    var mhc_cases: [10]mhc_k.Case = undefined;
++    var mhc_used: usize = 0;
++    defer for (mhc_cases[0..mhc_used]) |*m| m.deinit();
++    for (std.enums.values(mhc_k.Which)) |site| for ([_]bool{ false, true }) |planted| {
++        mhc_cases[mhc_used] = .init(a, &r, s, &l, site, planted);
++        mhc_used += 1;
++        try kernels.append(a, mhc_cases[mhc_used - 1].kernel());
++    };
+     var argmax = argmax_k.Argmax.init(a, &r, s, &l);
+     defer argmax.deinit();
+     try kernels.append(a, argmax.kernel());
+diff --git a/zig/tests/hip/contract_q35_mhc.zig b/zig/tests/hip/contract_q35_mhc.zig
+new file mode 100644
+index 0000000..c461824
+--- /dev/null
++++ b/zig/tests/hip/contract_q35_mhc.zig
+@@ -0,0 +1,378 @@
++//! SenseNova-Loop's mHC under gates 1-4, against the host's FP64 arithmetic of the same definition.
++const std = @import("std");
++const hip = @import("hip");
++const core = @import("core");
++const rig_ = @import("contract_rig.zig");
++
++const contract = core.contract;
++const c = contract.spec;
++const g = contract.gates;
++const rows_ = contract.rows;
++const bf = core.bf16_round;
++
++/// The router's two outputs (its branch and its pre/post/mix state), then the three stream moves.
++pub const Which = enum { branch, state, merge, enter, leave };
++/// The checkpoint's own settings: two streams over a 4096-wide residual, twenty log-space Sinkhorn passes.
++pub const streams = 2;
++pub const iterations = 20;
++const hidden = 4096;
++const width = streams * hidden;
++const outs = 2 * streams + streams * streams;
++/// The rows one router block takes (ops/mhc.hip, launches/mhc.zig).
++pub const per = 16 / streams;
++
++fn router(which: Which) bool {
++    return which == .branch or which == .state;
++}
++
++/// A router dot: each thread's k/256 terms, a 32-lane shuffle, then the block's eight warps.
++fn routerDepth(shape: c.Shape) usize {
++    return shape.k / 256 + 5 + 8;
++}
++
++fn moveDepth(_: c.Shape) usize {
++    return streams + 1;
++}
++
++const served = [_]c.Shape{
++    .{ .rows = 1, .n = outs, .k = width },
++    .{ .rows = 9, .n = outs, .k = width },
++    .{ .rows = 129, .n = outs, .k = width },
++    .{ .rows = 4096, .n = outs, .k = width },
++};
++
++pub fn spec(which: Which, control: bool) c.Spec {
++    return .{
++        .name = if (control) switch (which) {
++            .branch => "control q35 mhc branch: no row normalisation",
++            .state => "control q35 mhc state: no Sinkhorn passes",
++            .merge => "control q35 mhc merge: identity map",
++            .enter => "control q35 mhc enter: no pending output folded",
++            .leave => "control q35 mhc leave: the first stream only",
++        } else switch (which) {
++            .branch => "hip tf_mhc_branch (branch)",
++            .state => "hip tf_mhc_branch (pre/post/mix)",
++            .merge => "hip tf_mhc_merge",
++            .enter => "hip tf_mhc_enter",
++            .leave => "hip tf_mhc_leave",
++        },
++        .accum = .f32,
++        .depth = if (router(which)) routerDepth else moveDepth,
++        .ops = if (which == .state) 64 * iterations else 8,
++        .out = if (which == .state) .f32 else .bf16,
++        .in_place = which == .merge,
++        .tiles = .{ .{ .size = per }, .{}, .{} },
++        .served = &served,
++        .sums = .{ .f16 = 0, .bf16 = 0, .why = "the router's logits pass a sigmoid and twenty Sinkhorn passes; the moves sum two streams" },
++    };
++}
++
++pub const Case = struct {
++    rig: rig_.Rig,
++    l: *const hip.Launcher,
++    arena: std.heap.ArenaAllocator,
++    which: Which,
++    control: bool,
++    shape: c.Shape = .{ .rows = 0, .n = 0, .k = 0 },
++    hs: []u16 = &.{},
++    branch: []u16 = &.{},
++    res: []u16 = &.{},
++    w: []f32 = &.{},
++    bias: []f32 = &.{},
++    state: []f32 = &.{},
++    in0: u64 = 0,
++    in1: u64 = 0,
++    in2: u64 = 0,
++    out0: u64 = 0,
++    out1: u64 = 0,
++
++    pub fn init(a: std.mem.Allocator, r: *const hip.Runtime, s: hip.Stream, l: *const hip.Launcher, which: Which, control: bool) Case {
++        return .{ .rig = .{ .a = a, .r = r, .s = s }, .l = l, .arena = .init(a), .which = which, .control = control };
++    }
++
++    pub fn deinit(self: *Case) void {
++        self.rig.deinit();
++        self.arena.deinit();
++    }
++
++    pub fn kernel(self: *Case) g.Kernel {
++        return .{ .spec = spec(self.which, self.control), .ctx = self, .vt = &vt, .control = if (self.control) .shapes else null };
++    }
++
++    const vt = g.hooks(Case);
++
++    fn random(rng: std.Random, out: []u16, scale: f32) void {
++        for (out) |*x| x.* = bf.bits((rng.float(f32) * 2 - 1) * scale);
++    }
++
++    fn integers(rng: std.Random, out: []u16) void {
++        for (out) |*x| x.* = bf.bits(@as(f32, @floatFromInt(@as(i32, @intCast(rng.uintLessThan(u32, 33))) - 16)));
++    }
++
++    pub fn prepare(self: *Case, shape: c.Shape, fill: g.Fill, seed: u64) !bool {
++        if (shape.rows == 0 or shape.rows > 4096 or shape.n != outs or shape.k != width) return false;
++        self.rig.reset();
++        _ = self.arena.reset(.retain_capacity);
++        const a = self.arena.allocator();
++        self.shape = shape;
++        var prng = std.Random.DefaultPrng.init(seed);
++        const rng = prng.random();
++        self.hs = try a.alloc(u16, shape.rows * width);
++        self.branch = try a.alloc(u16, shape.rows * hidden);
++        self.res = try a.alloc(u16, shape.rows * hidden);
++        self.w = try a.alloc(f32, outs * width);
++        self.bias = try a.alloc(f32, outs);
++        self.state = try a.alloc(f32, shape.rows * outs);
++        for (self.state, 0..) |*st, i| st.* = switch (i % outs) {
++            0, 1 => 0.25,
++            2, 3 => 1.0,
++            else => 0.5,
++        };
++        if (fill == .stress) {
++            // integers and halves: every product and sum is exact in fp32, in any order
++            integers(rng, self.hs);
++            integers(rng, self.branch);
++            integers(rng, self.res);
++            for (self.w) |*wt| wt.* = if (rng.boolean()) 0.5 else -0.5;
++            @memset(self.bias, 0);
++        } else {
++            random(rng, self.hs, 2);
++            random(rng, self.branch, 2);
++            random(rng, self.res, 2);
++            for (self.w) |*wt| wt.* = (rng.float(f32) * 2 - 1) * 0.05;
++            for (self.bias) |*bias| bias.* = (rng.float(f32) * 2 - 1) * 0.5;
++        }
++        if (fill == .nonfinite) {
++            // rows 0 and 2 only, so finite rows remain beside them
++            self.hs[3] = bf.bits(std.math.nan(f32));
++            self.hs[2 * width + hidden + 5] = bf.bits(std.math.inf(f32));
++            self.branch[2 * hidden + 7] = bf.bits(-std.math.inf(f32));
++            self.res[9] = bf.bits(std.math.inf(f32));
++        }
++        const r = shape.rows;
++        switch (self.which) {
++            .branch, .state => {
++                self.in0 = try self.rig.input(std.mem.sliceAsBytes(self.hs));
++                self.in1 = try self.rig.input(std.mem.sliceAsBytes(self.w));
++                self.in2 = try self.rig.input(std.mem.sliceAsBytes(self.bias));
++                const b_len = r * hidden * 2;
++                const s_len = r * outs * 4;
++                self.out0 = if (self.which == .branch) try self.rig.output(b_len) else try self.rig.scratch(b_len);
++                self.out1 = if (self.which == .state) try self.rig.output(s_len) else try self.rig.scratch(s_len);
++            },
++            .merge => {
++                self.in0 = try self.rig.input(std.mem.sliceAsBytes(self.branch));
++                self.in1 = try self.rig.input(std.mem.sliceAsBytes(self.state));
++                self.in2 = try self.rig.input(std.mem.sliceAsBytes(self.hs));
++                self.out0 = try self.rig.output(r * width * 2);
++            },
++            .enter => {
++                self.in0 = try self.rig.input(std.mem.sliceAsBytes(self.hs[0 .. r * hidden]));
++                self.in1 = try self.rig.input(std.mem.sliceAsBytes(self.res));
++                self.out0 = try self.rig.output(r * width * 2);
++            },
++            .leave => {
++                self.in0 = try self.rig.input(std.mem.sliceAsBytes(self.hs));
++                self.out0 = try self.rig.output(r * hidden * 2);
++            },
++        }
++        return true;
++    }
++
++    pub fn run(self: *Case) !void {
++        const rows: c_longlong = @intCast(self.shape.rows);
++        const s = self.rig.s.handle;
++        switch (self.which) {
++            .branch, .state => try self.l.mhcBranch(
++                p(self.in0),
++                p(self.in1),
++                p(self.in2),
++                pm(self.out0),
++                pm(self.out1),
++                @intCast(self.shape.rows),
++                streams,
++                hidden,
++                iterations,
++                1.0,
++                s,
++            ),
++            .merge => {
++                // the merge rewrites the streams in place: the run starts from the input's own bytes
++                try self.rig.put(self.out0, std.mem.sliceAsBytes(self.hs));
++                try self.l.mhcMerge(p(self.in0), p(self.in1), pm(self.out0), rows, streams, hidden, s);
++            },
++            .enter => try self.l.mhcEnter(p(self.in0), p(self.in1), pm(self.out0), rows, streams, hidden, s),
++            .leave => try self.l.mhcLeave(p(self.in0), pm(self.out0), rows, streams, hidden, s),
++        }
++        try self.rig.s.synchronize();
++    }
++
++    pub fn count(self: *Case) usize {
++        const r = self.shape.rows;
++        return switch (self.which) {
++            .branch, .leave => r * hidden,
++            .state => r * outs,
++            .merge, .enter => r * width,
++        };
++    }
++
++    /// The 2x2 map Sinkhorn-normalised as the definition does: log space, a row pass then a column pass.
++    fn sinkhorn(m: *[streams * streams]f64) void {
++        for (0..iterations) |_| {
++            for (0..streams) |row| {
++                var mx = -std.math.inf(f64);
++                for (0..streams) |col| mx = @max(mx, m[row * streams + col]);
++                var sum: f64 = 0;
++                for (0..streams) |col| sum += @exp(m[row * streams + col] - mx);
++                const lz = mx + @log(sum);
++                for (0..streams) |col| m[row * streams + col] -= lz;
++            }
++            for (0..streams) |col| {
++                var mx = -std.math.inf(f64);
++                for (0..streams) |row| mx = @max(mx, m[row * streams + col]);
++                var sum: f64 = 0;
++                for (0..streams) |row| sum += @exp(m[row * streams + col] - mx);
++                const lz = mx + @log(sum);
++                for (0..streams) |row| m[row * streams + col] -= lz;
++            }
++        }
++    }
++
++    fn sumAll(t: []const f64) f64 {
++        var s: f64 = 0;
++        for (t) |v| s += v;
++        return s;
++    }
++
++    /// One row's router: pre, post, mix, and the logits' magnitude (what an fp32 dot's error scales with).
++    fn route(self: *Case, acc: c.Accum, order: g.Order, r: usize, terms: []f64, st: *[outs]f64) f64 {
++        const row = self.hs[r * width ..][0..width];
++        for (terms, row) |*t, x| t.* = @as(f64, bf.value(x)) * bf.value(x);
++        const sq = if (acc == .none) sumAll(terms) else rows_.sumIn(acc, order, terms);
++        const inv = if (self.control and self.which == .branch) 1.0 else 1.0 / @sqrt(sq / @as(f64, width) + 1e-6);
++        var logits: [outs]f64 = undefined;
++        var mag: f64 = 0;
++        for (0..outs) |o| {
++            var size: f64 = 0;
++            for (terms, row, 0..) |*t, x, i| {
++                t.* = @as(f64, self.w[o * width + i]) * bf.value(x);
++                size += @abs(t.*);
++            }
++            const dot = if (acc == .none) sumAll(terms) else rows_.sumIn(acc, order, terms);
++            logits[o] = dot * inv + self.bias[o];
++            mag = @max(mag, size * @abs(inv));
++        }
++        var m: [streams * streams]f64 = logits[2 * streams ..][0 .. streams * streams].*;
++        if (!(self.control and self.which == .state)) sinkhorn(&m);
++        for (0..streams) |s| {
++            st[s] = 1.0 / (1.0 + @exp(-logits[s]));
++            st[streams + s] = 2.0 / (1.0 + @exp(-logits[streams + s]));
++        }
++        for (m, 0..) |v, i| st[2 * streams + i] = @exp(v);
++        return mag;
++    }
++
++    fn outputs(self: *Case, acc: c.Accum, order: g.Order, want: []f64, mag: ?[]f64) !void {
++        const terms = try self.arena.allocator().alloc(f64, width);
++        defer self.arena.allocator().free(terms);
++        for (0..self.shape.rows) |r| {
++            const hs = self.hs[r * width ..][0..width];
++            switch (self.which) {
++                .branch, .state => {
++                    var st: [outs]f64 = undefined;
++                    const size = self.route(acc, order, r, terms, &st);
++                    if (self.which == .state) {
++                        for (st, 0..) |v, o| {
++                            want[r * outs + o] = v;
++                            if (mag) |m| m[r * outs + o] = size;
++                        }
++                    } else for (0..hidden) |col| {
++                        var b: f64 = 0;
++                        var sz: f64 = 0;
++                        for (0..streams) |s| {
++                            const x: f64 = bf.value(hs[s * hidden + col]);
++                            b += st[s] * x;
++                            sz += @abs(st[s] * x);
++                        }
++                        want[r * hidden + col] = b;
++                        if (mag) |m| m[r * hidden + col] = sz;
++                    }
++                },
++                .leave => for (0..hidden) |col| {
++                    var sum: f64 = 0;
++                    for (0..streams) |s| sum += bf.value(hs[s * hidden + col]);
++                    const v = if (self.control) @as(f64, bf.value(hs[col])) else sum / @as(f64, streams);
++                    want[r * hidden + col] = v;
++                    if (mag) |m| m[r * hidden + col] = @abs(v);
++                },
++                .enter => for (0..hidden) |col| {
++                    const fold: f64 = if (self.control) 0 else bf.value(self.res[r * hidden + col]);
++                    const v = bf.bf16(@as(f64, bf.value(self.hs[r * hidden + col])) + fold);
++                    for (0..streams) |s| {
++                        want[r * width + s * hidden + col] = v;
++                        if (mag) |m| m[r * width + s * hidden + col] = @abs(v);
++                    }
++                },
++                .merge => {
++                    const st = self.state[r * outs ..][0..outs];
++                    var mix: [streams * streams]f64 = undefined;
++                    for (&mix, 0..) |*v, i| v.* = st[2 * streams + i];
++                    if (self.control) mix = .{ 1, 0, 0, 1 };
++                    for (0..hidden) |col| for (0..streams) |s| {
++                        var v: f64 = @as(f64, st[streams + s]) * bf.value(self.branch[r * hidden + col]);
++                        var sz: f64 = @abs(v);
++                        for (0..streams) |t| {
++                            const term = mix[s * streams + t] * bf.value(hs[t * hidden + col]);
++                            v += term;
++                            sz += @abs(term);
++                        }
++                        want[r * width + s * hidden + col] = v;
++                        if (mag) |m| m[r * width + s * hidden + col] = sz;
++                    };
++                },
++            }
++        }
++    }
++
++    pub fn reference(self: *Case, want: []f64, mag: []f64) !void {
++        try self.outputs(.none, .sequential, want, mag);
++    }
++
++    pub fn simulate(self: *Case, acc: c.Accum, order: g.Order, out: []f64) !void {
++        try self.outputs(acc, order, out, null);
++    }
++
++    /// The branch mixes with pre rounded to bf16 (as the reference model does): a bf16 ulp of each term.
++    pub fn bounds(self: *Case, _: []const f64, mag: []const f64, allow: []f64) !void {
++        if (self.which == .branch) for (allow, mag) |*l, m| {
++            l.* += 0x1p-7 * m;
++        };
++    }
++};
++
++/// A device address as the kernel argument it is: the const face the kernels read.
++fn p(x: u64) ?*const anyopaque {
++    return @ptrFromInt(x);
++}
++
++/// A device address as the kernel argument it is: the face the launches write through.
++fn pm(x: u64) ?*anyopaque {
++    return @ptrFromInt(x);
++}
++
++test "the mHC contract's own settings match the checkpoint's window" {
++    try std.testing.expectEqual(@as(usize, 2), streams);
++    try std.testing.expectEqual(@as(usize, 8), outs);
++    try std.testing.expectEqual(@as(usize, 8), per);
++    try std.testing.expectEqual(@as(usize, 8192), width);
++    for (served) |shape| {
++        try std.testing.expect(shape.rows <= 4096);
++        try std.testing.expectEqual(outs, shape.n);
++        try std.testing.expectEqual(width, shape.k);
++    }
++    // every planted control names its own plant, and no real case carries a control's name
++    for (std.enums.values(Which)) |which| {
++        try std.testing.expect(!std.mem.eql(u8, spec(which, false).name, spec(which, true).name));
++        try std.testing.expect(std.mem.indexOf(u8, spec(which, true).name, "control") != null);
++    }
++}
+-- 
+2.56.0
+

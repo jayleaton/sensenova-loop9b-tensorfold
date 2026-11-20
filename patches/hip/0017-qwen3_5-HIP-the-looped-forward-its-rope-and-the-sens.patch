@@ -1,0 +1,916 @@
+From ead46d9596fb20c63db33a48709b5192da368aa9 Mon Sep 17 00:00:00 2001
+From: Jay Leaton <58495321+jayleaton@users.noreply.github.com>
+Date: Thu, 19 Nov 2026 18:48:54 +0800
+Subject: [PATCH 17/20] qwen3_5 HIP: the looped forward, its rope and the
+ sensenova_loop registration
+
+A forward now runs the plan's executions, not the model's layers: the
+window and span passes walk loop_plan's 56 steps and name the physical
+layer each one visits, its cache slot its own. Inside the mHC window
+the streams hold the residual: a layer branches out of them with its
+router, runs its mixer and its MLP on that branch, and merges each
+sublayer's output back with the learned mix; the streams collapse to
+their mean at the window's end on every visit, as the reference does,
+with TF_Q35_MHC_CARRY keeping the carry for an A/B. Outside the window
+the fused add-rms tails keep their arithmetic, and the seam between
+the two folds and norms exactly once.
+
+The rope kernels grow a YaRN pair: tf_yarn_prefill and tf_qk_yarn_rope
+read the static table (its attention factor scaling cos and sin, its
+words the frequencies) the CUDA rotate reads. A YaRN checkpoint's
+bf16 chat text and --vision rows still take Torch's M-RoPE op, which
+reads no table: those loads refuse rather than serve quiet plain rope.
+
+The native server registers sensenova_loop over the MLX affine
+formats, text only for now, and declares the reply share 0.5 beside a
+filling prompt. A device whose activations are not bf16 refuses an
+mHC window, and a drafter cannot tap a looped layer: one ring a layer
+would alias its passes.
+---
+ zig/kernels/hip/ops/rope.hpp                  | 74 +++++++++++++++
+ zig/src/families/flashnext/hip/mixers.zig     |  4 +-
+ zig/src/families/nemotron/hip/forward.zig     |  4 +-
+ zig/src/families/nemotron_parse/compute.zig   |  2 +-
+ zig/src/families/qwen3/forward.zig            |  4 +-
+ .../qwen3_5/backend/hip/draft/frame.zig       |  6 +-
+ .../qwen3_5/backend/hip/engine/engine.zig     | 12 +++
+ .../qwen3_5/backend/hip/engine/native.zig     | 18 ++--
+ .../qwen3_5/backend/hip/forward/forward.zig   | 63 ++++++++++---
+ .../qwen3_5/backend/hip/forward/window.zig    | 89 +++++++++++++++----
+ zig/src/families/qwen3_5/backend/hip/mhc.zig  | 10 +--
+ .../qwen3_5/backend/hip/model/bridge.zig      |  8 ++
+ .../qwen3_5/backend/hip/model/view.zig        |  4 +
+ zig/src/families/qwen3_5/hip.zig              |  6 +-
+ zig/src/families/qwen3_5/rope.zig             |  2 +
+ zig/src/hip/launches.zig                      |  7 ++
+ zig/src/hip/launches/rope.zig                 | 40 +++++++++
+ zig/src/hip/ops/attention.zig                 | 20 +++--
+ zig/src/native/hip.zig                        | 22 ++---
+ zig/src/platform/environment.zig              |  6 +-
+ zig/src/server/engines.zig                    |  1 +
+ 21 files changed, 336 insertions(+), 66 deletions(-)
+
+diff --git a/zig/kernels/hip/ops/rope.hpp b/zig/kernels/hip/ops/rope.hpp
+index 12b481e..a888d26 100644
+--- a/zig/kernels/hip/ops/rope.hpp
++++ b/zig/kernels/hip/ops/rope.hpp
+@@ -31,6 +31,29 @@ extern "C" __global__ void tf_rope_prefill(const void* x, int kind, void* out, i
+     store(out, out_kind, h * s_head + r * s_row + j, rounded(y, kind));
+ }
+ 
++// The same prefill over a YaRN table: its first word scales cos and sin (the attention factor), then 32 frequencies.
++extern "C" __global__ void tf_yarn_prefill(const void* x, int kind, void* out, int out_kind, long long s_head, long long s_row,
++                                     int len, int heads, int d, int rotary, int pos0, const float* yarn) {
++    long long i = gid();
++    if (i >= static_cast<long long>(len) * heads * d) return;
++    int j = static_cast<int>(i % d);
++    int h = static_cast<int>((i / d) % heads);
++    int r = static_cast<int>(i / (static_cast<long long>(d) * heads));
++    long long base = (static_cast<long long>(r) * heads + h) * d;
++    int half = rotary / 2;
++    float y;
++    if (j >= rotary) {
++        y = load(x, kind, base + j);
++    } else {
++        int f = j < half ? j : j - half;
++        float ang = static_cast<float>(pos0 + r) * yarn[1 + f];
++        float c = cosf(ang) * yarn[0], s = sinf(ang) * yarn[0];
++        float x1 = load(x, kind, base + f), x2 = load(x, kind, base + f + half);
++        y = j < half ? x1 * c - x2 * s : x1 * s + x2 * c;
++    }
++    store(out, out_kind, h * s_head + r * s_row + j, rounded(y, kind));
++}
++
+ // A window's q or k heads in one pass, a wave a (row, head): RMS norm, then rotation at its position, both rounded.
+ extern "C" __global__ void __launch_bounds__(256) tf_qk_rope(const void* src, int kind, long long s_row, int s_head,
+                                                       const float* weight, float eps, int rows, int heads, int width,
+@@ -83,4 +106,55 @@ extern "C" __global__ void __launch_bounds__(256) tf_qk_rope(const void* src, in
+     for (int i = rotary + lane; i < width; i += 32) put(i, row_v[wave][i]);
+ }
+ 
++// The same window pass over a YaRN table: cos and sin scaled by its attention factor, its words the frequencies.
++extern "C" __global__ void __launch_bounds__(256) tf_qk_yarn_rope(const void* src, int kind, long long s_row, int s_head,
++                                                           const float* weight, float eps, int rows, int heads, int width,
++                                                           int rotary, const float* yarn, const int* pos, float* wide,
++                                                           void* cache, int total) {
++    constexpr int kMost = 512 / 32;
++    __shared__ float row_v[8][512];
++    const int lane = threadIdx.x & 31, wave = threadIdx.x >> 5;
++    const int g = blockIdx.x * 8 + wave;
++    const bool live = g < rows * heads;
++    const int r = live ? g / heads : 0, h = live ? g % heads : 0;
++    const long long at = r * s_row + static_cast<long long>(h) * s_head;
++    float v[kMost];
++    float sum = 0.f;
++#pragma unroll
++    for (int j = 0; j < kMost; ++j) {
++        const int i = lane + 32 * j;
++        v[j] = live && i < width ? load(src, kind, at + i) : 0.f;
++        if (i < width) sum += v[j] * v[j];
++    }
++#pragma unroll
++    for (int mask = 16; mask > 0; mask >>= 1) sum += __shfl_xor(sum, mask, 32);
++    const float inv = rsqrtf(__shfl(sum, 0, 32) / static_cast<float>(width) + eps);
++#pragma unroll
++    for (int j = 0; j < kMost; ++j) {
++        const int i = lane + 32 * j;
++        if (i < width) row_v[wave][i] = rounded(v[j] * inv * weight[i], kind);
++    }
++    __syncthreads();
++    if (!live) return;
++    const int p = pos[r];
++    const int half = rotary >> 1;
++    float* out = wide ? wide + static_cast<long long>(g) * width : nullptr;
++    const long long slot = (static_cast<long long>(h) * total + p) * width;
++    auto put = [&](int i, float value) {
++        value = rounded(value, kind);
++        if (out) out[i] = value;
++        if (cache) store(cache, kind, slot + i, value);
++    };
++    for (int i = lane; i < half; i += 32) {
++        float ang = static_cast<float>(p) * yarn[1 + i];
++        float c = cosf(ang) * yarn[0];
++        float sn = sinf(ang) * yarn[0];
++        float x1 = row_v[wave][i];
++        float x2 = row_v[wave][half + i];
++        put(i, x1 * c - x2 * sn);
++        put(half + i, x1 * sn + x2 * c);
++    }
++    for (int i = rotary + lane; i < width; i += 32) put(i, row_v[wave][i]);
++}
++
+ }  // namespace
+diff --git a/zig/src/families/flashnext/hip/mixers.zig b/zig/src/families/flashnext/hip/mixers.zig
+index d1c9207..fed65c5 100644
+--- a/zig/src/families/flashnext/hip/mixers.zig
++++ b/zig/src/families/flashnext/hip/mixers.zig
+@@ -253,9 +253,10 @@ pub fn sparse(
+         q32,
+         null,
+         0,
++        null,
+     );
+     const iq = try o.arena.of(f32, rows * d.index_heads * di);
+-    try o.qkRope(idx, width, di, s.iq_norm, d.eps, rows, d.index_heads, di, d.rotary, d.theta, dev_pos, iq, null, 0);
++    try o.qkRope(idx, width, di, s.iq_norm, d.eps, rows, d.index_heads, di, d.rotary, d.theta, dev_pos, iq, null, 0, null);
+     const att = try o.arena.of(f32, rows * d.heads * hd);
+     const graphed = o.window and staged != null;
+     var off: usize = 0;
+@@ -280,6 +281,7 @@ pub fn sparse(
+             null,
+             kv.k,
+             cap,
++            null,
+         );
+         if (graphed) {
+             try o.kvWriteAt(forward.at(values, off * d.kv_heads * hd), kv.v, n, d.kv_heads, hd, cap, at_pos);
+diff --git a/zig/src/families/nemotron/hip/forward.zig b/zig/src/families/nemotron/hip/forward.zig
+index 8cba574..cd5ebb6 100644
+--- a/zig/src/families/nemotron/hip/forward.zig
++++ b/zig/src/families/nemotron/hip/forward.zig
+@@ -76,10 +76,10 @@ pub fn attention(
+             try o.pageWrite(keys.ptr, c.k, c.table, rows, d.kv_heads, hd, hd, d.kv_heads * hd, pos, c.count);
+             try o.pageWrite(values.ptr, c.v, c.table, rows, d.kv_heads, hd, hd, d.kv_heads * hd, pos, c.count);
+             // q (rows, heads, d) to (heads, rows, d) fp32: the prefill RoPE kernel with no rotary part is that copy
+-            try o.ropePrefill(q, .{ .ptr = q32, .kind = .f32 }, rows * hd, hd, rows, d.heads, hd, 0, pos, 1);
++            try o.ropePrefill(q, .{ .ptr = q32, .kind = .f32 }, rows * hd, hd, rows, d.heads, hd, 0, pos, 1, null);
+             try o.causalPaged(q32, c, att, rows, pos + rows, d.heads, scaleOf(hd), pos);
+             // (heads, rows, d) fp32 back to (rows, heads, d) in act: the same copy with heads and rows swapped
+-            try o.ropePrefill(.{ .ptr = att, .kind = .f32 }, flat, d.heads * hd, hd, d.heads, rows, hd, 0, 0, 1);
++            try o.ropePrefill(.{ .ptr = att, .kind = .f32 }, flat, d.heads * hd, hd, d.heads, rows, hd, 0, 0, 1, null);
+         },
+         .plan => |pl| if (o.fused()) {
+             // the walk reads q and writes its rows in the activation type: the bytes of the casts it saves
+diff --git a/zig/src/families/nemotron_parse/compute.zig b/zig/src/families/nemotron_parse/compute.zig
+index 39ea695..a157fa7 100644
+--- a/zig/src/families/nemotron_parse/compute.zig
++++ b/zig/src/families/nemotron_parse/compute.zig
+@@ -60,7 +60,7 @@ pub const Compute = struct {
+     /// Copy interleaved projection rows into [head,row,dim], without applying text rotary positions.
+     pub fn heads(c: Compute, x: Tensor, rows: usize, count: usize, dim: usize, wide: bool) !Tensor {
+         const out = try c.alloc(rows * count * dim, if (wide) .f32 else .bf16);
+-        try c.ops.ropePrefill(x, out, rows * dim, dim, rows, count, dim, 0, 0, 1);
++        try c.ops.ropePrefill(x, out, rows * dim, dim, rows, count, dim, 0, 0, 1, null);
+         return out;
+     }
+ 
+diff --git a/zig/src/families/qwen3/forward.zig b/zig/src/families/qwen3/forward.zig
+index 8ed60c3..ea193f4 100644
+--- a/zig/src/families/qwen3/forward.zig
++++ b/zig/src/families/qwen3/forward.zig
+@@ -154,9 +154,9 @@ fn attention(o: Ops, m: *const model.Model, l: *const model.Layer, q: Tensor, k:
+         try o.rms(at(k, (a + p) * kvw), l.k_norm, kn, rows * s.kv_heads, hd, @floatCast(s.eps));
+         // q rotated, rounded to the activation dtype, then widened: (heads, rows, d) fp32 for the kernel
+         const q32 = try o.arena.of(f32, rows * qw);
+-        try o.ropePrefill(qn, .{ .ptr = q32, .kind = .f32 }, rows * hd, hd, rows, s.heads, hd, hd, at_pos, theta);
++        try o.ropePrefill(qn, .{ .ptr = q32, .kind = .f32 }, rows * hd, hd, rows, s.heads, hd, hd, at_pos, theta, null);
+         // k rotated into the cache (kv_heads, total, d) from slot at_pos (row r at r * s_row); v as it is
+-        try o.ropePrefill(kn, .{ .ptr = c.k + at_pos * hd * c.kind.size(), .kind = c.kind }, c.total * hd, hd, rows, s.kv_heads, hd, hd, at_pos, theta);
++        try o.ropePrefill(kn, .{ .ptr = c.k + at_pos * hd * c.kind.size(), .kind = c.kind }, c.total * hd, hd, rows, s.kv_heads, hd, hd, at_pos, theta, null);
+         try o.kvWrite(at(v, (a + p) * kvw), c.v, rows, s.kv_heads, hd, c.total, at_pos);
+         const att = try o.arena.of(f32, rows * qw);
+         try o.causalPrefill(q32, c, att, rows, at_pos + rows, s.heads, scaleOf(hd), at_pos);
+diff --git a/zig/src/families/qwen3_5/backend/hip/draft/frame.zig b/zig/src/families/qwen3_5/backend/hip/draft/frame.zig
+index d5d4ac4..31f0799 100644
+--- a/zig/src/families/qwen3_5/backend/hip/draft/frame.zig
++++ b/zig/src/families/qwen3_5/backend/hip/draft/frame.zig
+@@ -92,7 +92,7 @@ pub fn absorb(o: Ops, net: Net, k: Chunk) !void {
+         else
+             .{ try o.project(thn, l.k, k.n, false), try o.project(thn, l.v, k.n, false) };
+         const k32 = try o.arena.of(f32, k.n * kvw);
+-        try o.qkRope(keys, kvw, head, l.k_norm, c.eps, k.n, c.kv_heads, head, head, c.theta, k.pos, k32, null, 0);
++        try o.qkRope(keys, kvw, head, l.k_norm, c.eps, k.n, c.kv_heads, head, head, c.theta, k.pos, k32, null, 0, null);
+         const r = rings(c, k.ring, i);
+         try dops.ringPut(o, k32, values, r[0], r[1], k.n, kvw, k.put, c.ringRows());
+     }
+@@ -137,9 +137,9 @@ pub fn forward(o: Ops, net: Net, l: Layout, dev: u64, streams: usize) !Out {
+             };
+         const q32 = try o.arena.of(f32, B * c.qWidth());
+         const pos = dev + l.pos;
+-        try o.qkRope(q, c.qWidth(), head, w.q_norm, c.eps, B, c.heads, head, head, c.theta, pos, q32, null, 0);
++        try o.qkRope(q, c.qWidth(), head, w.q_norm, c.eps, B, c.heads, head, head, c.theta, pos, q32, null, 0, null);
+         const k32 = try o.arena.of(f32, B * c.kvWidth());
+-        try o.qkRope(k, c.kvWidth(), head, w.k_norm, c.eps, B, c.kv_heads, head, head, c.theta, pos, k32, null, 0);
++        try o.qkRope(k, c.kvWidth(), head, w.k_norm, c.eps, B, c.kv_heads, head, head, c.theta, pos, k32, null, 0, null);
+         const att = try fwd.take(o, net.act, B * c.qWidth());
+         const parts = dops.Partials.at(try o.arena.take(dops.Partials.bytes(B, c.heads)), B, c.heads);
+         var shape = at;
+diff --git a/zig/src/families/qwen3_5/backend/hip/engine/engine.zig b/zig/src/families/qwen3_5/backend/hip/engine/engine.zig
+index 99b3153..5776446 100644
+--- a/zig/src/families/qwen3_5/backend/hip/engine/engine.zig
++++ b/zig/src/families/qwen3_5/backend/hip/engine/engine.zig
+@@ -221,6 +221,8 @@ pub const Engine = struct {
+         if (group != null) e.bridge.model.tp = e.comm;
+         // the checkpoint, not --vision, picks the text rotary: a bf16 chat checkpoint always takes Torch's
+         const torch_text = chat;
++        // the torch M-RoPE op (a bf16 chat checkpoint's text, or any --vision rows) reads no YaRN table
++        if ((torch_text or seen != null) and e.weights.spec.yarn != null) return error.UnsupportedTorchRope;
+         if (torch_text or seen != null) {
+             const s = e.weights.spec;
+             if (e.act != .bf16 or s.head_dim != 256 or s.rotary_dim != 64 or !s.mrope.interleaved or !std.mem.eql(usize, &s.mrope.section, &.{ 11, 11, 10 })) return error.UnsupportedTorchRope;
+@@ -229,6 +231,16 @@ pub const Engine = struct {
+             e.bridge.model.torch_text = torch_text;
+         }
+         errdefer if (e.rope) |*k| k.deinit();
++        if (e.weights.spec.mhc != null) {
++            // the mHC kernels' streams and router state read bf16, as the checkpoint's activations are
++            if (e.act != .bf16) return error.UnsupportedMhcActivation;
++            const env = @import("sys").environment;
++            e.bridge.model.mhc_carry = try env.read(bool, "TF_Q35_MHC_CARRY", false);
++            if (try env.read(bool, "TF_Q35_DEBUG", false)) {
++                const s = e.weights.spec;
++                std.debug.print("q35 hip debug: steps {d}, layers {d}, deltas {d}, attentions {d}, mhc {any}\n", .{ loop.steps(s), s.n_layers, loop.steps(s) - loop.attentions(s), loop.attentions(s), s.mhc });
++            }
++        }
+         if (seen) |limits| e.vision = try vision.Vision.open(gpa, io, &e.driver, e.stream, &e.lib, dir, e.weights.spec.hidden, limits);
+         errdefer if (e.vision) |v| v.deinit();
+         _ = try steps.done(.{ 0, 0 }, .first);
+diff --git a/zig/src/families/qwen3_5/backend/hip/engine/native.zig b/zig/src/families/qwen3_5/backend/hip/engine/native.zig
+index 9b3467c..a825dcc 100644
+--- a/zig/src/families/qwen3_5/backend/hip/engine/native.zig
++++ b/zig/src/families/qwen3_5/backend/hip/engine/native.zig
+@@ -26,11 +26,13 @@ const mlx_formats = blk: {
+     break :blk &done;
+ };
+ 
+-/// The dense and the sparse checkpoints are two registry entries over one engine.
+-pub fn Native(comptime type_name: []const u8) type {
++/// The dense, the sparse and the looped checkpoints are registry entries over one engine.
++pub fn Native(comptime type_name: []const u8, comptime family_share: ?f64) type {
+     return struct {
+         pub const model_type = type_name;
+         pub const formats = mlx_formats;
++        /// The reply's share beside a filling prompt, when no flag or env names one; null: the engine's default.
++        pub const decode_share: ?f64 = family_share;
+         /// BF16 serves decisions only, with a joint schema head (joint_head_config.json); chat refuses it.
+         pub const decision_formats: []const []const u8 = &.{"bf16"};
+         /// Positions a stream holds when neither --context nor the checkpoint's config names a window.
+@@ -190,6 +192,12 @@ fn prepare(
+                 "patches, 2x2 merge): serve it without --vision for text",
+             .{},
+         ),
++        error.UnsupportedMhcActivation => steps.refuseAll(
++            a,
++            problem,
++            "this checkpoint's mHC streams read bf16 activations; this device serves another kind",
++            .{},
++        ),
+         error.UnsupportedTorchRope => steps.refuseAll(
+             a,
+             problem,
+@@ -424,8 +432,8 @@ test "a bf16 checkpoint without a joint head is refused as decision-only, an MLX
+     const tp = oneRank(a, io, dir, .{ .window = 64, .streams = 1, .world = 2 }).?;
+     try std.testing.expectEqualStrings("the joint schema head serves on one rank; drop --tp", tp);
+     inline for (.{ "qwen3_5", "qwen3_5_moe" }) |kind| { // a headed checkpoint loads: BF16 offered for decisions only
+-        for (Native(kind).formats) |format| try std.testing.expect(!std.mem.eql(u8, format, "bf16"));
+-        try std.testing.expectEqualStrings("bf16", Native(kind).decision_formats[0]);
++        for (Native(kind, null).formats) |format| try std.testing.expect(!std.mem.eql(u8, format, "bf16"));
++        try std.testing.expectEqualStrings("bf16", Native(kind, null).decision_formats[0]);
+     }
+     const mlx = try std.mem.replaceOwned(u8, a, text, "\"tie_word_embeddings\": false,", "\"tie_word_embeddings\": false, \"quantization\": {\"group_size\": 64, \"bits\": 4, \"mode\": \"affine\"},");
+     try tmp.dir.writeFile(io, .{ .sub_path = "config.json", .data = mlx });
+@@ -466,7 +474,7 @@ test "capability audit: HIP Qwen format names cover the admitted affine widths"
+         \\ "linear_value_head_dim":128,"linear_conv_kernel_dim":4,"vocab_size":248320,
+         \\ "full_attention_interval":4,"eos_token_id":248044}
+     ;
+-    inline for (.{ Native("qwen3_5"), Native("qwen3_5_moe") }) |F| {
++    inline for (.{ Native("qwen3_5", null), Native("qwen3_5_moe", null) }) |F| {
+         for ([_]u8{ 2, 3, 4, 5, 6, 8 }) |bits| for ([_]u16{ 32, 64, 128 }) |g| {
+             var doc = try std.json.parseFromSliceLeaky(std.json.Value, a, text, .{});
+             try doc.object.put(a, "model_type", .{ .string = F.model_type });
+diff --git a/zig/src/families/qwen3_5/backend/hip/forward/forward.zig b/zig/src/families/qwen3_5/backend/hip/forward/forward.zig
+index 14bdd6c..1d747a4 100644
+--- a/zig/src/families/qwen3_5/backend/hip/forward/forward.zig
++++ b/zig/src/families/qwen3_5/backend/hip/forward/forward.zig
+@@ -4,6 +4,8 @@ const std = @import("std");
+ const hip = @import("hip");
+ const view = @import("../model/view.zig");
+ const state = @import("state.zig");
++const loop = @import("../../../loop_plan.zig");
++const mhc_mod = @import("../mhc.zig");
+ const moe = hip.moe;
+ const reduce = hip.reduce;
+ 
+@@ -43,6 +45,7 @@ pub fn span(ops: Ops, m: *const view.Model, caches: *state.Caches, ids: u64, len
+     var o = ops;
+     o.prefill = true;
+     const s = m.spec;
++    const window = s.mhc;
+     const x = try take(o, m.act, len * s.hidden);
+     var start: usize = 0;
+     while (start < len) : (start += SPAN) {
+@@ -54,7 +57,14 @@ pub fn span(ops: Ops, m: *const view.Model, caches: *state.Caches, ids: u64, len
+             try o.copyCols(.{ .ptr = clip.features, .kind = .bf16 }, s.hidden, 0, x.ptr + clip.first * s.hidden * 2, clip.rows, s.hidden);
+         };
+     }
+-    for (m.layers, 0..) |layer, index| {
++    // the mHC streams span the whole prompt: a chunk's rows keep their planes between the window's executions
++    const streams: ?mhc_mod.Streams = if (window != null) try mhc_mod.take(o, m, len) else null;
++    for (0..loop.steps(s)) |i| {
++        const ph = loop.physical(s, i);
++        const layer = m.layers[ph];
++        const hc = if (window) |w| w.holds(ph) else false;
++        const prev_hc = i > 0 and (if (window) |w| w.holds(loop.physical(s, i - 1)) else false);
++        const next: usize = if (i + 1 < loop.steps(s)) loop.physical(s, i + 1) else s.n_layers;
+         start = 0;
+         while (start < len) : (start += SPAN) {
+             const rows = @min(SPAN, len - start);
+@@ -65,18 +75,51 @@ pub fn span(ops: Ops, m: *const view.Model, caches: *state.Caches, ids: u64, len
+                 .full => |f| .{ f.input_norm, f.post_norm, f.mlp },
+                 .linear => |l| .{ l.input_norm, l.post_norm, l.mlp },
+             };
++            // the chunk's own view of the streams, at its rows
++            const chunk: ?mhc_mod.Streams = if (streams) |st| .{
++                .hs = at(st.hs, start * window.?.streams * s.hidden),
++                .state = st.state + 4 * start * window.?.outputs(),
++            } else null;
+             const normed = try take(o, m.act, rows * s.hidden);
+-            try o.rms(xs, input_norm, normed, rows, s.hidden, @floatCast(s.eps));
++            if (hc) {
++                // the streams enter at the window's first execution, and hold this chunk's residual across it
++                if (!prev_hc) try mhc_mod.enter(o, m, &chunk.?, rows, xs);
++                const branch = try take(o, m.act, rows * s.hidden);
++                const routers = switch (layer) {
++                    .full => |f| f.mhc.?,
++                    .linear => |l| l.mhc.?,
++                };
++                try mhc_mod.branch(o, m, &chunk.?, routers.attn, routers.attn_b, rows, branch);
++                try o.rms(branch, input_norm, normed, rows, s.hidden, @floatCast(s.eps));
++            } else {
++                try o.rms(xs, input_norm, normed, rows, s.hidden, @floatCast(s.eps));
++            }
+             const y = switch (layer) {
+-                .full => |f| try attention(o, m, f, caches, index, normed, rows, pos0 + start),
+-                .linear => |l| try linear(o, m, l, caches, index, normed, rows),
++                .full => |f| try attention(o, m, f, caches, i, normed, rows, pos0 + start),
++                .linear => |l| try linear(o, m, l, caches, i, normed, rows),
+             };
+-            try reduce.residualNorm(o, m.tp, xs, y, post_norm, normed, rows, s.hidden, @floatCast(s.eps));
++            if (hc) {
++                try mhc_mod.merge(o, m, &chunk.?, y, rows);
++                const branch = try take(o, m.act, rows * s.hidden);
++                const routers = switch (layer) {
++                    .full => |f| f.mhc.?,
++                    .linear => |l| l.mhc.?,
++                };
++                try mhc_mod.branch(o, m, &chunk.?, routers.ffn, routers.ffn_b, rows, branch);
++                try o.rms(branch, post_norm, normed, rows, s.hidden, @floatCast(s.eps));
++            } else {
++                try reduce.residualNorm(o, m.tp, xs, y, post_norm, normed, rows, s.hidden, @floatCast(s.eps));
++            }
+             const z = try mlpRows(o, m, mlp, normed, rows, true);
+-            try residual(o, m, xs, z, rows * s.hidden);
+-            if (m.taps.of(index)) |ti| if (caches.tap) |ring| try hip.plan_ops.tapRows(o, xs, ring.base(), rows, s.hidden, ti, m.taps.n, m.taps.rows, pos0 + start);
++            if (hc) {
++                try mhc_mod.merge(o, m, &chunk.?, z, rows);
++                if (mhc_mod.leaves(window.?, ph, next, m.mhc_carry)) try mhc_mod.leave(o, m, &chunk.?, rows, xs);
++            } else {
++                try residual(o, m, xs, z, rows * s.hidden);
++            }
++            if (m.taps.of(ph)) |ti| if (caches.tap) |ring| try hip.plan_ops.tapRows(o, xs, ring.base(), rows, s.hidden, ti, m.taps.n, m.taps.rows, pos0 + start);
+         }
+-        if (trace) |t| t.layer(t.ctx, index, x, len) catch |err| return if (err == error.Cancelled) error.Cancelled else error.HipFailed;
++        if (trace) |t| t.layer(t.ctx, i, x, len) catch |err| return if (err == error.Cancelled) error.Cancelled else error.HipFailed;
+     }
+     const out = try take(o, m.act, len * s.hidden);
+     try o.rms(x, m.final_norm, out, len, s.hidden, @floatCast(s.eps));
+@@ -110,7 +153,7 @@ fn attention(o: Ops, m: *const view.Model, f: view.Full, caches: *state.Caches,
+     const stream: hip.Stream = .{ .r = o.l.r, .handle = o.stream };
+     // q rounded to the activation dtype by apply_rope, then widened for the kernel: (heads, rows, d) fp32
+     if (!torch) {
+-        try o.ropePrefill(qn, .{ .ptr = q32, .kind = .f32 }, rows * hd, hd, rows, s.heads, hd, s.rotary_dim, pos, theta);
++        try o.ropePrefill(qn, .{ .ptr = q32, .kind = .f32 }, rows * hd, hd, rows, s.heads, hd, s.rotary_dim, pos, theta, if (m.yarn != 0) m.yarn else null);
+     } else if (o.stream != hip.counting) {
+         m.rope.?.textRope(stream, qn, .{ .ptr = q32, .kind = .f32 }, rows * hd, hd, rows, s.heads, hd, s.rotary_dim, positions, theta) catch return error.HipFailed;
+     }
+@@ -118,7 +161,7 @@ fn attention(o: Ops, m: *const view.Model, f: view.Full, caches: *state.Caches,
+     // k rotated and rounded to the activation dtype as (kv_heads, rows, d), then with v into the pages from slot pos
+     const kr = try take(o, m.act, rows * s.kv_heads * hd);
+     if (!torch) {
+-        try o.ropePrefill(kn, kr, rows * hd, hd, rows, s.kv_heads, hd, s.rotary_dim, pos, theta);
++        try o.ropePrefill(kn, kr, rows * hd, hd, rows, s.kv_heads, hd, s.rotary_dim, pos, theta, if (m.yarn != 0) m.yarn else null);
+     } else if (o.stream != hip.counting) {
+         m.rope.?.textRope(stream, kn, kr, rows * hd, hd, rows, s.kv_heads, hd, s.rotary_dim, positions, theta) catch return error.HipFailed;
+     }
+diff --git a/zig/src/families/qwen3_5/backend/hip/forward/window.zig b/zig/src/families/qwen3_5/backend/hip/forward/window.zig
+index 65e2477..c530c4f 100644
+--- a/zig/src/families/qwen3_5/backend/hip/forward/window.zig
++++ b/zig/src/families/qwen3_5/backend/hip/forward/window.zig
+@@ -4,6 +4,7 @@ const std = @import("std");
+ const hip = @import("hip");
+ const view = @import("../model/view.zig");
+ const loop = @import("../../../loop_plan.zig");
++const mhc_mod = @import("../mhc.zig");
+ const fwd = @import("forward.zig");
+ const moe = hip.moe;
+ 
+@@ -37,41 +38,90 @@ pub fn forward(ops: Ops, m: *const view.Model, r: Round, trace: ?fwd.Trace) fwd.
+     var o = ops;
+     o.window = true;
+     const s = m.spec;
++    const steps = loop.steps(s);
++    const window = s.mhc;
+     const total = r.plan.rows;
+     const x = try fwd.take(o, m.act, total * s.hidden);
+     try o.embedRows(m.embed, r.tokens, total, x);
+     const normed = try fwd.take(o, m.act, total * s.hidden);
+     const out = try fwd.take(o, m.act, total * s.hidden);
+     const eps: f32 = @floatCast(s.eps);
+-    try o.rms(x, inputNorm(m.layers[0]), normed, total, s.hidden, eps);
+-    for (m.layers, 0..) |layer, index| {
++    // inside the mHC window the streams hold the residual; x only carries it between the window's visits
++    var streams: ?mhc_mod.Streams = if (window != null) try mhc_mod.take(o, m, total) else null;
++    var entered = false;
++    if (window == null or !window.?.holds(loop.physical(s, 0))) try o.rms(x, inputNorm(m.layers[loop.physical(s, 0)]), normed, total, s.hidden, eps);
++    for (0..steps) |i| {
+         const mark = o.arena.mark();
+         defer o.arena.release(mark);
+-        const post_norm, const mlp = switch (layer) {
+-            .full => |f| .{ f.post_norm, f.mlp },
+-            .linear => |l| .{ l.post_norm, l.mlp },
++        const ph = loop.physical(s, i);
++        const layer = m.layers[ph];
++        const hc = if (window) |w| w.holds(ph) else false;
++        const prev_hc = i > 0 and (if (window) |w| w.holds(loop.physical(s, i - 1)) else false);
++        const input_norm, const post_norm, const mlp = switch (layer) {
++            .full => |f| .{ f.input_norm, f.post_norm, f.mlp },
++            .linear => |l| .{ l.input_norm, l.post_norm, l.mlp },
+         };
++        // the sublayer's input: a branch of the streams inside the window, x's folded rows outside it
++        if (hc) {
++            if (!entered) {
++                try mhc_mod.enter(o, m, &streams.?, total, x);
++                entered = true;
++            }
++            const branch = try fwd.take(o, m.act, total * s.hidden);
++            const routers = switch (layer) {
++                .full => |f| f.mhc.?,
++                .linear => |l| l.mhc.?,
++            };
++            try mhc_mod.branch(o, m, &streams.?, routers.attn, routers.attn_b, total, branch);
++            try o.rms(branch, input_norm, normed, total, s.hidden, eps);
++        } else if (prev_hc) {
++            // the window's collapse left x raw: this execution folds and norms its own input
++            try o.rms(x, input_norm, normed, total, s.hidden, eps);
++        }
+         const y = switch (layer) {
+-            .full => |f| try attentionRows(o, m, f, r, index, normed),
+-            .linear => |l| try linearRows(o, m, l, r, index, normed),
++            .full => |f| try attentionRows(o, m, f, r, i, normed),
++            .linear => |l| try linearRows(o, m, l, r, i, normed),
+         };
+         // the launches of a layer's two tails merge when the rows stay on this rank and every slot is in `y`
+         const stacked = switch (mlp) {
+             .moe => |rt| rt.experts.shared == null,
+             .dense => true,
+         };
+-        const merge = o.fused() and y.kind == m.act and stacked;
+-        const last = index + 1 == m.layers.len;
+-        const next_norm = if (last) m.final_norm else inputNorm(m.layers[index + 1]);
++        const fused = o.fused() and y.kind == m.act and stacked;
++        const last = i + 1 == steps;
++        const next_hc = if (!last) (if (window) |w| w.holds(loop.physical(s, i + 1)) else false) else false;
++        const next_norm = if (last) m.final_norm else inputNorm(m.layers[loop.physical(s, i + 1)]);
+         const dest = if (last) out else normed;
+-        if (merge) {
++        if (hc) {
++            try mhc_mod.merge(o, m, &streams.?, y, total);
++            const branch = try fwd.take(o, m.act, total * s.hidden);
++            const routers = switch (layer) {
++                .full => |f| f.mhc.?,
++                .linear => |l| l.mhc.?,
++            };
++            try mhc_mod.branch(o, m, &streams.?, routers.ffn, routers.ffn_b, total, branch);
++            try o.rms(branch, post_norm, normed, total, s.hidden, eps);
++        } else if (fused) {
+             try o.addRms(x, y, post_norm, normed, total, s.hidden, eps);
+         } else {
+             try fwd.residual(o, m, x, y, total * s.hidden);
+             try o.rms(x, post_norm, normed, total, s.hidden, eps);
+         }
+-        switch (mlp) {
+-            .moe => |rt| if (merge and rt.remap == 0) {
++        // the MLP's rows run on the streams' second branch inside the window, or fold into x outside it
++        if (hc) {
++            const z = try fwd.mlpRows(o, m, mlp, normed, total, true);
++            try mhc_mod.merge(o, m, &streams.?, z, total);
++            const next: usize = if (last) s.n_layers else loop.physical(s, i + 1);
++            if (mhc_mod.leaves(window.?, ph, next, m.mhc_carry)) {
++                try mhc_mod.leave(o, m, &streams.?, total, x);
++                entered = false;
++            }
++        } else if (next_hc) {
++            // the next execution enters the window: its branch carries its own norm, so x stays the raw residual
++            const z = try fwd.mlpRows(o, m, mlp, normed, total, true);
++            try fwd.residual(o, m, x, z, total * s.hidden);
++        } else switch (mlp) {
++            .moe => |rt| if (fused and rt.remap == 0) {
+                 const parts = try moe.parts(o, m.act, rt, normed, total);
+                 try o.moeTail(x, parts.y, parts.wts, next_norm, dest, total, parts.slots, s.hidden, eps);
+             } else {
+@@ -81,7 +131,7 @@ pub fn forward(ops: Ops, m: *const view.Model, r: Round, trace: ?fwd.Trace) fwd.
+             },
+             .dense => {
+                 const z = try fwd.mlpRows(o, m, mlp, normed, total, true);
+-                if (merge and z.kind == m.act) {
++                if (fused and z.kind == m.act) {
+                     try o.addRms(x, z, next_norm, dest, total, s.hidden, eps);
+                 } else {
+                     try fwd.residual(o, m, x, z, total * s.hidden);
+@@ -89,9 +139,11 @@ pub fn forward(ops: Ops, m: *const view.Model, r: Round, trace: ?fwd.Trace) fwd.
+                 }
+             },
+         }
+-        if (m.taps.of(index)) |ti| try pops.tap(o, x, r.plan, s.hidden, ti, m.taps.n, m.taps.rows);
+-        if (trace) |t| t.layer(t.ctx, index, x, total) catch return error.HipFailed;
++        if (m.taps.of(ph)) |ti| try pops.tap(o, x, r.plan, s.hidden, ti, m.taps.n, m.taps.rows);
++        if (trace) |t| t.layer(t.ctx, i, x, total) catch return error.HipFailed;
+     }
++    // a window that runs to the model's end collapsed into x: the final norm runs here
++    if (window != null and window.?.holds(loop.physical(s, steps - 1))) try o.rms(x, m.final_norm, out, total, s.hidden, eps);
+     return out;
+ }
+ 
+@@ -147,8 +199,9 @@ fn attentionRows(o: Ops, m: *const view.Model, f: view.Full, r: Round, index: us
+     } else {
+         // an image lane's later rows sit at its M-RoPE shift; with all three axes equal that is 1-D RoPE
+         const pos = if (r.rotary != 0) r.rotary else r.plan.args.pos;
+-        try o.qkRope(qg, s.heads * 2 * hd, 2 * hd, f.q_norm, eps, total, s.heads, hd, s.rotary_dim, theta, pos, q32, null, 0);
+-        try o.qkRope(keys, s.kv_heads * hd, hd, f.k_norm, eps, total, s.kv_heads, hd, s.rotary_dim, theta, pos, k32, null, 0);
++        const yarn: ?u64 = if (m.yarn != 0) m.yarn else null;
++        try o.qkRope(qg, s.heads * 2 * hd, 2 * hd, f.q_norm, eps, total, s.heads, hd, s.rotary_dim, theta, pos, q32, null, 0, yarn);
++        try o.qkRope(keys, s.kv_heads * hd, hd, f.k_norm, eps, total, s.kv_heads, hd, s.rotary_dim, theta, pos, k32, null, 0, yarn);
+     }
+     try pops.kvWrite(o, k32, values, r.plan, index, s.kv_heads, hd);
+     const att = try o.arena.of(f32, q_rows * hd);
+diff --git a/zig/src/families/qwen3_5/backend/hip/mhc.zig b/zig/src/families/qwen3_5/backend/hip/mhc.zig
+index be0b452..15bbf32 100644
+--- a/zig/src/families/qwen3_5/backend/hip/mhc.zig
++++ b/zig/src/families/qwen3_5/backend/hip/mhc.zig
+@@ -7,7 +7,7 @@ const loop = @import("../../loop_plan.zig");
+ 
+ const Ops = hip.ops.Ops;
+ const Tensor = hip.ops.Tensor;
+-const Error = hip.ops.Error;
++const Error = fwd.Error;
+ 
+ /// A window's streams over `rows` rows: the residual planes, and the router's per-row state.
+ pub const Streams = struct {
+@@ -32,14 +32,14 @@ pub fn enter(o: Ops, m: *const view.Model, st: *const Streams, rows: usize, h: T
+     try o.l.mhcEnter(p(h.ptr), null, pm(st.hs.ptr), @intCast(rows), @intCast(mh.streams), @intCast(s.hidden), o.stream);
+ }
+ 
+-/// A sublayer's branch out of the streams: its routers' weights and biases name the site (attn or ffn).
+-pub fn branch(o: Ops, m: *const view.Model, st: *const Streams, routers: view.Mhc, rows: usize, out: Tensor) Error!void {
++/// A sublayer's branch out of the streams: `w` and `b` are the site's router (mhc_attn or mhc_ffn).
++pub fn branch(o: Ops, m: *const view.Model, st: *const Streams, w: u64, b: u64, rows: usize, out: Tensor) Error!void {
+     const s = m.spec;
+     const mh = s.mhc orelse return error.BadShape;
+     try o.l.mhcBranch(
+         p(st.hs.ptr),
+-        p(routers.attn),
+-        p(routers.attn_b),
++        p(w),
++        p(b),
+         pm(out.ptr),
+         pm(st.state),
+         @intCast(rows),
+diff --git a/zig/src/families/qwen3_5/backend/hip/model/bridge.zig b/zig/src/families/qwen3_5/backend/hip/model/bridge.zig
+index 5beb4c4..a0b9ad2 100644
+--- a/zig/src/families/qwen3_5/backend/hip/model/bridge.zig
++++ b/zig/src/families/qwen3_5/backend/hip/model/bridge.zig
+@@ -51,6 +51,8 @@ pub const Bridge = struct {
+     layers: []view.Layer,
+     q_weight: hip.DeviceBuffer,
+     k_weight: hip.DeviceBuffer,
++    /// The YaRN table of a checkpoint whose config declares one; owned here, read as view.Model.yarn.
++    yarn: ?hip.DeviceBuffer = null,
+     model: view.Model,
+ 
+     /// The view of `m` for activations of `act` (fp16 on RDNA2, bf16 on gfx11 / gfx12).
+@@ -73,6 +75,10 @@ pub const Bridge = struct {
+         errdefer b.q_weight.free();
+         @memset(qs, c.k);
+         b.k_weight = try hip.DeviceBuffer.fromHost(d, std.mem.sliceAsBytes(qs));
++        errdefer if (b.yarn) |*t| t.free();
++        if (s.yarn) |y| {
++            b.yarn = try hip.DeviceBuffer.fromHost(d, std.mem.sliceAsBytes(&y.table));
++        }
+         b.model = .{
+             .spec = s,
+             .act = act,
+@@ -81,6 +87,7 @@ pub const Bridge = struct {
+             .final_norm = m.final_norm.ptr,
+             .head = try projection(m.outputHead()),
+             .qk = .{ .q_weight = b.q_weight.base(), .k_weight = b.k_weight.base(), .eps = c.eps },
++            .yarn = if (b.yarn) |t| t.base() else 0,
+         };
+         return b;
+     }
+@@ -88,6 +95,7 @@ pub const Bridge = struct {
+     pub fn deinit(b: *Bridge) void {
+         b.q_weight.free();
+         b.k_weight.free();
++        if (b.yarn) |*t| t.free();
+         b.gpa.free(b.layers);
+         b.gpa.destroy(b);
+     }
+diff --git a/zig/src/families/qwen3_5/backend/hip/model/view.zig b/zig/src/families/qwen3_5/backend/hip/model/view.zig
+index c389dad..14c9bba 100644
+--- a/zig/src/families/qwen3_5/backend/hip/model/view.zig
++++ b/zig/src/families/qwen3_5/backend/hip/model/view.zig
+@@ -101,6 +101,10 @@ pub const Model = struct {
+     torch_text: bool = false,
+     /// [p, p, p] for each position: a text-only prompt's rows under `torch_text`.
+     positions: u64 = 0,
++    /// The static YaRN table (the attention factor, then 32 frequencies) the rope kernels read; 0: plain rope.
++    yarn: u64 = 0,
++    /// The mHC streams carry across the loop seam (TF_Q35_MHC_CARRY, an A/B against the reference collapse).
++    mhc_carry: bool = false,
+     frame: ?ImageFrame = null,
+     /// What this rank sees: under tp its heads and value heads.
+     spec: Spec,
+diff --git a/zig/src/families/qwen3_5/hip.zig b/zig/src/families/qwen3_5/hip.zig
+index e3d6b06..729524f 100644
+--- a/zig/src/families/qwen3_5/hip.zig
++++ b/zig/src/families/qwen3_5/hip.zig
+@@ -37,8 +37,10 @@ pub const draft = @import("backend/hip/draft/draft.zig");
+ /// The tokenizer, for the drafter check's prompts.
+ pub const tokenizer = @import("core").tokenizer;
+ /// The registry entries of the native server: the dense and the sparse checkpoints.
+-pub const native = native_engine.Native("qwen3_5");
+-pub const native_moe = native_engine.Native("qwen3_5_moe");
++pub const native = native_engine.Native("qwen3_5", null);
++pub const native_moe = native_engine.Native("qwen3_5_moe", null);
++/// SenseNova-Loop: the looped Qwen3.5 tower, its shared-weight passes and its manifold-constrained streams.
++pub const native_loop = native_engine.Native("sensenova_loop", 0.5);
+ 
+ test {
+     _ = config;
+diff --git a/zig/src/families/qwen3_5/rope.zig b/zig/src/families/qwen3_5/rope.zig
+index a5ee744..1b021c8 100644
+--- a/zig/src/families/qwen3_5/rope.zig
++++ b/zig/src/families/qwen3_5/rope.zig
+@@ -32,6 +32,8 @@ pub fn resolve(spec: *config.Spec, tower: std.json.ObjectMap, rope: std.json.Obj
+     if (from.map.get("truncate")) |v| if (v != .null and !(v == .bool and v.bool)) return error.InvalidRotary;
+     const factor = try number(from.map.get("factor") orelse return error.InvalidRotary);
+     if (!std.math.isFinite(factor) or !(factor > 1)) return error.InvalidRotary;
++    // the shared table holds 32 frequencies of a 64-wide rotary (core/rope_yarn.zig), as the Qwen checkpoints rotate
++    if (spec.rotary_dim != 64) return error.InvalidRotary;
+     const trained = try positive(from.map, "original_max_position_embeddings");
+     const ceiling = try checks.maxPosition(tower);
+     if (@as(f64, @floatFromInt(trained)) * factor != @as(f64, @floatFromInt(ceiling))) return error.InvalidRotary;
+diff --git a/zig/src/hip/launches.zig b/zig/src/hip/launches.zig
+index bcede9f..93f055d 100644
+--- a/zig/src/hip/launches.zig
++++ b/zig/src/hip/launches.zig
+@@ -175,6 +175,9 @@ pub const Launcher = struct {
+         router_small: [2]Function,
+         rms_rows: Function,
+         qk_rope: Function,
++        /// qk_rope and rope_prefill over a YaRN table (the qwen3_5 looped checkpoints' scaled rope).
++        qk_yarn_rope: Function,
++        yarn_prefill: Function,
+         add_wide: Function,
+         moe_localize: Function,
+         moe_foreign_items: Function,
+@@ -270,6 +273,8 @@ pub const Launcher = struct {
+             .router_small = .{ try ops.function("tf_router_small_f16"), try ops.function("tf_router_small_bf16") },
+             .rms_rows = try ops.function("tf_rms_rows"),
+             .qk_rope = try ops.function("tf_qk_rope"),
++            .qk_yarn_rope = try ops.function("tf_qk_yarn_rope"),
++            .yarn_prefill = try ops.function("tf_yarn_prefill"),
+             .add_wide = try ops.function("tf_add_wide"),
+             .moe_localize = try ops.function("tf_moe_localize"),
+             .moe_foreign_items = try ops.function("tf_moe_foreign_items"),
+@@ -406,6 +411,8 @@ pub const Launcher = struct {
+     pub const pagesWrite = plan.pagesWrite;
+     pub const pagesGather = plan.pagesGather;
+     pub const planGather = plan.planGather;
++    pub const tf_yarn_prefill = rope.tf_yarn_prefill;
++    pub const tf_qk_yarn_rope = rope.tf_qk_yarn_rope;
+     pub const mhcBranch = mhc.mhcBranch;
+     pub const mhcMerge = mhc.mhcMerge;
+     pub const mhcEnter = mhc.mhcEnter;
+diff --git a/zig/src/hip/launches/rope.zig b/zig/src/hip/launches/rope.zig
+index 69ec48c..dc13d78 100644
+--- a/zig/src/hip/launches/rope.zig
++++ b/zig/src/hip/launches/rope.zig
+@@ -66,3 +66,43 @@ pub fn tf_rope_prefill(l: *const Launcher, x: C, kind: c_int, out: P, out_kind:
+     try a.add(theta);
+     try l.flat(l.op.rope_prefill, @as(i64, len) * heads * d, s, &a);
+ }
++
++/// The same prefill over a YaRN table: its first word the attention factor, its words the 32 frequencies.
++pub fn tf_yarn_prefill(l: *const Launcher, x: C, kind: c_int, out: P, out_kind: c_int, s_head: c_longlong, s_row: c_longlong, len: c_int, heads: c_int, d: c_int, rotary: c_int, pos0: c_int, yarn: C, s: S) Error!void {
++    var a: Args = .{};
++    try a.add(ad(x));
++    try a.add(kind);
++    try a.add(ad(out));
++    try a.add(out_kind);
++    try a.add(s_head);
++    try a.add(s_row);
++    try a.add(len);
++    try a.add(heads);
++    try a.add(d);
++    try a.add(rotary);
++    try a.add(pos0);
++    try a.add(ad(yarn));
++    try l.flat(l.op.yarn_prefill, @as(i64, len) * heads * d, s, &a);
++}
++
++/// The window's fused q / k norm and rotation over a YaRN table, a wave a (row, head), 8 a block.
++pub fn tf_qk_yarn_rope(l: *const Launcher, src: C, kind: c_int, s_row: c_longlong, s_head: c_int, weight: CF, eps: f32, rows: c_int, heads: c_int, width: c_int, rotary: c_int, yarn: C, pos: CI, wide: F, cache: P, total: c_int, s: S) Error!void {
++    if (width > 512) return invalid("qk_yarn_rope");
++    var a: Args = .{};
++    try a.add(ad(src));
++    try a.add(kind);
++    try a.add(s_row);
++    try a.add(s_head);
++    try a.add(ad(weight));
++    try a.add(eps);
++    try a.add(rows);
++    try a.add(heads);
++    try a.add(width);
++    try a.add(rotary);
++    try a.add(ad(yarn));
++    try a.add(ad(pos));
++    try a.add(ad(wide));
++    try a.add(ad(cache));
++    try a.add(total);
++    try l.go(l.op.qk_yarn_rope, dim(cdiv(@as(i64, rows) * heads, 8), 1, 1), dim(256, 1, 1), 0, s, &a);
++}
+diff --git a/zig/src/hip/ops/attention.zig b/zig/src/hip/ops/attention.zig
+index 132e2d2..93a7f3f 100644
+--- a/zig/src/hip/ops/attention.zig
++++ b/zig/src/hip/ops/attention.zig
+@@ -19,15 +19,23 @@ pub fn headsRows(o: Ops, att: u64, out: Tensor, len: usize, heads: usize, d: usi
+     try o.l.tf_heads_rows(f(att), p(out.ptr), @backingInt(out.kind), int(len), int(heads), int(d), o.stream);
+ }
+ 
+-/// Prefill RoPE of x (len, heads, d), rounded to x's kind, stored as `out` kind at out[h * s_head + r * s_row + j].
+-pub fn ropePrefill(o: Ops, x: Tensor, out: Tensor, s_head: usize, s_row: usize, len: usize, heads: usize, d: usize, rotary: usize, pos0: usize, theta: f32) Error!void {
+-    try o.l.tf_rope_prefill(p(x.ptr), @backingInt(x.kind), p(out.ptr), @backingInt(out.kind), @intCast(s_head), @intCast(s_row), int(len), int(heads), int(d), int(rotary), int(pos0), theta, o.stream);
++/// Prefill RoPE of x (len, heads, d) at `yarn`'s static YaRN table, or plain rope when it is null.
++pub fn ropePrefill(o: Ops, x: Tensor, out: Tensor, s_head: usize, s_row: usize, len: usize, heads: usize, d: usize, rotary: usize, pos0: usize, theta: f32, yarn: ?u64) Error!void {
++    if (yarn) |table| {
++        try o.l.tf_yarn_prefill(p(x.ptr), @backingInt(x.kind), p(out.ptr), @backingInt(out.kind), @intCast(s_head), @intCast(s_row), int(len), int(heads), int(d), int(rotary), int(pos0), @ptrFromInt(table), o.stream);
++    } else {
++        try o.l.tf_rope_prefill(p(x.ptr), @backingInt(x.kind), p(out.ptr), @backingInt(out.kind), @intCast(s_head), @intCast(s_row), int(len), int(heads), int(d), int(rotary), int(pos0), theta, o.stream);
++    }
+ }
+ 
+-/// A window's q or k heads RMS-normed with `weight`, rotated at `pos`, rounded; into fp32 `wide` and/or cache slots.
+-pub fn qkRope(o: Ops, src: Tensor, s_row: usize, s_head: usize, weight: u64, eps: f32, rows: usize, heads: usize, width: usize, rotary: usize, theta: f32, pos: u64, wide: ?u64, cache: ?u64, total: usize) Error!void {
++/// A window's q or k heads RMS-normed and rotated at `pos`, at `yarn`'s table or plain rope when it is null.
++pub fn qkRope(o: Ops, src: Tensor, s_row: usize, s_head: usize, weight: u64, eps: f32, rows: usize, heads: usize, width: usize, rotary: usize, theta: f32, pos: u64, wide: ?u64, cache: ?u64, total: usize, yarn: ?u64) Error!void {
+     if (width > 512 or src.kind == .f32) return error.BadShape;
+-    try o.l.tf_qk_rope(p(src.ptr), @backingInt(src.kind), @intCast(s_row), int(s_head), f(weight), eps, int(rows), int(heads), int(width), int(rotary), theta, @ptrFromInt(pos), if (wide) |w| f(w) else null, if (cache) |c| p(c) else null, int(total), o.stream);
++    if (yarn) |table| {
++        try o.l.tf_qk_yarn_rope(p(src.ptr), @backingInt(src.kind), @intCast(s_row), int(s_head), f(weight), eps, int(rows), int(heads), int(width), int(rotary), @ptrFromInt(table), @ptrFromInt(pos), if (wide) |w| f(w) else null, if (cache) |c| p(c) else null, int(total), o.stream);
++    } else {
++        try o.l.tf_qk_rope(p(src.ptr), @backingInt(src.kind), @intCast(s_row), int(s_head), f(weight), eps, int(rows), int(heads), int(width), int(rotary), theta, @ptrFromInt(pos), if (wide) |w| f(w) else null, if (cache) |c| p(c) else null, int(total), o.stream);
++    }
+ }
+ 
+ /// The decode RoPE over fp32 rows; `pos_dev` (int32, one a group of `per` rows) or the host `pos`.
+diff --git a/zig/src/native/hip.zig b/zig/src/native/hip.zig
+index 344a131..b4060bd 100644
+--- a/zig/src/native/hip.zig
++++ b/zig/src/native/hip.zig
+@@ -19,7 +19,7 @@ const admission = hip.admission;
+ const modelContext = admission.modelContext;
+ 
+ /// The HIP families: namespaces with `model_type`, `formats`, `default_context`, `prefill_step`, `open` and `follow`.
+-const registry = .{ qwen35.native, qwen35.native_moe, flashnext.native, nemotron.native, glm_ocr.native, qwen3.native, dots.native, parse, lighton.native };
++const registry = .{ qwen35.native, qwen35.native_moe, qwen35.native_loop, flashnext.native, nemotron.native, glm_ocr.native, qwen3.native, dots.native, parse, lighton.native };
+ 
+ pub const backends: []const []const u8 = &.{"hip"};
+ /// No per-thread alternate signal stack: its thread-local leaves RCCL's and HIP's threads too little stack to start.
+@@ -315,6 +315,7 @@ fn openWith(comptime F: type, a: Allocator, gpa: Allocator, io: std.Io, o: api.O
+         .context_window = @intCast(offer.window orelse r.options.window),
+         .prefill_step = F.prefill_step,
+         .decode_share = o.decode_share,
++        .family_decode_share = if (@hasDecl(F, "decode_share")) F.decode_share else null,
+         .policy = offer.policy orelse h.policy_line,
+         .startup = loaded.startup,
+         .structures = text and loaded.backend.vtable.first_masked != null,
+@@ -403,15 +404,16 @@ test "every registered family is listed for capabilities" {
+     try std.testing.expectEqual(@as(usize, registry.len + 1), families.len);
+     try std.testing.expectEqualStrings("qwen3_5", families[0].model_type);
+     try std.testing.expectEqualStrings("qwen3_5_moe", families[1].model_type);
+-    try std.testing.expectEqualStrings("qwen4_exp", families[2].model_type);
+-    try std.testing.expectEqualStrings("nemotron_h", families[3].model_type);
+-    try std.testing.expectEqualStrings("glm_ocr", families[4].model_type);
+-    try std.testing.expectEqualStrings("qwen3", families[5].model_type);
+-    try std.testing.expectEqualStrings("dots_ocr", families[6].model_type);
+-    try std.testing.expectEqualStrings("nemotron_parse", families[7].model_type);
+-    try std.testing.expect(!families[7].raw_text);
+-    try std.testing.expectEqualStrings("mistral3", families[8].model_type);
+-    try std.testing.expectEqualStrings("lighton_ocr", families[9].model_type);
++    try std.testing.expectEqualStrings("sensenova_loop", families[2].model_type);
++    try std.testing.expectEqualStrings("qwen4_exp", families[3].model_type);
++    try std.testing.expectEqualStrings("nemotron_h", families[4].model_type);
++    try std.testing.expectEqualStrings("glm_ocr", families[5].model_type);
++    try std.testing.expectEqualStrings("qwen3", families[6].model_type);
++    try std.testing.expectEqualStrings("dots_ocr", families[7].model_type);
++    try std.testing.expectEqualStrings("nemotron_parse", families[8].model_type);
++    try std.testing.expect(!families[8].raw_text);
++    try std.testing.expectEqualStrings("mistral3", families[9].model_type);
++    try std.testing.expectEqualStrings("lighton_ocr", families[10].model_type);
+     try std.testing.expect(fam.reads(lighton.native, "lighton_ocr") and !fam.reads(lighton.native, "mistral"));
+     try std.testing.expect(!reasoning(lighton.native)); // LightOnOCR-3 1B replies carry no reasoning block
+     try std.testing.expect(reasoning(qwen35.native)); // the 0.8B and 4B share Qwen3.5, which can reason
+diff --git a/zig/src/platform/environment.zig b/zig/src/platform/environment.zig
+index 438892a..feb1969 100644
+--- a/zig/src/platform/environment.zig
++++ b/zig/src/platform/environment.zig
+@@ -3,7 +3,7 @@ const std = @import("std");
+ const sys = @import("sys.zig");
+ 
+ pub const Error = error{InvalidEnvironment};
+-pub const Scope = enum { common, cuda, metal, xpu, slide, hooks, dsv41, gemma4, drama3, glm, flashnext, nemotron, minimax_m3 };
++pub const Scope = enum { common, cuda, metal, xpu, slide, hooks, dsv41, gemma4, drama3, glm, flashnext, nemotron, minimax_m3, hip };
+ pub const Kind = enum { u32, u64, size, percent, positive, device, segments, mib, bit_width, word, prompt, flag, toggle, real, positive_real, signed_real, range, path };
+ pub const Rule = struct {
+     name: [:0]const u8,
+@@ -73,6 +73,8 @@ pub const rules = [_]Rule{
+     .{ .name = "TF_QWEN27_METAL_KV_PAGES", .scope = .metal, .kind = .flag, .forms = "0 or 1 (1 puts the 27B's keys and values in core-pool pages; unset or blank is 0)" },
+     .{ .name = "TF_QWEN27_JOIN", .scope = .metal, .kind = .flag, .forms = "0 or 1 (1 runs a window's rows in pairs in the 27B's decode tail before M5; unset or blank is 1)" },
+     .{ .name = "TF_QWEN35_METAL_KV_PAGES", .scope = .metal, .kind = .flag, .forms = "0 or 1 (1 puts the streams' keys and values in core-pool pages; unset or blank is 0)" },
++    .{ .name = "TF_Q35_DEBUG", .scope = .hip, .kind = .flag, .forms = "0 or 1 (1 prints a qwen3_5 HIP forward's execution plan, cache slots and mHC settings)" },
++    .{ .name = "TF_Q35_MHC_CARRY", .scope = .hip, .kind = .flag, .forms = "0 or 1 (1 carries the mHC streams across the loop seam, for A/B against the reference collapse)" },
+     .{ .name = "TF_DSV41_SMALL", .scope = .metal, .kind = .flag, .forms = "0 or 1 (1 reads a DeepSeek-V4.1 Metal checkpoint's config at its own small shapes)" },
+     .{ .name = "TF_DSV41_ASSETS", .scope = .metal, .kind = .path, .forms = "a directory path without control characters holding DeepSeek-V4.1's Engram token map" },
+     .{ .name = "TF_DSV41_ENGRAM_DIR", .scope = .metal, .kind = .path, .forms = "a directory path without control characters holding DeepSeek-V4.1's packed Engram tables" },
+@@ -374,6 +376,7 @@ pub fn device(flag: ?u32, raw: ?[]const u8) Error!u32 {
+ 
+ pub const Flags = struct {
+     cuda: bool = false,
++    hip: bool = false,
+     metal: bool = false,
+     xpu: bool = false,
+     slide: bool = false,
+@@ -393,6 +396,7 @@ pub const Flags = struct {
+         return switch (scope) {
+             .common => true,
+             .cuda => f.cuda,
++            .hip => f.hip,
+             .metal => f.metal,
+             .xpu => f.xpu,
+             .slide => f.slide,
+diff --git a/zig/src/server/engines.zig b/zig/src/server/engines.zig
+index dca0781..9e48aa7 100644
+--- a/zig/src/server/engines.zig
++++ b/zig/src/server/engines.zig
+@@ -16,6 +16,7 @@ pub fn environment(a: Allocator, args: cli.Args) !?[]const u8 {
+     var flags: settings.Flags = .{ .slide = args.slide, .device = args.device, .segments = args.segments, .hooks = @import("build_options").slide_test_hooks };
+     for (native.backends) |backend| {
+         if (std.mem.eql(u8, backend, "cuda")) flags.cuda = true;
++        if (std.mem.eql(u8, backend, "hip")) flags.hip = true;
+         if (std.mem.eql(u8, backend, "metal")) flags.metal = true;
+         if (std.mem.eql(u8, backend, "xpu")) flags.xpu = true;
+     }
+-- 
+2.56.0
+

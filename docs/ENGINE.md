@@ -9,12 +9,14 @@ patch series applied in order. The pin, the series length and the resulting tree
 | `config/cuda-v6/` (validated, not yet served) | same | `patches/cuda/` `0001`-`0027` | `9bac6ecbdef1c03861d824e930799edcb3b3de16` |
 | `config/rtx/` | same | `patches/cuda/` `0001`-`0022`, then `patches/rtx/` `0001`-`0002` | `0f61f4723db864b510f9a278b6dd5d679b344acb` |
 | `config/metal/` | `6d0a128b0cde35aa091bda933577cfced3519b8a` | `patches/metal/` `0001`-`0044` | `d33e2d93ea37f0b3ed1f208599a24ac00b3de16e` |
+| `config/hip/` | `813ff4ccbf9d6610e991a96d53fda2b628f56347` | `patches/hip/` `0001`-`0018` | `083d74e21f2678630829c59af6ee008a963331fe` |
 
 Every repo is `https://github.com/ashhart/TensorFold.git`. A config with `tensorfold.patches` applies its own directory
 `0001`..`LAST`; one with `tensorfold.series` applies each `DIR:LAST` word in order (`cuda-v6`: `cuda:0027`; `rtx`:
 `cuda:0022 rtx:0002`).
 
-Both pins are on upstream `main` (2026-11-17); `038e4a278` is 36 commits older than `6d0a128b0`.
+The CUDA and Metal pins are on upstream `main` (2026-11-17); `038e4a278` is 36 commits older than `6d0a128b0`. The HIP
+pin `813ff4ccb` is on upstream `main` too (2026-11-19, version 1.2.10), the commit the Ally X work started from.
 `scripts/fetch-engine.sh BACKEND DEST [SOURCE]` fetches the pin, applies `patches/BACKEND/0001`..`LAST` with `git am`
 (each patch keeps its author; the committer and dates are fixed, so every machine gets the same commits) and refuses
 any result whose tree differs from `tensorfold.tree`. SOURCE may be a local TensorFold checkout or bundle that holds
@@ -121,3 +123,13 @@ exist. The series are this recipe's, not upstream pull requests.
 conflict against the CUDA series (`cuda_loop_plan_test.zig`) keeps both tests. On `cuda:0022` the RTX tree's engine
 source equals the build the RTX copy-draft and host-cache numbers were measured on; the only differences are the
 converter in `tools/` and the equivalent registry loop of `0002`. RTX does not take `0023`-`0027` yet.
+
+## HIP series, `patches/hip/` (on `813ff4ccb`)
+
+`0001`-`0011` are the CUDA series' backend-neutral patches replayed on the HIP pin: CUDA `0008`, `0010`, `0013`, `0015`
+and `0017`-`0022` apply as recorded; CUDA `0014`'s two CUDA-family hunks do not exist on this pin, so its `qwen3_5`
+share is declared at the HIP registration instead. `0012`-`0018` port the looped model to the `qwen3_5` HIP path: the
+plan, YaRN, the mHC routers, per-execution cache slots, the four mHC kernels with their contract, the looped forward
+and the `sensenova_loop` registration ([HIP](HIP.md#patcheship)). The series gives back the tree the Ally X's
+measured binary was built from. It does not take CUDA `0023`'s seam change in its CUDA form: the HIP forward collapses
+the streams at the window's end on every visit from the start (`TF_Q35_MHC_CARRY=1` keeps the carry).

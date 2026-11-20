@@ -1,0 +1,70 @@
+From 15f30f77c1016540baedee249f2b1da16fbc3348 Mon Sep 17 00:00:00 2001
+From: Jay Leaton <58495321+jayleaton@users.noreply.github.com>
+Date: Wed, 18 Nov 2026 15:19:16 +0700
+Subject: [PATCH 04/20] rows: --spill-gib's evictions are not charged to the
+ daily write budget
+
+A spill store parks states RAM evicts; once --learn-daily-gib (32 by
+default) was spent every eviction was skipped and the state lost, so
+long conversations came back cached=0. Writes behind every turn keep
+the budget.
+---
+ zig/src/core/rows_spill_test.zig | 24 ++++++++++++++++++++++++
+ zig/src/core/rows_store.zig      |  5 ++---
+ 2 files changed, 26 insertions(+), 3 deletions(-)
+
+diff --git a/zig/src/core/rows_spill_test.zig b/zig/src/core/rows_spill_test.zig
+index bc4630d..620b24c 100644
+--- a/zig/src/core/rows_spill_test.zig
++++ b/zig/src/core/rows_spill_test.zig
+@@ -85,6 +85,30 @@ test "spill: a state evicted from RAM goes to disk, and its next turn resumes fr
+     try std.testing.expectEqual(fresh(again), got.sum);
+ }
+ 
++test "spill: evictions are not charged to --learn-daily-gib, while writes behind every turn still are" {
++    const gpa = std.testing.allocator;
++    var arena: std.heap.ArenaAllocator = .init(gpa);
++    defer arena.deinit();
++    const a = arena.allocator();
++    var buf: [128]u8 = undefined;
++    const dir = root(&buf, "daily");
++    defer rmTree(dir);
++    for ([_]rows.Spill{ .evicted, .finish }) |spill| {
++        var f: Fake = .{ .gpa = gpa };
++        var s = pc.Store.init(gpa, f.snapshots(), rules, one(&f, 600));
++        var o = options(dir, spill);
++        o.daily = 1;
++        const r = try rows.attach(gpa, &s, o);
++        defer r.deinit();
++        defer s.deinit();
++        try std.testing.expectEqual(spill == .evicted, r.budget(1 << 30));
++        _ = try request(a, &s, &f, try prompt(a, 0, 1, 700), 600);
++        _ = try request(a, &s, &f, try prompt(a, 0, 2, 700), 600);
++        while (rows.write.step(r)) {}
++        try std.testing.expectEqual(@as(u64, @intFromBool(spill == .evicted)), r.counts.writes);
++    }
++}
++
+ test "spill: --checkpoint-slots keeps that many states in RAM, and the oldest conversation goes to disk first" {
+     const gpa = std.testing.allocator;
+     var arena: std.heap.ArenaAllocator = .init(gpa);
+diff --git a/zig/src/core/rows_store.zig b/zig/src/core/rows_store.zig
+index c495517..1efac76 100644
+--- a/zig/src/core/rows_store.zig
++++ b/zig/src/core/rows_store.zig
+@@ -362,10 +362,9 @@ pub const Rows = struct {
+         return out;
+     }
+ 
+-    /// Whether `bytes` more fit today's write budget (root/written: the day and its bytes, every identity together).
++    /// Whether `bytes` more fit today's write budget (root/written); --spill-gib's evictions are exempt.
+     pub fn budget(r: *const Rows, bytes: u64) bool {
+-        const w = r.written();
+-        return w.bytes + bytes <= r.daily;
++        return r.spill == .evicted or r.written().bytes + bytes <= r.daily;
+     }
+ 
+     const Day = struct { day: u64, bytes: u64 };
+-- 
+2.56.0
+

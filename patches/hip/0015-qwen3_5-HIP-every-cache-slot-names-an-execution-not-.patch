@@ -1,0 +1,304 @@
+From 2fcd4644be64842cca69c9aa4f18b8b1e33ea4a7 Mon Sep 17 00:00:00 2001
+From: Jay Leaton <58495321+jayleaton@users.noreply.github.com>
+Date: Thu, 19 Nov 2026 18:18:47 +0800
+Subject: [PATCH 15/20] qwen3_5 HIP: every cache slot names an execution, not a
+ layer
+
+A looped checkpoint runs a layer more than once, and each visit owns
+its state: 14 attention slots where the checkpoint has 8 attention
+layers, 42 delta slots where it has 24. The pages pool, a stream's
+caches, the rounds' plan buffer and their snapshots, the keep's
+replay and the memory budgets now all count and index a forward's
+executions (loop_plan.steps of the shared Spec), with the kind of
+each slot read through the plan's physical().
+
+A model without a loop keeps its exact layout: steps equals layers
+and every index is the one it was.
+---
+ .../qwen3_5/backend/hip/engine/engine.zig     |  3 ++-
+ .../qwen3_5/backend/hip/engine/memory.zig     | 19 +++++++------------
+ .../qwen3_5/backend/hip/engine/round.zig      |  7 ++++---
+ .../qwen3_5/backend/hip/engine/scratch.zig    |  3 ++-
+ .../qwen3_5/backend/hip/forward/pages.zig     | 19 ++++++++++---------
+ .../qwen3_5/backend/hip/forward/state.zig     | 13 +++++++------
+ .../qwen3_5/backend/hip/forward/window.zig    |  7 ++++---
+ zig/src/families/qwen3_5/loop_plan.zig        |  7 ++++++-
+ 8 files changed, 42 insertions(+), 36 deletions(-)
+
+diff --git a/zig/src/families/qwen3_5/backend/hip/engine/engine.zig b/zig/src/families/qwen3_5/backend/hip/engine/engine.zig
+index b89018d..99b3153 100644
+--- a/zig/src/families/qwen3_5/backend/hip/engine/engine.zig
++++ b/zig/src/families/qwen3_5/backend/hip/engine/engine.zig
+@@ -21,6 +21,7 @@ const admission = hip.admission;
+ const prefix = @import("prefix.zig");
+ const plan = @import("../forward/plan.zig");
+ const config = @import("../../../weights/config.zig");
++const loop = @import("../../../loop_plan.zig");
+ const table = @import("../../../weights/table.zig");
+ const vision = @import("vision.zig");
+ 
+@@ -288,7 +289,7 @@ pub const Engine = struct {
+         const m = e.model();
+         const blas: usize = if (e.plain()) hip.blas.workspace_bytes else 0;
+         return arenas[0] + arenas[1] + prompt_rows * 4 + draw.Drawer.deviceBytes(rows) + pages.Pool.deviceBytes(m, pool_pages) +
+-            plan.Buffer.deviceBytes(rows, m.spec.n_layers) + state.Caches.deviceBytes(m, rows) +
++            plan.Buffer.deviceBytes(rows, loop.steps(m.spec)) + state.Caches.deviceBytes(m, rows) +
+             hip.Votes.bytes(e.o.world) + blas + if (m.torch_text) capacity * 12 else 0;
+     }
+ 
+diff --git a/zig/src/families/qwen3_5/backend/hip/engine/memory.zig b/zig/src/families/qwen3_5/backend/hip/engine/memory.zig
+index 3b24a80..23cc342 100644
+--- a/zig/src/families/qwen3_5/backend/hip/engine/memory.zig
++++ b/zig/src/families/qwen3_5/backend/hip/engine/memory.zig
+@@ -1,29 +1,24 @@
+ //! Bytes of a stream's state and of the prompt cache: pages of keys and values, and the linear layers' state.
+ 
+ const config = @import("../../../weights/config.zig");
++const loop = @import("../../../loop_plan.zig");
+ const pages = @import("../forward/pages.zig");
+ 
+-/// Bytes of one page of the pool: the keys and values of 64 positions in every attention layer.
++/// Bytes of one page of the pool: the keys and values of 64 positions in every attention execution.
+ pub fn pageBytes(s: config.Spec, act_bytes: usize) usize {
+-    var full: usize = 0;
+-    for (0..s.n_layers) |i| full += @intFromBool(s.full(i));
+-    return full * 2 * s.kv_heads * s.head_dim * act_bytes * pages.tokens;
++    return loop.attentions(s) * 2 * s.kv_heads * s.head_dim * act_bytes * pages.tokens;
+ }
+ 
+-/// One stream's (or one snapshot's) linear state: the conv window and the recurrent state of every linear layer.
++/// One stream's (or one snapshot's) linear state: the conv window and recurrent state of every delta execution.
+ pub fn linearBytes(s: config.Spec) usize {
+-    var full: usize = 0;
+-    for (0..s.n_layers) |i| full += @intFromBool(s.full(i));
+     const conv = (s.keyWidth() * 2 + s.valueWidth()) * (s.conv - 1) * 4;
+     const recurrent = s.value_heads * s.value_dim * s.key_dim * 4;
+-    return (s.n_layers - full) * (conv + recurrent);
++    return (loop.steps(s) - loop.attentions(s)) * (conv + recurrent);
+ }
+ 
+-/// Bytes one stream's caches hold at `tokens` positions: attention keys and values plus the linear layers' state.
++/// Bytes one stream's caches hold at `tokens` positions: attention keys and values plus the linear state.
+ pub fn stateBytes(s: config.Spec, act_bytes: usize, tokens: usize) usize {
+-    var full: usize = 0;
+-    for (0..s.n_layers) |i| full += @intFromBool(s.full(i));
+-    return full * 2 * s.kv_heads * s.head_dim * act_bytes * tokens + linearBytes(s);
++    return loop.attentions(s) * 2 * s.kv_heads * s.head_dim * act_bytes * tokens + linearBytes(s);
+ }
+ 
+ /// What `budget` bytes of prompt cache hold: at most `slots` snapshots, up to half of it, and pages for the rest.
+diff --git a/zig/src/families/qwen3_5/backend/hip/engine/round.zig b/zig/src/families/qwen3_5/backend/hip/engine/round.zig
+index 13d9d7d..2e83b47 100644
+--- a/zig/src/families/qwen3_5/backend/hip/engine/round.zig
++++ b/zig/src/families/qwen3_5/backend/hip/engine/round.zig
+@@ -7,6 +7,7 @@ const state = @import("../forward/state.zig");
+ const win = @import("../forward/window.zig");
+ const fwd = @import("../forward/forward.zig");
+ const plan = @import("../forward/plan.zig");
++const loop = @import("../../../loop_plan.zig");
+ const view = @import("../model/view.zig");
+ const draw = @import("hip_serve").draw;
+ const round_graphs = @import("round_graphs.zig");
+@@ -53,11 +54,11 @@ pub const State = struct {
+         const m = e.model();
+         if (!win.supported(e.ops(&e.rounds), m)) return error.RoundsUnsupported;
+         const rows = e.o.batch_rows;
+-        var buffer = try plan.Buffer.init(&e.driver, rows, m.spec.n_layers, e.pool.count);
++        var buffer = try plan.Buffer.init(&e.driver, rows, loop.steps(m.spec), e.pool.count);
+         errdefer buffer.deinit();
+         var scratch = try state.Caches.initFull(e.gpa, &e.pool, m, rows);
+         errdefer scratch.deinit(e.gpa);
+-        const snaps = try e.gpa.alloc([2]u64, m.spec.n_layers);
++        const snaps = try e.gpa.alloc([2]u64, loop.steps(m.spec));
+         errdefer e.gpa.free(snaps);
+         const wins = try e.gpa.alloc(plan.Window, rows);
+         errdefer e.gpa.free(wins);
+@@ -149,7 +150,7 @@ pub fn verify(e: *Engine, rows: []const Rows, reqs: []const draw.Request, out: [
+     e.rounds.reset();
+     const o = e.ops(&e.rounds);
+     try win.kept(o, m, c.shape.rows, st.snaps);
+-    const l = plan.Layout.of(c.shape.rows, c.shape.slots, m.spec.n_layers);
++    const l = plan.Layout.of(c.shape.rows, c.shape.slots, loop.steps(m.spec));
+     st.buffer.fill(l, c.shape, st.wins[0..rows.len], st.scratch.desc.base(), st.snaps);
+     st.layout = l;
+     const p: hip.plan_ops.Plan = .{ .args = st.buffer.args(l), .rows = c.shape.rows, .slots = c.shape.slots };
+diff --git a/zig/src/families/qwen3_5/backend/hip/engine/scratch.zig b/zig/src/families/qwen3_5/backend/hip/engine/scratch.zig
+index 8311734..c0c3631 100644
+--- a/zig/src/families/qwen3_5/backend/hip/engine/scratch.zig
++++ b/zig/src/families/qwen3_5/backend/hip/engine/scratch.zig
+@@ -8,6 +8,7 @@ const pages = @import("../forward/pages.zig");
+ const state = @import("../forward/state.zig");
+ const plan = @import("../forward/plan.zig");
+ const round = @import("round.zig");
++const loop = @import("../../../loop_plan.zig");
+ const Engine = @import("engine.zig").Engine;
+ 
+ /// A prompt pass of `rows` rows ending at the last of `capacity` positions, then the head over its last row.
+@@ -29,7 +30,7 @@ pub fn prompts(e: *Engine, rows: usize, capacity: usize) !usize {
+ /// A round of `rows` rows whose attention walks every position of `capacity`: snapshots, forward, whole logits.
+ pub fn rounds(e: *Engine, rows: usize, capacity: usize) !usize {
+     const m = e.model();
+-    const table = try e.gpa.alloc([2]u64, m.spec.n_layers);
++    const table = try e.gpa.alloc([2]u64, loop.steps(m.spec));
+     defer e.gpa.free(table);
+     var arena = hip.Arena.counting();
+     const o = counting(e, &arena);
+diff --git a/zig/src/families/qwen3_5/backend/hip/forward/pages.zig b/zig/src/families/qwen3_5/backend/hip/forward/pages.zig
+index 69e5fb9..877258b 100644
+--- a/zig/src/families/qwen3_5/backend/hip/forward/pages.zig
++++ b/zig/src/families/qwen3_5/backend/hip/forward/pages.zig
+@@ -3,6 +3,7 @@
+ const std = @import("std");
+ const hip = @import("hip");
+ const view = @import("../model/view.zig");
++const loop = @import("../../../loop_plan.zig");
+ const shared = @import("hip_serve").pages;
+ const Allocator = std.mem.Allocator;
+ 
+@@ -26,28 +27,28 @@ pub const Pool = struct {
+     /// Whether this holder hands pages out (rank 0 and a lone rank); a follower is told which pages to use.
+     managed: bool,
+ 
+-    /// Device bytes a pool of `count` pages holds: keys and values of every attention layer.
++    /// Device bytes a pool of `count` pages holds: keys and values of every attention execution.
+     pub fn deviceBytes(m: *const view.Model, count: usize) usize {
+         const s = m.spec;
+-        var full: usize = 0;
+-        for (0..s.n_layers) |i| full += @intFromBool(s.full(i));
+-        return 2 * full * count * s.kv_heads * tokens * s.head_dim * m.act.size();
++        return 2 * loop.attentions(s) * count * s.kv_heads * tokens * s.head_dim * m.act.size();
+     }
+ 
+     pub fn init(gpa: Allocator, d: *const hip.Runtime, m: *const view.Model, count: usize, managed: bool) !Pool {
+         const s = m.spec;
+-        const keys = try gpa.alloc(hip.DeviceBuffer, s.n_layers);
++        const slots = loop.steps(s);
++        const keys = try gpa.alloc(hip.DeviceBuffer, slots);
+         errdefer gpa.free(keys);
+-        const values = try gpa.alloc(hip.DeviceBuffer, s.n_layers);
++        const values = try gpa.alloc(hip.DeviceBuffer, slots);
+         errdefer gpa.free(values);
+         var made: usize = 0;
+         errdefer for (0..made) |i| {
+             keys[i].free();
+             values[i].free();
+         };
+-        const per_layer = count * s.kv_heads * tokens * s.head_dim * m.act.size();
+-        for (0..s.n_layers) |i| {
+-            const bytes = if (s.full(i)) per_layer else 0;
++        const per_slot = count * s.kv_heads * tokens * s.head_dim * m.act.size();
++        for (0..slots) |i| {
++            // a looped model gives each visit of an attention layer its own pool
++            const bytes = if (loop.full(s, i)) per_slot else 0;
+             keys[i] = try hip.DeviceBuffer.alloc(d, bytes);
+             errdefer keys[i].free();
+             values[i] = try hip.DeviceBuffer.alloc(d, bytes);
+diff --git a/zig/src/families/qwen3_5/backend/hip/forward/state.zig b/zig/src/families/qwen3_5/backend/hip/forward/state.zig
+index 249f8d3..4cd40f4 100644
+--- a/zig/src/families/qwen3_5/backend/hip/forward/state.zig
++++ b/zig/src/families/qwen3_5/backend/hip/forward/state.zig
+@@ -3,6 +3,7 @@
+ const std = @import("std");
+ const hip = @import("hip");
+ const view = @import("../model/view.zig");
++const loop = @import("../../../loop_plan.zig");
+ const pages = @import("pages.zig");
+ const Allocator = std.mem.Allocator;
+ 
+@@ -42,25 +43,25 @@ pub const Caches = struct {
+     /// Device bytes the caches of `total` positions hold beside their pages: linear state and the descriptor.
+     pub fn deviceBytes(m: *const view.Model, total: usize) usize {
+         const s = m.spec;
+-        var linear: usize = 0;
+-        for (0..s.n_layers) |i| linear += @intFromBool(!s.full(i));
++        const linear = loop.steps(s) - loop.attentions(s);
+         const conv = (s.conv - 1) * view.convChannels(s) * 4;
+         const state = s.value_heads * s.value_dim * s.key_dim * 4;
+-        return linear * (conv + state) + 8 * (tableWord(s.n_layers) + std.mem.alignForward(usize, pages.pagesFor(total), 2) / 2);
++        return linear * (conv + state) + 8 * (tableWord(loop.steps(s)) + std.mem.alignForward(usize, pages.pagesFor(total), 2) / 2);
+     }
+ 
+     /// Caches for up to `total` positions with no pages yet; every linear byte zeroed.
+     pub fn init(gpa: Allocator, pool: *pages.Pool, m: *const view.Model, total: usize) !Caches {
+         const d = pool.d;
+         const s = m.spec;
+-        const layers = try gpa.alloc(LayerCache, s.n_layers);
++        // every execution owns its slot: a looped layer's second visit never reads its first pass's state
++        const layers = try gpa.alloc(LayerCache, loop.steps(s));
+         var made: usize = 0;
+         errdefer {
+             for (layers[0..made]) |*l| free(l);
+             gpa.free(layers);
+         }
+         for (layers, 0..) |*l, i| {
+-            if (s.full(i)) {
++            if (loop.full(s, i)) {
+                 l.* = .full;
+             } else {
+                 var conv = try hip.DeviceBuffer.alloc(d, (s.conv - 1) * view.convChannels(s) * 4);
+@@ -74,7 +75,7 @@ pub const Caches = struct {
+             made += 1;
+         }
+         const slots = std.mem.alignForward(usize, pages.pagesFor(total), 2);
+-        const words = try gpa.alloc(u64, tableWord(s.n_layers) + slots / 2);
++        const words = try gpa.alloc(u64, tableWord(loop.steps(s)) + slots / 2);
+         defer gpa.free(words);
+         @memset(words, 0);
+         var desc = try hip.DeviceBuffer.alloc(d, 8 * words.len);
+diff --git a/zig/src/families/qwen3_5/backend/hip/forward/window.zig b/zig/src/families/qwen3_5/backend/hip/forward/window.zig
+index 71f2b01..65e2477 100644
+--- a/zig/src/families/qwen3_5/backend/hip/forward/window.zig
++++ b/zig/src/families/qwen3_5/backend/hip/forward/window.zig
+@@ -3,6 +3,7 @@
+ const std = @import("std");
+ const hip = @import("hip");
+ const view = @import("../model/view.zig");
++const loop = @import("../../../loop_plan.zig");
+ const fwd = @import("forward.zig");
+ const moe = hip.moe;
+ 
+@@ -24,7 +25,7 @@ pub fn kept(o: Ops, m: *const view.Model, rows: usize, table: [][2]u64) !void {
+     const s = m.spec;
+     for (table, 0..) |*t, index| {
+         t.* = .{ 0, 0 };
+-        if (s.full(index)) continue;
++        if (loop.full(s, index)) continue;
+         t[0] = try o.arena.of(f32, rows * view.convChannels(s));
+         t[1] = try o.arena.of(f32, rows * (s.keyWidth() + s.valueWidth() + 2 * s.value_heads));
+     }
+@@ -110,9 +111,9 @@ pub fn keep(o: Ops, m: *const view.Model, p: pops.Plan, counts: u64, hidden: u64
+         .hidden_words = s.hidden * m.act.size() / 4,
+         .channels = view.convChannels(s),
+         .taps = s.conv - 1,
+-        .layers = s.n_layers,
++        .layers = loop.steps(s),
+     });
+-    try pops.gdnReplay(o, counts, p, s.key_heads, s.value_heads, s.key_dim, s.value_dim, s.n_layers);
++    try pops.gdnReplay(o, counts, p, s.key_heads, s.value_heads, s.key_dim, s.value_dim, loop.steps(s));
+ }
+ 
+ fn attentionRows(o: Ops, m: *const view.Model, f: view.Full, r: Round, index: usize, x: Tensor) fwd.Error!Tensor {
+diff --git a/zig/src/families/qwen3_5/loop_plan.zig b/zig/src/families/qwen3_5/loop_plan.zig
+index 70a4851..d1821a0 100644
+--- a/zig/src/families/qwen3_5/loop_plan.zig
++++ b/zig/src/families/qwen3_5/loop_plan.zig
+@@ -57,10 +57,15 @@ pub fn physical(s: config.Spec, i: usize) usize {
+     return l.end + (i - l.start - body);
+ }
+ 
++/// Whether the `i`-th execution runs full attention (the others are gated delta-net).
++pub fn full(s: config.Spec, i: usize) bool {
++    return s.full(physical(s, i));
++}
++
+ /// The full attention executions among a forward's steps.
+ pub fn attentions(s: config.Spec) usize {
+     var n: usize = 0;
+-    for (0..steps(s)) |i| n += @intFromBool(s.full(physical(s, i)));
++    for (0..steps(s)) |i| n += @intFromBool(full(s, i));
+     return n;
+ }
+ 
+-- 
+2.56.0
+

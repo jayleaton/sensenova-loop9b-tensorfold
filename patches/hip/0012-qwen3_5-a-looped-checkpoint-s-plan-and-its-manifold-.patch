@@ -1,0 +1,319 @@
+From 9e41421d5c65e805da6984538f0421c1745b3d6d Mon Sep 17 00:00:00 2001
+From: Jay Leaton <58495321+jayleaton@users.noreply.github.com>
+Date: Thu, 19 Nov 2026 18:09:05 +0800
+Subject: [PATCH 12/20] qwen3_5: a looped checkpoint's plan and its
+ manifold-constrained streams
+
+SenseNova-Loop wraps the Qwen3.5 text tower with a shared-weight loop
+and a two-stream mHC, both declared at the config's root. The shared
+Spec now carries them: loop_plan.zig reads loop_settings and mhc as the
+reference's execution_plan does (a fixed-count loop, a window inside
+one loop phase, a learned Sinkhorn map), and answers the two questions
+every backend asks: how many executions a forward runs (56 where the
+checkpoint has 32 layers) and which physical layer each one visits.
+The loader reads them after geometry, so the HIP path sees the same plan
+the SenseNova recipe's CUDA series executes; a config without the
+blocks keeps every layer once. model_type sensenova_loop is admitted
+beside qwen3_5 and qwen3_5_moe.
+
+Each visit of a looped layer needs its own cache slot; the engines that
+have not caught up keep refusing looped checkpoints by the plan's own
+rules until they do.
+---
+ zig/src/families/qwen3_5/config.zig         |   9 +-
+ zig/src/families/qwen3_5/hip.zig            |   1 +
+ zig/src/families/qwen3_5/loop_plan.zig      | 221 ++++++++++++++++++++
+ zig/src/families/qwen3_5/weights/config.zig |   3 +-
+ 4 files changed, 232 insertions(+), 2 deletions(-)
+ create mode 100644 zig/src/families/qwen3_5/loop_plan.zig
+
+diff --git a/zig/src/families/qwen3_5/config.zig b/zig/src/families/qwen3_5/config.zig
+index 3f0d593..5d398c8 100644
+--- a/zig/src/families/qwen3_5/config.zig
++++ b/zig/src/families/qwen3_5/config.zig
+@@ -256,6 +256,8 @@ pub const Error = error{
+     UnsupportedModel,
+     InvalidMoe,
+     InvalidRotary,
++    InvalidLoop,
++    InvalidMhc,
+ } || checks.Error || std.mem.Allocator.Error || std.json.ParseError(std.json.Scanner);
+ 
+ pub const checks = @import("config_checks.zig");
+@@ -288,6 +290,10 @@ pub const Spec = struct {
+     full_layers: [checks.max_layers]bool = @splat(false),
+     mrope: checks.Mrope = .{},
+     max_position: usize = 262144,
++    /// The loop that repeats a range of physical layers; a looped forward runs `loop_plan.steps` executions.
++    loop: @import("loop_plan.zig").Loop = .{},
++    /// Manifold-constrained streams over one loop phase, with their router's settings.
++    mhc: ?@import("loop_plan.zig").Mhc = null,
+ 
+     /// Whether layer `index` is full attention (the others are gated delta-net).
+     pub fn full(s: Spec, index: usize) bool {
+@@ -307,7 +313,8 @@ pub const Spec = struct {
+ pub fn declared(a: std.mem.Allocator, bytes: []const u8) Error!std.json.ObjectMap {
+     const doc = try objectOf(try std.json.parseFromSliceLeaky(std.json.Value, a, bytes, .{}));
+     const kind = doc.get("model_type") orelse return error.UnsupportedModel;
+-    if (kind != .string or !(eql(kind.string, "qwen3_5") or eql(kind.string, "qwen3_5_moe"))) return error.UnsupportedModel;
++    if (kind != .string or !(eql(kind.string, "qwen3_5") or eql(kind.string, "qwen3_5_moe") or
++        eql(kind.string, "sensenova_loop"))) return error.UnsupportedModel;
+     _ = try rules.tied(doc, try textTower(doc), .hip);
+     return doc;
+ }
+diff --git a/zig/src/families/qwen3_5/hip.zig b/zig/src/families/qwen3_5/hip.zig
+index 72c60c8..c828214 100644
+--- a/zig/src/families/qwen3_5/hip.zig
++++ b/zig/src/families/qwen3_5/hip.zig
+@@ -42,6 +42,7 @@ pub const native_moe = native_engine.Native("qwen3_5_moe");
+ 
+ test {
+     _ = config;
++    _ = @import("loop_plan.zig");
+     _ = table;
+     _ = @import("weights/shard.zig");
+     _ = @import("weights/projection.zig");
+diff --git a/zig/src/families/qwen3_5/loop_plan.zig b/zig/src/families/qwen3_5/loop_plan.zig
+new file mode 100644
+index 0000000..70a4851
+--- /dev/null
++++ b/zig/src/families/qwen3_5/loop_plan.zig
+@@ -0,0 +1,221 @@
++//! A looped Qwen3.5 checkpoint's root blocks: the shared-weight loop and its manifold-constrained streams.
++
++const std = @import("std");
++const config = @import("config.zig");
++const checks = config.checks;
++
++/// The most passes a loop may make over its layers; a forward's steps stay within 3 * checks.max_layers.
++pub const max_count = 8;
++
++/// The loop that repeats the physical layers of [start, end) `count` times (count 1: every layer once).
++pub const Loop = struct {
++    start: usize = 0,
++    end: usize = 0,
++    count: usize = 1,
++
++    /// Whether a forward repeats this loop's layers.
++    pub fn active(l: Loop) bool {
++        return l.count > 1 and l.end > l.start;
++    }
++};
++
++/// Manifold-constrained hyper-connections over one loop phase: `streams` residual streams a router mixes.
++pub const Mhc = struct {
++    start: usize,
++    end: usize,
++    streams: usize,
++    iterations: usize,
++    fixed_identity: bool,
++    pre_scale: f32,
++
++    /// The router's output count: pre, post, then the stream-mixing logits (none when the map is the identity).
++    pub fn outputs(m: Mhc) usize {
++        return 2 * m.streams + (if (m.fixed_identity) 0 else m.streams * m.streams);
++    }
++
++    /// Whether the physical layer `layer` sits inside the streams' window.
++    pub fn holds(m: Mhc, layer: usize) bool {
++        return layer >= m.start and layer < m.end;
++    }
++};
++
++/// Executions a forward of `s` runs: its layers unless its loop repeats a range of them.
++pub fn steps(s: config.Spec) usize {
++    if (!s.loop.active()) return s.n_layers;
++    const l = s.loop;
++    return l.start + l.count * (l.end - l.start) + (s.n_layers - l.end);
++}
++
++/// The physical layer the `i`-th execution runs: the prefix, the loop's passes, then the suffix.
++pub fn physical(s: config.Spec, i: usize) usize {
++    if (!s.loop.active()) return i;
++    const l = s.loop;
++    const span = l.end - l.start;
++    if (i < l.start) return i;
++    const body = l.count * span;
++    if (i < l.start + body) return l.start + (i - l.start) % span;
++    return l.end + (i - l.start - body);
++}
++
++/// The full attention executions among a forward's steps.
++pub fn attentions(s: config.Spec) usize {
++    var n: usize = 0;
++    for (0..steps(s)) |i| n += @intFromBool(s.full(physical(s, i)));
++    return n;
++}
++
++/// `loop_settings` and `mhc` at the config's root, as the reference's `execution_plan` reads them.
++pub fn read(spec: *config.Spec, root: std.json.ObjectMap) error{ InvalidLoop, InvalidMhc }!void {
++    try loopSettings(spec, root);
++    try mhcSettings(spec, root);
++}
++
++/// A JSON object, or null for the refusal every one of these blocks shares.
++fn object(v: std.json.Value) ?std.json.ObjectMap {
++    return if (v == .object) v.object else null;
++}
++
++/// A whole field, zero included (a loop may start at layer 0), or null when it is absent or out of range.
++fn whole(o: std.json.ObjectMap, key: []const u8) ?usize {
++    const v = o.get(key) orelse return null;
++    if (v != .integer or v.integer < 0 or v.integer > checks.max_layers) return null;
++    return @intCast(v.integer);
++}
++
++/// A positive whole field, or null when it is absent or out of range.
++fn count(o: std.json.ObjectMap, key: []const u8) ?usize {
++    const v = o.get(key) orelse return null;
++    if (v != .integer or v.integer < 1 or v.integer > std.math.maxInt(u32)) return null;
++    return @intCast(v.integer);
++}
++
++/// A number, integer or float, or null when the field is not one.
++fn number(o: std.json.ObjectMap, key: []const u8) ?f64 {
++    return switch (o.get(key) orelse return null) {
++        .integer => |i| @floatFromInt(i),
++        .float => |f| f,
++        else => null,
++    };
++}
++
++fn loopSettings(spec: *config.Spec, root: std.json.ObjectMap) error{InvalidLoop}!void {
++    const v = root.get("loop_settings") orelse return;
++    const o = object(v) orelse return error.InvalidLoop;
++    const start = whole(o, "start") orelse return error.InvalidLoop;
++    const end = whole(o, "end") orelse return error.InvalidLoop;
++    const passes = count(o, "eval_count") orelse return error.InvalidLoop;
++    if (start >= end or end > spec.n_layers or passes > max_count) return error.InvalidLoop;
++    // the reference runs fixed-count loop checkpoints only: `counts` is exactly [eval_count] when present
++    if (o.get("counts")) |c| {
++        if (c != .array or c.array.items.len != 1) return error.InvalidLoop;
++        if (c.array.items[0] != .integer or c.array.items[0].integer != @as(i64, @intCast(passes))) return error.InvalidLoop;
++    }
++    const l: Loop = .{ .start = start, .end = end, .count = passes };
++    if (l.active() and steps(spec.*) > 3 * checks.max_layers) return error.InvalidLoop;
++    spec.loop = l;
++}
++
++fn mhcSettings(spec: *config.Spec, root: std.json.ObjectMap) error{InvalidMhc}!void {
++    const v = root.get("mhc") orelse return;
++    const o = object(v) orelse return error.InvalidMhc;
++    const start = whole(o, "start") orelse return error.InvalidMhc;
++    const end = whole(o, "end") orelse return error.InvalidMhc;
++    const streams = count(o, "streams") orelse return error.InvalidMhc;
++    const iterations = count(o, "iterations") orelse return error.InvalidMhc;
++    if (start >= end or end > spec.n_layers or (streams != 2 and streams != 4) or iterations > 64)
++        return error.InvalidMhc;
++    var fixed = false;
++    if (o.get("fixed_identity")) |f| {
++        if (f != .bool) return error.InvalidMhc;
++        fixed = f.bool;
++    }
++    var pre: f32 = 1;
++    if (o.get("pre_scale")) |_| {
++        const value = number(o, "pre_scale") orelse return error.InvalidMhc;
++        if (!std.math.isFinite(value) or value <= 0) return error.InvalidMhc;
++        pre = @floatCast(value);
++    }
++    // the window cannot cross a loop phase boundary: the streams would have to survive a collapse
++    const phases = [_][2]usize{ .{ 0, spec.loop.start }, .{ spec.loop.start, spec.loop.end }, .{ spec.loop.end, spec.n_layers } };
++    var inside = false;
++    for (phases) |p| if (p[0] <= start and end <= p[1]) {
++        inside = true;
++    };
++    if (!inside) return error.InvalidMhc;
++    // the kernels mix with the learned map only: an identity map would have to skip the Sinkhorn
++    if (fixed) return error.InvalidMhc;
++    spec.mhc = .{ .start = start, .end = end, .streams = streams, .iterations = iterations, .fixed_identity = fixed, .pre_scale = pre };
++}
++
++test "SenseNova-Loop-9B's plan: 56 executions, 14 attention and 42 delta slots" {
++    var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
++    defer arena.deinit();
++    const a = arena.allocator();
++    const spec = try parseSpec(a, config_json);
++    try std.testing.expectEqual(@as(usize, 56), steps(spec));
++    try std.testing.expectEqual(@as(usize, 32), spec.n_layers);
++    try std.testing.expectEqual(@as(usize, 14), attentions(spec));
++    try std.testing.expectEqual(@as(usize, 42), steps(spec) - attentions(spec));
++    // the prefix runs once, layers [4, 28) twice, then the suffix: physical(i) walks the same order
++    for (0..4) |i| try std.testing.expectEqual(i, physical(spec, i));
++    for (0..24) |i| try std.testing.expectEqual(4 + i, physical(spec, 4 + i));
++    for (0..24) |i| try std.testing.expectEqual(4 + i, physical(spec, 28 + i));
++    for (0..4) |i| try std.testing.expectEqual(28 + i, physical(spec, 52 + i));
++    try std.testing.expectEqual(@as(usize, 8192), spec.mhc.?.streams * spec.hidden);
++    try std.testing.expectEqual(@as(usize, 8), spec.mhc.?.outputs());
++    try std.testing.expect(spec.mhc.?.holds(4) and spec.mhc.?.holds(27) and !spec.mhc.?.holds(3) and !spec.mhc.?.holds(28));
++}
++
++test "a plan without loop_settings runs every layer once" {
++    var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
++    defer arena.deinit();
++    const a = arena.allocator();
++    var plain = try std.mem.replaceOwned(u8, a, config_json, "\"loop_settings\": {\"start\": 4, \"end\": 28, \"eval_count\": 2, \"counts\": [2]},", "");
++    plain = try std.mem.replaceOwned(u8, a, plain, "\"mhc\": {\"start\": 4, \"end\": 28, \"streams\": 2, \"iterations\": 20},", "");
++    const spec = try parseSpec(a, plain);
++    try std.testing.expect(!spec.loop.active());
++    try std.testing.expectEqual(spec.n_layers, steps(spec));
++    for (0..spec.n_layers) |i| try std.testing.expectEqual(i, physical(spec, i));
++    try std.testing.expect(spec.mhc == null);
++}
++
++test "the plan refuses what a forward cannot execute" {
++    var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
++    defer arena.deinit();
++    const a = arena.allocator();
++    const cases = [_]struct { []const u8, []const u8, anyerror }{
++        .{ "\"eval_count\": 2", "\"eval_count\": 0", error.InvalidLoop },
++        .{ "\"eval_count\": 2", "\"eval_count\": 9", error.InvalidLoop },
++        .{ "\"counts\": [2]", "\"counts\": [3]", error.InvalidLoop },
++        .{ "\"end\": 28", "\"end\": 40", error.InvalidLoop },
++        .{ "\"start\": 4", "\"start\": 28", error.InvalidLoop },
++        .{ "\"streams\": 2", "\"streams\": 3", error.InvalidMhc },
++        .{ "\"iterations\": 20", "\"iterations\": 65", error.InvalidMhc },
++        .{ "\"iterations\": 20", "\"fixed_identity\": true, \"iterations\": 20", error.InvalidMhc },
++        .{ "\"mhc\": {\"start\": 4", "\"mhc\": {\"start\": 2", error.InvalidMhc },
++    };
++    for (cases) |c| {
++        const bad = try std.mem.replaceOwned(u8, a, config_json, c[0], c[1]);
++        try std.testing.expectError(c[2], parseSpec(a, bad));
++    }
++}
++
++/// A config's Spec as the loader reads it: `declared`, `geometry`, then this module's `read`.
++fn parseSpec(a: std.mem.Allocator, text: []const u8) !config.Spec {
++    const root = try config.declared(a, text);
++    var spec = try config.geometry(try config.textTower(root), 4, 64);
++    try read(&spec, root);
++    return spec;
++}
++
++const config_json =
++    \\{"model_type": "sensenova_loop", "tie_word_embeddings": false,
++    \\ "loop_settings": {"start": 4, "end": 28, "eval_count": 2, "counts": [2]},
++    \\ "mhc": {"start": 4, "end": 28, "streams": 2, "iterations": 20},
++    \\ "text_config": {"hidden_size": 4096, "intermediate_size": 12288, "num_hidden_layers": 32,
++    \\  "num_attention_heads": 16, "num_key_value_heads": 4, "head_dim": 256,
++    \\  "linear_num_key_heads": 16, "linear_num_value_heads": 32, "linear_key_head_dim": 128,
++    \\  "linear_value_head_dim": 128, "linear_conv_kernel_dim": 4, "vocab_size": 248320,
++    \\  "rms_norm_eps": 1e-06, "full_attention_interval": 4, "eos_token_id": 248044,
++    \\  "rope_parameters": {"rope_theta": 10000000, "partial_rotary_factor": 0.25}}}
++;
+diff --git a/zig/src/families/qwen3_5/weights/config.zig b/zig/src/families/qwen3_5/weights/config.zig
+index 0d7f666..03d1ca8 100644
+--- a/zig/src/families/qwen3_5/weights/config.zig
++++ b/zig/src/families/qwen3_5/weights/config.zig
+@@ -52,7 +52,8 @@ pub const Config = struct {
+         // the family's own order: an unquantized BF16 checkpoint first, then the shared formats
+         const table: quant.Config = if (try quant.bf16.detect(a, sources)) |b| .{ .bf16 = b } else try quant.detect(a, sources);
+         const width: Width = if (table == .bf16) .{ .bits = 16, .group = 0 } else try table.width("");
+-        const spec = try shared.geometry(tower, width.bits, width.group);
++        var spec = try shared.geometry(tower, width.bits, width.group);
++        try @import("../loop_plan.zig").read(&spec, doc);
+         const gen = if (generation) |g| (try std.json.parseFromSliceLeaky(std.json.Value, a, g, .{})) else null;
+         if (gen) |g| if (g != .object) return error.InvalidConfig;
+         const ids = try a.create([shared.checks.max_eos]u32);
+-- 
+2.56.0
+

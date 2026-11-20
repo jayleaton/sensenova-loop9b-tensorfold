@@ -1,0 +1,96 @@
+From ca485b4969faa2f24907aaa8f49c903b83622d85 Mon Sep 17 00:00:00 2001
+From: Jay Leaton <58495321+jayleaton@users.noreply.github.com>
+Date: Wed, 18 Nov 2026 16:54:10 +0700
+Subject: [PATCH 07/20] lanes: copy width never applies to a priced proposer's
+ drafts
+
+---
+ zig/src/core/lanes/copy_width.zig        | 17 ++++++++--------
+ zig/src/core/lanes/drafted_copy_test.zig | 25 ++++++++++++++++++++++++
+ 2 files changed, 34 insertions(+), 8 deletions(-)
+
+diff --git a/zig/src/core/lanes/copy_width.zig b/zig/src/core/lanes/copy_width.zig
+index 03db05d..eaaa0b5 100644
+--- a/zig/src/core/lanes/copy_width.zig
++++ b/zig/src/core/lanes/copy_width.zig
+@@ -8,32 +8,33 @@ pub const Widths = struct { lone: ?u32 = null, shared: ?u32 = null };
+ /// A shared round's first copy rows at most, as the narrow families' first_copy_rows (4 rows: 3 copies).
+ const shared_first = 3;
+ 
+-/// Which width a round grows: none where allocate_shared_drafts prices shared rows (they keep cfg.first_copy).
++/// Which width a round grows: none for a priced proposer (a drafter) or allocate_shared_drafts rows.
+ const Kind = enum { lone, shared, priced };
+ 
+-fn kind(e: *const Engine) Kind {
++fn kind(e: *const Engine, s: *const Stream) Kind {
++    if (s.proposer) |p| if (p.vtable.priced) return .priced;
+     return if (e.alone) .lone else if (e.cfg.allocate_shared_drafts) .priced else .shared;
+ }
+ 
+ /// The first width: a lone or priced stream's cfg.first_copy; an unpriced shared stream's no wider than shared_first.
+-pub fn first(e: *const Engine) u32 {
+-    return if (kind(e) == .shared) @min(e.cfg.first_copy, shared_first) else e.cfg.first_copy;
++pub fn first(e: *const Engine, s: *const Stream) u32 {
++    return if (kind(e, s) == .shared) @min(e.cfg.first_copy, shared_first) else e.cfg.first_copy;
+ }
+ 
+ /// The copies this round may propose.
+ pub fn current(e: *const Engine, s: *const Stream) u32 {
+-    const width: ?u32 = switch (kind(e)) {
++    const width: ?u32 = switch (kind(e, s)) {
+         .lone => s.copy_width.lone,
+         .shared => s.copy_width.shared,
+         .priced => null,
+     };
+-    return width orelse first(e);
++    return width orelse first(e, s);
+ }
+ 
+ /// After a copy window: widen it when all its own rows landed, else back to the first width.
+ pub fn observe(e: *const Engine, s: *Stream, whole: bool) void {
+-    const next = if (whole) @min(e.cfg.max_copy, 2 * current(e, s) + 1) else first(e);
+-    switch (kind(e)) {
++    const next = if (whole) @min(e.cfg.max_copy, 2 * current(e, s) + 1) else first(e, s);
++    switch (kind(e, s)) {
+         .lone => s.copy_width.lone = next,
+         .shared => s.copy_width.shared = next,
+         .priced => {},
+diff --git a/zig/src/core/lanes/drafted_copy_test.zig b/zig/src/core/lanes/drafted_copy_test.zig
+index 841dee3..ff8820b 100644
+--- a/zig/src/core/lanes/drafted_copy_test.zig
++++ b/zig/src/core/lanes/drafted_copy_test.zig
+@@ -206,6 +206,31 @@ test "copy width: an unpriced shared stream starts at three copies, grows to 2 w
+     try std.testing.expectEqual(cfg.first_copy, cw.current(&e, &s));
+ }
+ 
++test "copy width: a priced proposer (a loaded drafter) drafts max_copy in shared rounds and never grows a width" {
++    const cw = @import("copy_width.zig");
++    const win = @import("windows.zig");
++    var cfg = try Config.init(gpa, .{ .exact_width = 16, .hidden_rows = true, .batch_rows = 32 }, 16, 15);
++    defer cfg.deinit(gpa);
++    var target: fake.Fake = .{ .gpa = gpa };
++    defer target.deinit();
++    var clock: fake.FixedClock = .{};
++    var e = Engine.init(gpa, &cfg, target.backend(), clock.clock());
++    defer e.deinit();
++    var drafter: Echo = .{};
++    const vtable: Proposer.VTable = .{ .propose = Echo.propose, .last_match = Echo.lastMatch, .priced = true };
++    var s = try sm.Stream.init(gpa, .{ .id = "s", .prompt = &.{ 1, 2 }, .max_new = 64, .proposer = .{ .ptr = &drafter, .vtable = &vtable } });
++    defer s.deinit(gpa);
++    for ([_]bool{ false, true }) |alone| {
++        e.alone = alone;
++        for ([_]bool{ true, false, true }) |whole| {
++            const c = try win.copyProposal(&e, &s);
++            try std.testing.expectEqual(@as(usize, @intCast(@min(@as(i64, cfg.max_copy), s.draftRoom() - 1))), c.tokens.len);
++            cw.observe(&e, &s, whole);
++            try std.testing.expectEqual(cw.Widths{}, s.copy_width);
++        }
++    }
++}
++
+ /// Copies the fake target's own continuation, as many tokens as the window allows, so every copy lands whole.
+ const Echo = struct {
+     out: [16]u32 = undefined,
+-- 
+2.56.0
+

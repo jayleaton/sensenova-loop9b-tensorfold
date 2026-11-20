@@ -1,6 +1,6 @@
 # Known issues
 
-## Both backends
+## All backends
 
 - **No neural drafter.** The checkpoint ships no MTP or draft weights. Copy drafts (drafts taken from a stream's own
   context) are on and keep tokens unchanged; a DFlash2 drafter waits on published weights.
@@ -42,6 +42,25 @@
   the window is bounded by the card (212,992 fp8 tokens for `sn-6.0` at one chat).
 - **Measured on one card in WSL2.** RTX 5070 Ti 16 GB only; native Windows and other cards are untested. `sn-4.0`'s
   tool calls were not run on the card. Decode varies with desktop load and clock decay (about 39-47 tok/s for `sn-6.0`).
+
+## HIP
+
+- **GPU hangs with the prompt cache on.** A serve with `--prompt-cache-gib 1.2` hung the 780M on its first long
+  prompt (`MES failed to respond to msg=REMOVE_QUEUE`, then a GPU reset), and so did a second full
+  `hip-kernel-contract` run a few seconds later. The profile serves with the cache off, which ran without a hang;
+  the cause is not found.
+- **Two upstream prompt-attention kernels fail a contract case on gfx1103.** `tf_fa_paged_bf16` and
+  `tf_fa_wide_bf16` return a finite value for 255 of 49,152 outputs where the FP64 reference gives NaN (the
+  `nonfinite` case). Neither is changed by this series. The full contract run stopped before its summary.
+- **One 8K stream.** The 8 GB UMA carve-out holds the 4.71 GiB model and one 8,192-token window with a 0.5 GiB
+  reserve. The TTM limit is raised and live after a reboot (GTT 15,674 MiB), but the engine budgeted from the
+  carve-out in every measured run; serving from GTT, longer windows and more streams are untested.
+- **No fidelity gate against BF16 on HIP.** The mHC kernels pass their FP64 contract and `serve_check` passes its
+  exactness checks; no teacher-forced KL or top-1 comparison has run on the 780M.
+- **Text only, no tool-call grammar.** `--vision` is refused on HIP, and `libtfgrammar` was not built, so required and
+  named tool calls were not tested.
+- **Measured on one Ally X.** The 780M (`gfx1103`) only; other AMD iGPUs and discrete cards, other distributions and
+  other carve-out sizes are untested, as are unattended boot and long soaks.
 
 ## Metal
 

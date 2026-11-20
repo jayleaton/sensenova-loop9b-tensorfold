@@ -2,11 +2,11 @@ Follow me on X for more updates: https://x.com/jayleaton
 
 Support me here: https://buymeacoffee.com/jayleaton
 
-# SenseNova-Loop-9B on TensorFold: DGX Spark, Macs and RTX
+# SenseNova-Loop-9B on TensorFold: DGX Spark, Macs, RTX and the ROG Ally X
 
 A recipe for serving [SenseNova-Loop-9B](https://huggingface.co/sensenova/SenseNova-Loop-9B) with
-[TensorFold](https://github.com/ashhart/TensorFold) on two backends: CUDA on one NVIDIA DGX Spark (TP=1) or a 16 GB RTX
-card, and Metal on Apple Silicon. It ships an exact upstream TensorFold pin and a patch series for each backend, a converter from the
+[TensorFold](https://github.com/ashhart/TensorFold) on three backends: CUDA on one NVIDIA DGX Spark (TP=1) or a 16 GB RTX
+card, Metal on Apple Silicon, and HIP on the ROG Ally X's Radeon 780M. It ships an exact upstream TensorFold pin and a patch series for each backend, a converter from the
 published BF16 checkpoint to the engine's MLX affine format, serving profiles, and the measurements behind them.
 The measured weight trees are on Hugging Face ([Weights on Hugging Face](#weights-on-hugging-face)), or convert the
 checkpoint yourself.
@@ -44,6 +44,7 @@ Each row is a recipe that was built and run end to end. Every build checks the e
 | **16 GB Mac** (M-series) | the same 4-bit tree, 5.07 GB | `metal` | 58 tok/s decode; 2,719 tok/s prefill at 8k; peak 7.60 / 7.82 / 9.13 GiB at 4k / 8k / 32k | same tree as the Studio | measured under a 16 GB working-set cap on the M5 Ultra; 8 GB Macs not supported |
 | **MacBook Pro M4 Pro** (24 GB) | the same 4-bit tree | `metal` | 26.7 tok/s decode; prefill about 230 tok/s (32k prompt: 166 s to first token) | same tree as the Studio | slow prefill on long prompts; quality not separately measured |
 | **RTX 5070 Ti 16 GB** (WSL2) | EXL3 `sn-6.0` (8.29 GB); `sn-4.0` for speed | `rtx`: pin `038e4a278` + `patches/cuda` `0001`-`0022` + `patches/rtx` `0001`-`0002` | `sn-6.0` 44-47 tok/s at 4k, 39-44 at 32k, prefill 2,232 tok/s; copy drafts re-quote 660, code 534 tok/s; host prompt cache restores 109K tokens in 4.5 s (30x) | gate cosine 0.99931, top-1 290/298; 36/36 tool calls; 30-minute soak, 0 failures | no live KV in host RAM (212,992-token fp8 window); native Windows untested |
+| **ROG Ally X** (Ryzen Z1 Extreme, Radeon 780M, 8 GB UMA carve-out) | the Metal 4-bit tree, text only | `hip`: pin `813ff4ccb` + `patches/hip` `0001`-`0018` | decode 10.8 tok/s short, 10.2 / 10.0 / 9.8 at 4.8K / 6.5K / 7.4K prompts; prefill about 200 tok/s | serve_check 11 ok, every exactness check; 3 vacuous fails (no drafter, cache off); mHC kernels pass their FP64 contract | one 8,192-token stream; prompt cache off (it hung the GPU); no tool calls or images; other AMD GPUs untested |
 
 **DGX Spark** ([CUDA](docs/CUDA.md)), CUDA 13 toolkit and Zig 0.17.0:
 
@@ -75,7 +76,16 @@ scripts/build-engine.sh rtx engine-rtx                       # SM=120 (RTX 50) b
 scripts/serve.sh rtx engine-rtx sn-6.0                       # --parallel 1 --kv-cache fp8 --context 212992
 ```
 
-Every command above needs the checkpoint downloaded first ([Quick start](#quick-start)).
+**ROG Ally X** ([HIP](docs/HIP.md), the full setup from a fresh Arch install), ROCm 7.2.4 and Zig 0.17.0:
+
+```bash
+sudo pacman -Sy --needed rocm-hip-sdk rocminfo               # then the TTM limit: docs/HIP.md#2-gpu-memory-the-ttm-limit
+scripts/build-engine.sh hip engine-hip                       # -Dhip-arch=gfx1103, Arch's device-lib path
+hf download jayleaton/SenseNova-Loop-9B-MLX-4bit --local-dir loop9b-mlx4
+scripts/serve.sh hip engine-hip loop9b-mlx4                  # --context 8192 --parallel 1 --prompt-cache-gib 0
+```
+
+Every command above except the Ally X's needs the checkpoint downloaded first ([Quick start](#quick-start)).
 
 ## Weights on Hugging Face
 
@@ -85,14 +95,14 @@ line, the measurements and the sha256 of its weight files. Apache-2.0, SenseNova
 | repository | what | device | engine (`config/`) | size |
 | --- | --- | --- | --- | ---: |
 | [SenseNova-Loop-9B-MLX-8bit-vision](https://huggingface.co/jayleaton/SenseNova-Loop-9B-MLX-8bit-vision) | 8-bit MLX g64 + BF16 vision tower, YaRN 4 (`loop9b-q8-vis`) | DGX Spark | `cuda`, `cuda-v6` | 10.46 GB |
-| [SenseNova-Loop-9B-MLX-4bit](https://huggingface.co/jayleaton/SenseNova-Loop-9B-MLX-4bit) | 4-bit MLX g64, vision tower carried (`loop9b-mlx4`) | Macs, 16 GB and up | `metal` | 5.98 GB |
+| [SenseNova-Loop-9B-MLX-4bit](https://huggingface.co/jayleaton/SenseNova-Loop-9B-MLX-4bit) | 4-bit MLX g64, vision tower carried (`loop9b-mlx4`) | Macs, 16 GB and up; ROG Ally X (text) | `metal`, `hip` | 5.98 GB |
 | [SenseNova-Loop-9B-EXL3-6.0bpw](https://huggingface.co/jayleaton/SenseNova-Loop-9B-EXL3-6.0bpw) | EXL3 `sn-6.0` | 16 GB RTX | `rtx` | 8.29 GB |
 | [SenseNova-Loop-9B-EXL3-5.0bpw](https://huggingface.co/jayleaton/SenseNova-Loop-9B-EXL3-5.0bpw) | EXL3 `sn-5.0` | 16 GB RTX | `rtx` | 7.17 GB |
 | [SenseNova-Loop-9B-EXL3-4.0bpw](https://huggingface.co/jayleaton/SenseNova-Loop-9B-EXL3-4.0bpw) | EXL3 `sn-4.0` | 16 GB RTX | `rtx` | 6.31 GB |
 
 ```bash
 hf download jayleaton/SenseNova-Loop-9B-MLX-8bit-vision --local-dir loop9b-q8-vis   # then scripts/serve.sh cuda engine-cuda loop9b-q8-vis
-hf download jayleaton/SenseNova-Loop-9B-MLX-4bit --local-dir loop9b-mlx4            # then scripts/serve.sh metal engine-metal loop9b-mlx4
+hf download jayleaton/SenseNova-Loop-9B-MLX-4bit --local-dir loop9b-mlx4            # then scripts/serve.sh metal engine-metal loop9b-mlx4 (or hip engine-hip)
 hf download jayleaton/SenseNova-Loop-9B-EXL3-6.0bpw --local-dir sn-6.0              # then scripts/serve.sh rtx engine-rtx sn-6.0
 ```
 
@@ -104,6 +114,7 @@ hf download jayleaton/SenseNova-Loop-9B-EXL3-6.0bpw --local-dir sn-6.0          
 | CUDA v6 | `cuda-v6` | `038e4a278` | `cuda` `0001`-`0027` | `9bac6ecbdef1` | 2026-11-19 | **validated, not yet served** | loop-seam fix (mean KL 0.0244 to 0.0186); prefill up to 1.13x; same checks pass |
 | RTX | `rtx` | `038e4a278` | `cuda` `0001`-`0022`, `rtx` `0001`-`0002` | `0f61f4723db8` | 2026-11-19 | tested on an RTX 5070 Ti | `sn-6.0` 44-47 tok/s, 36/36 tools, copy drafts up to 660 tok/s |
 | Metal | `metal` | `6d0a128b0` | `metal` `0001`-`0044` | `d33e2d93ea37` | 2026-11-18 | tested on M5 Ultra and M4 Pro | q4 60 tok/s, task gate code and reasoning 64/64, images |
+| HIP | `hip` | `813ff4ccb` | `hip` `0001`-`0018` | `083d74e21f26` | 2026-11-19 | tested on a ROG Ally X (780M) | q4 10.8 tok/s decode, 9.8 at 7.4K; serve_check exactness pass |
 
 Full tree hashes are in each `config/<config>/tensorfold.tree`. The `tensorfold-native` binaries measured had sha256
 `f2cde8048449c9f743122e1818eff31823fc0173e254724e96ebdba3f12362b5` (v5) and
@@ -119,18 +130,20 @@ differently with another toolchain. Details: [ENGINE](docs/ENGINE.md).
 | Weights served | MLX affine g64, converted with [`tools/sensenova_loop_mlx.py`](docs/CONVERT.md) from the patch series: 8-bit on CUDA, 4-bit on Metal |
 | CUDA | 1x DGX Spark (GB10), TP=1: upstream TensorFold [`038e4a278`](config/cuda/tensorfold.rev) + [`patches/cuda/`](patches/cuda/) `0001`-`0022` (served); `0001`-`0027` validated ([`config/cuda-v6`](config/cuda-v6/)) |
 | RTX | 16 GB RTX cards (tested on an RTX 5070 Ti, WSL2): the CUDA pin and series `0001`-`0022` + [`patches/rtx/`](patches/rtx/) `0001`-`0002`, EXL3 packs |
+| HIP | ROG Ally X, Radeon 780M (`gfx1103`), ROCm 7.2.4: upstream TensorFold [`813ff4ccb`](config/hip/tensorfold.rev) + [`patches/hip/`](patches/hip/) `0001`-`0018`, the Metal 4-bit tree, text only |
 | Metal | Apple Silicon (measured on M5 Ultra and M4 Pro): upstream TensorFold [`6d0a128b0`](config/metal/tensorfold.rev) + [`patches/metal/`](patches/metal/) `0001`-`0044` |
 | Input | text and images on both ([CUDA](docs/CUDA.md#serve), [METAL](docs/METAL.md#images)) |
 | Drafts | copy drafts on by default on both: drafts from a stream's own context, verified, so tokens are unchanged |
 
-The two series sit on different upstream commits, so each backend keeps its own pin. Each pin is the upstream commit
+The series sit on different upstream commits, so each backend keeps its own pin. Each pin is the upstream commit
 its backend was measured on, and each series rebuilds the measured engine tree exactly
 (`config/<backend>/tensorfold.tree` is checked after every apply). The CUDA series also rebases cleanly onto the Metal
 pin, but that tree has not been measured. See [ENGINE](docs/ENGINE.md).
 
-> **Experimental.** Both backends run the full 56-execution model end to end and keep the reference's top-1 token. CUDA
+> **Experimental.** CUDA and Metal run the full 56-execution model end to end and keep the reference's top-1 token. CUDA
 > misses the planned 0.05-logit parity gate and has no task gate yet; Metal passes its task gate on code and reasoning,
-> and its prose prompt stops at the reference's own noise floor. Read [KNOWN-ISSUES](docs/KNOWN-ISSUES.md) before you
+> and its prose prompt stops at the reference's own noise floor. HIP runs the same model on one device and has no
+> fidelity gate against BF16 yet. Read [KNOWN-ISSUES](docs/KNOWN-ISSUES.md) before you
 > rely on it.
 
 ## What works today
@@ -157,6 +170,11 @@ MacBook Pro (24 GB) decodes at 26.7 tok/s ([METAL](docs/METAL.md#copy-drafts)).
 pack. Copy drafts take a re-quote to 660 tok/s and a code edit to 534, token-identical; the host-RAM prompt cache
 restores a 109,313-token prefix in 4.48 s against 133.6 s cold. The 4.0-bit pack decodes at 59.1 tok/s. The packs are
 [on Hugging Face](#weights-on-hugging-face), or quantize them yourself.
+
+**ROG Ally X: the 4-bit tree on the Radeon 780M.** HIP on `gfx1103` with ROCm 7.2.4 and `patches/hip/`
+([HIP](docs/HIP.md)): 10.8 tok/s decode on a short prompt and 9.8 at a 7,428-token prompt, one 8K stream inside the 8 GB
+UMA carve-out. `serve_check` passes every exactness check and the mHC kernels pass their FP64 contract on the chip.
+The prompt cache is off: turning it on hung the GPU.
 
 **Tool calls need `libtfgrammar`.** `tool_choice: "required"`, a named function and `response_format` need
 `libtfgrammar` (`.so` on Linux, `.dylib` on macOS) beside the server, built from xgrammar v0.2.8 with
@@ -247,7 +265,7 @@ curl -s http://127.0.0.1:8090/v1/chat/completions -H 'Content-Type: application/
 Thinking is on by default (the checkpoint's chat template); send `"chat_template_kwargs": {"enable_thinking": false}`
 to turn it off. A `--thinking-budget` at or above `max_tokens` never closes the thinking block (the reply ends with
 `length`); keep it under `max_tokens` or add `--thinking-reserve N`. Build `libtfgrammar` for required and named tool
-calls (see above). To check the patch series without building, run `scripts/fetch-engine.sh cuda|cuda-v6|metal|rtx DIR`: it fetches
+calls (see above). To check the patch series without building, run `scripts/fetch-engine.sh cuda|cuda-v6|metal|rtx|hip DIR`: it fetches
 the pin, applies the series and checks the resulting tree.
 
 ## Not yet
@@ -264,6 +282,7 @@ the pin, applies the series and checks the resulting tree.
 | [CUDA](docs/CUDA.md) | DGX Spark: build, the served 1M profile, parity, speed |
 | [METAL](docs/METAL.md) | Apple Silicon: build, serve, copy drafts, fidelity, speed |
 | [RTX](docs/RTX.md) | EXL3 packs on a 16 GB RTX card: results on an RTX 5070 Ti, pack choice, WSL2 steps |
+| [HIP](docs/HIP.md) | the ROG Ally X's Radeon 780M: setup from scratch (ROCm, the TTM limit on Limine, build, serve), results |
 | [ENGINE](docs/ENGINE.md) | the pins and the patch series, patch by patch |
 | [KNOWN-ISSUES](docs/KNOWN-ISSUES.md) | what is not solved |
 | [CREDITS](docs/CREDITS.md) / [LICENSING](docs/LICENSING.md) | who built what, and under which terms |

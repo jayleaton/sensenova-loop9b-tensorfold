@@ -5,11 +5,14 @@
 #   scripts/build-engine.sh cuda-v6 DEST [SOURCE] the same, with the CUDA series through 0027 (loop seam, one-barrier prefill)
 #   scripts/build-engine.sh metal DEST [SOURCE]   on Apple Silicon with Xcode's macOS SDK and Metal toolchain
 #   scripts/build-engine.sh rtx DEST [SOURCE]     an RTX card: the CUDA series plus EXL3, kernels for SM (default 120)
+#   scripts/build-engine.sh hip DEST [SOURCE]     an AMD GPU with ROCm: kernels for HIP_ARCH (default gfx1103, the Radeon 780M)
 #
 # NVCC=none builds the CUDA side's host code without kernel images (a source check on a machine without CUDA).
+# HIPCC (default /opt/rocm/bin/hipcc) and HIP_DEVICE_LIB (default /opt/rocm/amdgcn/bitcode, where Arch's rocm-device-libs
+# puts the bitcode) pick the ROCm toolchain.
 set -euo pipefail
-backend=${1:?usage: scripts/build-engine.sh cuda|cuda-v6|metal|rtx DEST [SOURCE]}
-dest=${2:?usage: scripts/build-engine.sh cuda|cuda-v6|metal|rtx DEST [SOURCE]}
+backend=${1:?usage: scripts/build-engine.sh cuda|cuda-v6|metal|rtx|hip DEST [SOURCE]}
+dest=${2:?usage: scripts/build-engine.sh cuda|cuda-v6|metal|rtx|hip DEST [SOURCE]}
 root=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
 "$root/scripts/fetch-engine.sh" "$@"
 want=$(cat "$dest/.zig-version")
@@ -31,6 +34,12 @@ case "$backend" in
         nvcc=${NVCC:-/usr/local/cuda/bin/nvcc}
         zig build native -Dsm="${SM:-120}" -Dnvcc="$nvcc"
         zig build qwen35-cuda -Dsm="${SM:-120}" -Dnvcc="$nvcc"
+        ;;
+    hip)
+        zig build -Dhip=true native-hip -Dhip-arch="${HIP_ARCH:-gfx1103}" -Dhipcc="${HIPCC:-/opt/rocm/bin/hipcc}" \
+            -Dhip-device-lib="${HIP_DEVICE_LIB:-/opt/rocm/amdgcn/bitcode}"
+        echo "built $dest/zig-out/native-hip/bin/tensorfold-native"
+        exit 0
         ;;
     *) echo "no build for $backend" >&2; exit 2 ;;
 esac

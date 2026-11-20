@@ -1,0 +1,95 @@
+From fa4869c1f9a159584c1bb874b9283e01afecaf18 Mon Sep 17 00:00:00 2001
+From: Jay Leaton <58495321+jayleaton@users.noreply.github.com>
+Date: Thu, 19 Nov 2026 17:55:33 +0800
+Subject: [PATCH 11/20] lane host: a family's default decode share, applied
+ beside a filling prompt
+
+A family may declare decode_share; the lane host applies it beside a
+filling prompt when more than one stream serves and neither
+--decode-share nor TENSORFOLD_PREFILL_SHARE is set. The qwen3_5 CUDA
+family's own 0.5 declaration from the SenseNova series is left out here;
+this branch's loop family declares its share at its HIP registration.
+
+Applied from the SenseNova-Loop recipe's cuda 0014, whose four core
+hunks apply as written; its qwen3_5/cuda_native.zig and native/cuda.zig
+hunks are CUDA-family wiring this tree does not carry.
+---
+ zig/src/core/engine_api.zig     |  2 ++
+ zig/src/core/lane_host.zig      |  2 +-
+ zig/src/core/lane_host_env.zig  | 11 +++++++++++
+ zig/src/core/lane_host_fill.zig | 10 +++++-----
+ 4 files changed, 19 insertions(+), 6 deletions(-)
+
+diff --git a/zig/src/core/engine_api.zig b/zig/src/core/engine_api.zig
+index 1d0bd4c..52270bf 100644
+--- a/zig/src/core/engine_api.zig
++++ b/zig/src/core/engine_api.zig
+@@ -222,6 +222,8 @@ pub const Info = struct {
+     prompt_cache_plan: ?PromptCachePlan = null,
+     /// --decode-share: the reply's share of a fill step's wall time beside live decoders; null: the engine's default.
+     decode_share: ?f64 = null,
++    /// The family's reply share beside a filling prompt, absent --decode-share and TENSORFOLD_PREFILL_SHARE.
++    family_decode_share: ?f64 = null,
+     /// The engine scores decisions (`score`) and writes no text: the server refuses text requests.
+     decides: bool = false,
+     /// The engine is a reranker (it scores through `score`): the server answers POST /v1/rerank only when set.
+diff --git a/zig/src/core/lane_host.zig b/zig/src/core/lane_host.zig
+index c0cf723..042cf6e 100644
+--- a/zig/src/core/lane_host.zig
++++ b/zig/src/core/lane_host.zig
+@@ -107,7 +107,7 @@ pub const LaneHost = struct {
+     pub fn init(gpa: Allocator, io: std.Io, core: *lanes.Engine, info_: Info) LaneHost {
+         var shown = info_.ofLanes();
+         shown.draft_sources = shown.draft_sources.ofLanes(core.cfg, shown.lanes);
+-        return .{ .gpa = gpa, .io = io, .core = core, .info_ = shown, .share = .withDecode(info_.decode_share), .decode_cap = info_.decode_share != null, .prefix = .fromEnv(), .pressure = .fromEnv(), .srpt = .fromEnv(), .kv = ledger.of(info_) };
++        return .{ .gpa = gpa, .io = io, .core = core, .info_ = shown, .share = .withDecode(info_.decode_share, if (info_.lanes > 1) info_.family_decode_share else null), .decode_cap = info_.decode_share != null, .prefix = .fromEnv(), .pressure = .fromEnv(), .srpt = .fromEnv(), .kv = ledger.of(info_) };
+     }
+ 
+     /// A paged family's pool counts in this host's ledger, the only test its promises pass (#1943); before `start`.
+diff --git a/zig/src/core/lane_host_env.zig b/zig/src/core/lane_host_env.zig
+index 20787fe..0dc8de8 100644
+--- a/zig/src/core/lane_host_env.zig
++++ b/zig/src/core/lane_host_env.zig
+@@ -79,3 +79,14 @@ test "prefill variables: a value its reader would turn into a default is refused
+     try std.testing.expectEqual(Share.default_tokens, Share.tokensOf("2k"));
+     try std.testing.expectEqual(@as(u64, 0), Share.budget("+5"));
+ }
++
++test "a family's decode share applies only when neither --decode-share nor TENSORFOLD_PREFILL_SHARE is set" {
++    const env = @import("sys").env;
++    _ = env.unsetenv("TENSORFOLD_PREFILL_SHARE");
++    try std.testing.expectEqual(@as(f64, 0.5), Share.withDecode(null, 0.5).p);
++    try std.testing.expectEqual(@as(f64, 1), Share.withDecode(null, null).p);
++    try std.testing.expectEqual(@as(f64, 0.75), Share.withDecode(0.25, 0.5).p);
++    _ = env.setenv("TENSORFOLD_PREFILL_SHARE", "0.9", 1);
++    defer _ = env.unsetenv("TENSORFOLD_PREFILL_SHARE");
++    try std.testing.expectEqual(@as(f64, 0.9), Share.withDecode(null, 0.5).p);
++}
+diff --git a/zig/src/core/lane_host_fill.zig b/zig/src/core/lane_host_fill.zig
+index a1253dd..e439888 100644
+--- a/zig/src/core/lane_host_fill.zig
++++ b/zig/src/core/lane_host_fill.zig
+@@ -83,15 +83,15 @@ pub const Share = struct {
+         return .{ .p = @max(1 - x, min_share) };
+     }
+ 
+-    /// The env's share, with --decode-share's p in its place when given; the row budget always comes from the env.
+-    pub fn withDecode(decode_share: ?f64) Share {
+-        var s = fromEnv();
++    /// The env's share, else `family`'s, with --decode-share's p in its place when given; the env sets the row budget.
++    pub fn withDecode(decode_share: ?f64, family: ?f64) Share {
++        var s = fromEnv(family);
+         if (decode_share) |x| s.p = fromDecode(x).p;
+         return s;
+     }
+ 
+-    pub fn fromEnv() Share {
+-        var s: Share = if (std.c.getenv("TENSORFOLD_PREFILL_SHARE")) |text| fromText(std.mem.span(text)) else .{};
++    pub fn fromEnv(family: ?f64) Share {
++        var s: Share = if (std.c.getenv("TENSORFOLD_PREFILL_SHARE")) |text| fromText(std.mem.span(text)) else if (family) |x| fromDecode(x) else .{};
+         if (std.c.getenv("TENSORFOLD_PREFILL_BUDGET")) |text| s.rows = budget(std.mem.span(text));
+         if (std.c.getenv("TENSORFOLD_PREFILL_POLICY")) |text| s.policy = policyOf(std.mem.span(text));
+         if (std.c.getenv("TENSORFOLD_PREFILL_TOKENS")) |text| s.tokens = tokensOf(std.mem.span(text));
+-- 
+2.56.0
+

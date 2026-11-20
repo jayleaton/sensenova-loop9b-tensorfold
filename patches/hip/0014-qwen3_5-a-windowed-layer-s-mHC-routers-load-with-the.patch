@@ -1,0 +1,319 @@
+From 31f452d484bc2eb11fc3a7b881d94627df49cb28 Mon Sep 17 00:00:00 2001
+From: Jay Leaton <58495321+jayleaton@users.noreply.github.com>
+Date: Thu, 19 Nov 2026 18:16:01 +0800
+Subject: [PATCH 14/20] qwen3_5: a windowed layer's mHC routers load with their
+ shapes checked
+
+The HIP loader reads the two fp32 routers every mHC layer carries
+(mhc_attn and mhc_ffn, [outputs, streams * hidden] weights with an
+[outputs] bias each) for the layers the config's window holds, refuses
+one whose shape disagrees with the streams it declares, and carries
+them through the device model, the bridge and the forward's view. A
+layer outside the window, or a model without mHC, loads as before;
+the synthetic dense checkpoint gains a looped variant that exercises
+the read end to end.
+---
+ .../qwen3_5/backend/hip/model/bridge.zig      | 10 ++-
+ .../qwen3_5/backend/hip/model/view.zig        |  5 ++
+ .../qwen3_5/backend/hip/model/weights.zig     | 13 +++
+ .../families/qwen3_5/weights/checkpoint.zig   | 19 +++-
+ .../qwen3_5/weights/checkpoint_test.zig       | 86 ++++++++++++++++++-
+ zig/src/families/qwen3_5/weights/host.zig     |  5 ++
+ 6 files changed, 132 insertions(+), 6 deletions(-)
+
+diff --git a/zig/src/families/qwen3_5/backend/hip/model/bridge.zig b/zig/src/families/qwen3_5/backend/hip/model/bridge.zig
+index fc65975..5beb4c4 100644
+--- a/zig/src/families/qwen3_5/backend/hip/model/bridge.zig
++++ b/zig/src/families/qwen3_5/backend/hip/model/bridge.zig
+@@ -40,6 +40,12 @@ pub fn mlpView(m: weights.Mlp, sliced: bool) Error!view.Mlp {
+     };
+ }
+ 
++/// A windowed layer's uploaded mHC routers, their buffers as the kernels address them.
++fn mhcView(m: ?weights.Mhc) Error!?view.Mhc {
++    const r = m orelse return null;
++    return .{ .attn = r.attn.ptr, .attn_b = r.attn_b.ptr, .ffn = r.ffn.ptr, .ffn_b = r.ffn_b.ptr };
++}
++
+ pub const Bridge = struct {
+     gpa: std.mem.Allocator,
+     layers: []view.Layer,
+@@ -56,8 +62,8 @@ pub const Bridge = struct {
+         b.layers = try gpa.alloc(view.Layer, m.layers.len);
+         errdefer gpa.free(b.layers);
+         for (m.layers, b.layers) |l, *out| out.* = switch (l) {
+-            .full => |f| .{ .full = .{ .input_norm = f.input_norm.ptr, .post_norm = f.post_norm.ptr, .q = try projection(f.q), .k = try projection(f.k), .v = try projection(f.v), .o = try share(f.o, m.sliced), .q_norm = f.q_norm.ptr, .k_norm = f.k_norm.ptr, .mlp = try mlpView(f.mlp, m.sliced) } },
+-            .linear => |x| .{ .linear = .{ .input_norm = x.input_norm.ptr, .post_norm = x.post_norm.ptr, .qkv = try projection(x.qkv), .z = try projection(x.z), .a = try projection(x.a), .b = try projection(x.b), .out = try share(x.out, m.sliced), .conv = x.conv.ptr, .a_log = x.a_log.ptr, .dt_bias = x.dt_bias.ptr, .gnorm = x.gnorm.ptr, .mlp = try mlpView(x.mlp, m.sliced) } },
++            .full => |f| .{ .full = .{ .input_norm = f.input_norm.ptr, .post_norm = f.post_norm.ptr, .q = try projection(f.q), .k = try projection(f.k), .v = try projection(f.v), .o = try share(f.o, m.sliced), .q_norm = f.q_norm.ptr, .k_norm = f.k_norm.ptr, .mlp = try mlpView(f.mlp, m.sliced), .mhc = try mhcView(f.mhc) } },
++            .linear => |x| .{ .linear = .{ .input_norm = x.input_norm.ptr, .post_norm = x.post_norm.ptr, .qkv = try projection(x.qkv), .z = try projection(x.z), .a = try projection(x.a), .b = try projection(x.b), .out = try share(x.out, m.sliced), .conv = x.conv.ptr, .a_log = x.a_log.ptr, .dt_bias = x.dt_bias.ptr, .gnorm = x.gnorm.ptr, .mlp = try mlpView(x.mlp, m.sliced), .mhc = try mhcView(x.mhc) } },
+         };
+         const c = view.qkConstants(s.key_dim, s.eps);
+         const qs = try gpa.alloc(f32, s.key_dim);
+diff --git a/zig/src/families/qwen3_5/backend/hip/model/view.zig b/zig/src/families/qwen3_5/backend/hip/model/view.zig
+index e315ef6..c389dad 100644
+--- a/zig/src/families/qwen3_5/backend/hip/model/view.zig
++++ b/zig/src/families/qwen3_5/backend/hip/model/view.zig
+@@ -33,6 +33,7 @@ pub const Full = struct {
+     q_norm: u64,
+     k_norm: u64,
+     mlp: Mlp,
++    mhc: ?Mhc = null,
+ };
+ 
+ pub const Linear = struct {
+@@ -48,8 +49,12 @@ pub const Linear = struct {
+     dt_bias: u64,
+     gnorm: u64,
+     mlp: Mlp,
++    mhc: ?Mhc = null,
+ };
+ 
++/// A windowed layer's two mHC routers: their fp32 weights and biases as the kernels address them.
++pub const Mhc = struct { attn: u64, attn_b: u64, ffn: u64, ffn_b: u64 };
++
+ pub const Layer = union(enum) { full: Full, linear: Linear };
+ 
+ /// The MTP head: the Qwen3 shape (gated attention, an MLP or experts) with its own or the model's output head.
+diff --git a/zig/src/families/qwen3_5/backend/hip/model/weights.zig b/zig/src/families/qwen3_5/backend/hip/model/weights.zig
+index 86d746d..0c7dc88 100644
+--- a/zig/src/families/qwen3_5/backend/hip/model/weights.zig
++++ b/zig/src/families/qwen3_5/backend/hip/model/weights.zig
+@@ -35,6 +35,9 @@ pub const DenseMlp = struct { gate: Projection, up: Projection, down: Projection
+ 
+ pub const Mlp = union(enum) { dense: DenseMlp, routed: Routed };
+ 
++/// A windowed layer's two mHC routers on the device: fp32 [outputs, streams * hidden] rows and [outputs] biases.
++pub const Mhc = struct { attn: Buf, attn_b: Buf, ffn: Buf, ffn_b: Buf };
++
+ pub const LinearLayer = struct {
+     input_norm: Buf,
+     post_norm: Buf,
+@@ -48,6 +51,7 @@ pub const LinearLayer = struct {
+     gnorm: Buf,
+     out: Projection,
+     mlp: Mlp,
++    mhc: ?Mhc = null,
+ };
+ 
+ pub const FullLayer = struct {
+@@ -60,6 +64,7 @@ pub const FullLayer = struct {
+     q_norm: Buf,
+     k_norm: Buf,
+     mlp: Mlp,
++    mhc: ?Mhc = null,
+ };
+ 
+ pub const Layer = union(enum) { linear: LinearLayer, full: FullLayer };
+@@ -120,6 +125,12 @@ const Uploader = struct {
+     }
+ 
+     fn layer(u: Uploader, l: host.Layer) !Layer {
++        const mhc: ?Mhc = if (l.mhc) |*m| .{
++            .attn = try u.tensor(m.attn),
++            .attn_b = try u.tensor(m.attn_b),
++            .ffn = try u.tensor(m.ffn),
++            .ffn_b = try u.tensor(m.ffn_b),
++        } else null;
+         switch (l.body) {
+             .linear => |x| return .{ .linear = .{
+                 .input_norm = try u.tensor(x.input_norm),
+@@ -134,6 +145,7 @@ const Uploader = struct {
+                 .gnorm = try u.tensor(x.gnorm),
+                 .out = try u.projection(x.out),
+                 .mlp = try u.mlp(x.mlp),
++                .mhc = mhc,
+             } },
+             .full => |x| return .{ .full = .{
+                 .input_norm = try u.tensor(x.input_norm),
+@@ -145,6 +157,7 @@ const Uploader = struct {
+                 .q_norm = try u.tensor(x.q_norm),
+                 .k_norm = try u.tensor(x.k_norm),
+                 .mlp = try u.mlp(x.mlp),
++                .mhc = mhc,
+             } },
+         }
+     }
+diff --git a/zig/src/families/qwen3_5/weights/checkpoint.zig b/zig/src/families/qwen3_5/weights/checkpoint.zig
+index 2a0e947..4f4a5c2 100644
+--- a/zig/src/families/qwen3_5/weights/checkpoint.zig
++++ b/zig/src/families/qwen3_5/weights/checkpoint.zig
+@@ -128,6 +128,7 @@ pub const Checkpoint = struct {
+         const input_norm = try norm(a, t, projection.join(&scratch, &.{ base, "input_layernorm.weight" }));
+         const post_norm = try norm(a, t, projection.join(&scratch, &.{ base, "post_attention_layernorm.weight" }));
+         const mlp = try readMlp(a, t, projection.join(&scratch, &.{ base, "mlp." }), s);
++        const mhc: ?host.Mhc = if (s.mhc) |m| if (m.holds(index)) try routers(a, t, base, m, s) else null else null;
+         if (s.full(index)) {
+             const attn = projection.join(&scratch, &.{ base, "self_attn." });
+             const body: host.Body = .{ .full = .{
+@@ -141,7 +142,7 @@ pub const Checkpoint = struct {
+                 .k_norm = try subNorm(a, t, attn, "k_norm.weight"),
+                 .mlp = mlp,
+             } };
+-            return .{ .arena = arena, .body = body };
++            return .{ .arena = arena, .body = body, .mhc = mhc };
+         }
+         const lin = projection.join(&scratch, &.{ base, "linear_attn." });
+         // the arena is copied into the result last: allocations made after the copy would be lost
+@@ -159,7 +160,7 @@ pub const Checkpoint = struct {
+             .out = try sub(a, t, lin, "out_proj"),
+             .mlp = mlp,
+         } };
+-        return .{ .arena = arena, .body = body };
++        return .{ .arena = arena, .body = body, .mhc = mhc };
+     }
+ 
+     /// The MTP layer from `mtp*.safetensors` or the model's own shards; null when absent.
+@@ -204,6 +205,20 @@ fn subFloat(a: std.mem.Allocator, t: *const Table, base: []const u8, name: []con
+     return projection.float(a, t, projection.join(&buf, &.{ base, name }));
+ }
+ 
++/// A windowed layer's two mHC routers under its own prefix: fp32 [outputs, streams * hidden] rows and [outputs] biases.
++fn routers(a: std.mem.Allocator, t: *const Table, base: []const u8, m: @import("../loop_plan.zig").Mhc, s: config.Spec) !host.Mhc {
++    const k = m.streams * s.hidden;
++    const attn = try subFloat(a, t, base, "mhc_attn.weight");
++    if (attn.dtype != .f32 or attn.rank != 2 or attn.dim(0) != m.outputs() or attn.dim(1) != k) return error.UnexpectedTensor;
++    const attn_b = try subFloat(a, t, base, "mhc_attn.bias");
++    if (attn_b.dtype != .f32 or attn_b.rank != 1 or attn_b.dim(0) != m.outputs()) return error.UnexpectedTensor;
++    const ffn = try subFloat(a, t, base, "mhc_ffn.weight");
++    if (ffn.dtype != .f32 or ffn.rank != 2 or ffn.dim(0) != m.outputs() or ffn.dim(1) != k) return error.UnexpectedTensor;
++    const ffn_b = try subFloat(a, t, base, "mhc_ffn.bias");
++    if (ffn_b.dtype != .f32 or ffn_b.rank != 1 or ffn_b.dim(0) != m.outputs()) return error.UnexpectedTensor;
++    return .{ .attn = attn, .attn_b = attn_b, .ffn = ffn, .ffn_b = ffn_b };
++}
++
+ /// A trunk RMS weight by its role: torch's `1 + w` in a bf16 checkpoint (stored centred), else as stored.
+ fn norm(a: std.mem.Allocator, t: *const Table, key: []const u8) !Tensor {
+     return if (t.quant == .bf16) projection.centred(a, t, key) else projection.float(a, t, key);
+diff --git a/zig/src/families/qwen3_5/weights/checkpoint_test.zig b/zig/src/families/qwen3_5/weights/checkpoint_test.zig
+index b33d8ed..e931124 100644
+--- a/zig/src/families/qwen3_5/weights/checkpoint_test.zig
++++ b/zig/src/families/qwen3_5/weights/checkpoint_test.zig
+@@ -217,8 +217,8 @@ fn trunk(m: *Image) !void {
+     try m.put(L ++ "norm.weight", "BF16", &.{64});
+ }
+ 
+-/// The dense test model: a linear layer, a full one, the vision tower to skip and the MTP head in a side file.
+-fn denseFiles(img: *Image, side: *Image, dir: std.Io.Dir) !void {
++/// The dense test model's tensors: two layers, a vision tower to skip and the MTP head in a side file.
++fn denseTensors(img: *Image, side: *Image) !void {
+     try trunk(img);
+     try norms(img, L ++ "layers.0.");
+     const lin = L ++ "layers.0.linear_attn.";
+@@ -249,12 +249,94 @@ fn denseFiles(img: *Image, side: *Image, dir: std.Io.Dir) !void {
+     try side.affine("mtp.layers.0.mlp.gate_proj", 32, 64, 4, 32);
+     try side.affine("mtp.layers.0.mlp.up_proj", 32, 64, 4, 32);
+     try side.affine("mtp.layers.0.mlp.down_proj", 64, 32, 4, 32);
++}
+ 
++fn denseFiles(img: *Image, side: *Image, dir: std.Io.Dir) !void {
++    try denseTensors(img, side);
+     try img.write(dir, "model.safetensors");
+     try side.write(dir, "mtp.safetensors");
+     try dir.writeFile(io, .{ .sub_path = "config.json", .data = dense_config });
+ }
+ 
++const looped_config =
++    \\{"model_type": "sensenova_loop", "tie_word_embeddings": true,
++    \\ "quantization": {"group_size": 32, "bits": 4, "mode": "affine"},
++    \\ "loop_settings": {"start": 0, "end": 2, "eval_count": 2, "counts": [2]},
++    \\ "mhc": {"start": 0, "end": 2, "streams": 2, "iterations": 2},
++    \\ "text_config": {"hidden_size": 64, "intermediate_size": 32, "num_hidden_layers": 2,
++    \\  "num_attention_heads": 2, "num_key_value_heads": 1, "head_dim": 32, "linear_num_key_heads": 1,
++    \\  "linear_num_value_heads": 2, "linear_key_head_dim": 32, "linear_value_head_dim": 16,
++    \\  "linear_conv_kernel_dim": 4, "vocab_size": 16, "full_attention_interval": 2,
++    \\  "layer_types": ["linear_attention", "full_attention"], "eos_token_id": 1}}
++;
++
++/// The dense two-layer model with both layers inside a two-stream window: a 4-execution looped checkpoint.
++fn loopedFiles(img: *Image, dir: std.Io.Dir) !void {
++    var side = Image.init();
++    defer side.deinit();
++    try denseTensors(img, &side);
++    var buf: [160]u8 = undefined;
++    inline for (.{ "layers.0.", "layers.1." }) |l| for ([_][]const u8{ "mhc_attn", "mhc_ffn" }) |site| {
++        try img.put(try std.fmt.bufPrint(&buf, "{s}{s}{s}.weight", .{ L, l, site }), "F32", &.{ 8, 128 });
++        try img.put(try std.fmt.bufPrint(&buf, "{s}{s}{s}.bias", .{ L, l, site }), "F32", &.{8});
++    };
++    try img.write(dir, "model.safetensors");
++    try dir.writeFile(io, .{ .sub_path = "config.json", .data = looped_config });
++}
++
++test "a looped model's mHC routers load as the window's own fp32 tensors" {
++    var img = Image.init();
++    defer img.deinit();
++    var tmp = std.testing.tmpDir(.{});
++    defer tmp.cleanup();
++    try loopedFiles(&img, tmp.dir);
++    const root = try std.fmt.allocPrint(gpa, ".zig-cache/tmp/{s}", .{tmp.sub_path});
++    defer gpa.free(root);
++
++    var ck = try checkpoint.Checkpoint.open(gpa, io, root);
++    defer ck.close();
++    const plan = @import("../loop_plan.zig");
++    try std.testing.expectEqual(@as(usize, 4), plan.steps(ck.spec()));
++    try std.testing.expectEqual(@as(usize, 2), ck.spec().mhc.?.streams);
++    var buf: [160]u8 = undefined;
++    for (0..2) |i| {
++        var layer = try ck.layer(i);
++        defer layer.deinit();
++        const m = layer.mhc.?;
++        try std.testing.expect(m.attn.is(.f32, &.{ 8, 128 }));
++        try std.testing.expect(m.ffn.is(.f32, &.{ 8, 128 }));
++        try std.testing.expect(m.attn_b.is(.f32, &.{8}));
++        try std.testing.expect(m.ffn_b.is(.f32, &.{8}));
++        try std.testing.expectEqualSlices(u8, img.find(try std.fmt.bufPrint(&buf, "{s}layers.{d}.mhc_attn.weight", .{ L, i })), m.attn.bytes);
++    }
++}
++
++test "a windowed layer is refused when one of its routers has a wrong shape" {
++    var shaped = Image.init();
++    defer shaped.deinit();
++    var tmp = std.testing.tmpDir(.{});
++    defer tmp.cleanup();
++    try loopedFiles(&shaped, tmp.dir);
++    var buf: [160]u8 = undefined;
++    const name = try std.fmt.bufPrint(&buf, "{s}layers.0.mhc_attn.weight", .{L});
++    for (shaped.entries.items) |*e| {
++        if (std.mem.eql(u8, e.name, name)) {
++            const a = shaped.arena.allocator();
++            e.shape = try a.dupe(usize, &.{ 6, 128 });
++            e.bytes = try a.alloc(u8, 6 * 128 * 4);
++        }
++    }
++    try shaped.write(tmp.dir, "model.safetensors");
++    const root = try std.fmt.allocPrint(gpa, ".zig-cache/tmp/{s}", .{tmp.sub_path});
++    defer gpa.free(root);
++    var ck = try checkpoint.Checkpoint.open(gpa, io, root);
++    defer ck.close();
++    try std.testing.expectError(error.UnexpectedTensor, ck.layer(0));
++    var good = try ck.layer(1);
++    defer good.deinit();
++    try std.testing.expect(good.mhc != null); // the other windowed layer's routers keep their shape
++}
++
+ test "a dense model: layers, embedding, tied head and the MTP side file" {
+     var img = Image.init();
+     defer img.deinit();
+diff --git a/zig/src/families/qwen3_5/weights/host.zig b/zig/src/families/qwen3_5/weights/host.zig
+index f2d2f8d..b0005c7 100644
+--- a/zig/src/families/qwen3_5/weights/host.zig
++++ b/zig/src/families/qwen3_5/weights/host.zig
+@@ -47,10 +47,15 @@ pub const Full = struct {
+ 
+ pub const Body = union(enum) { linear: Linear, full: Full };
+ 
++/// A layer's two mHC routers: fp32 [outputs, streams * hidden] weights and [outputs] biases.
++pub const Mhc = struct { attn: Tensor, attn_b: Tensor, ffn: Tensor, ffn_b: Tensor };
++
+ /// One layer's tensors; `arena` holds what was converted or stacked, the rest points into the mapped files.
+ pub const Layer = struct {
+     arena: std.heap.ArenaAllocator,
+     body: Body,
++    /// The mHC routers of a layer inside the streams' window (null: a layer without hyper-connections).
++    mhc: ?Mhc = null,
+ 
+     pub fn deinit(l: *Layer) void {
+         l.arena.deinit();
+-- 
+2.56.0
+

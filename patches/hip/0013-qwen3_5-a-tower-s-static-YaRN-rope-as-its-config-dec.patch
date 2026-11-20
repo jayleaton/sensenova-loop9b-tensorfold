@@ -1,0 +1,199 @@
+From 1116cfa07b8943ff9e792336e7ff54f1d1d79e72 Mon Sep 17 00:00:00 2001
+From: Jay Leaton <58495321+jayleaton@users.noreply.github.com>
+Date: Thu, 19 Nov 2026 18:09:44 +0800
+Subject: [PATCH 13/20] qwen3_5: a tower's static YaRN rope, as its config
+ declares it
+
+The HIP path read every checkpoint as plain rope and refused a scaled
+one. SenseNova-Loop declares YaRN factor 2.0 over the trained 262,144
+(a 524,288-position window), so the shared Spec now carries the rope
+its config names: rope.zig resolves the tower's rope_parameters or
+legacy rope_scaling, keeps plain rope within the trained window as
+before, and builds the YaRN table transformers computes (the attention
+factor, then 32 frequencies, from core/rope_yarn.zig) for a yarn block
+whose factor and original window name the ceiling exactly. A block
+with transformers' own defaults only: mscale, attention_factor, or a
+non-default beta is refused, as the CUDA path's resolution refuses it.
+
+The Metal 2B admission keeps its own rope rule; the standalone config
+test module gains the core import rope.zig reads.
+---
+ zig/build/cuda_family_host.zig      |   2 +-
+ zig/src/families/qwen3_5/config.zig |   6 +-
+ zig/src/families/qwen3_5/hip.zig    |   1 +
+ zig/src/families/qwen3_5/rope.zig   | 114 ++++++++++++++++++++++++++++
+ 4 files changed, 119 insertions(+), 4 deletions(-)
+ create mode 100644 zig/src/families/qwen3_5/rope.zig
+
+diff --git a/zig/build/cuda_family_host.zig b/zig/build/cuda_family_host.zig
+index f96afd6..2e9d768 100644
+--- a/zig/build/cuda_family_host.zig
++++ b/zig/build/cuda_family_host.zig
+@@ -4,7 +4,7 @@ const std = @import("std");
+ pub fn steps(b: *std.Build, cuda: *std.Build.Module, mods: anytype, step: *std.Build.Step) void {
+     const host = b.graph.host;
+     @import("prefill_widths_cuda.zig").tests(b, cuda, mods, step);
+-    const metal_scope = b.addRunArtifact(b.addTest(.{ .root_module = b.createModule(.{ .root_source_file = b.path("zig/src/families/qwen3_5/config.zig"), .target = host }), .filters = &.{ "Metal 2B format scope:", "admit the affine 2B", "admit untied heads" } }));
++    const metal_scope = b.addRunArtifact(b.addTest(.{ .root_module = b.createModule(.{ .root_source_file = b.path("zig/src/families/qwen3_5/config.zig"), .target = host, .link_libc = true, .imports = &.{.{ .name = "core", .module = b.createModule(.{ .root_source_file = b.path("zig/src/core/root.zig"), .target = host, .link_libc = true }) }} }), .filters = &.{ "Metal 2B format scope:", "admit the affine 2B", "admit untied heads" } }));
+     b.step("test-qwen35-metal-scope-host", "Metal 2B format admission without device or Metal compiler").dependOn(&metal_scope.step);
+     @import("load_prefetch_host.zig").tests(b, mods.core, step);
+     const captured = b.addRunArtifact(b.addTest(.{ .root_module = b.createModule(.{ .root_source_file = b.path("zig/src/cuda/aot_identity.zig"), .target = host, .link_libc = true }), .filters = &.{"persistence identity: captured CUDA"} }));
+diff --git a/zig/src/families/qwen3_5/config.zig b/zig/src/families/qwen3_5/config.zig
+index 5d398c8..ab3b925 100644
+--- a/zig/src/families/qwen3_5/config.zig
++++ b/zig/src/families/qwen3_5/config.zig
+@@ -290,6 +290,8 @@ pub const Spec = struct {
+     full_layers: [checks.max_layers]bool = @splat(false),
+     mrope: checks.Mrope = .{},
+     max_position: usize = 262144,
++    /// The static YaRN the config declares, with the table its rope kernels read (null: plain rope).
++    yarn: ?@import("rope.zig").Yarn = null,
+     /// The loop that repeats a range of physical layers; a looped forward runs `loop_plan.steps` executions.
+     loop: @import("loop_plan.zig").Loop = .{},
+     /// Manifold-constrained streams over one loop phase, with their router's settings.
+@@ -383,9 +385,7 @@ pub fn geometry(tower: std.json.ObjectMap, bits: u8, group_size: u16) Error!Spec
+     try checks.products(.{ .hidden = spec.hidden, .intermediate = spec.intermediate, .vocab = spec.vocab, .heads = spec.heads, .kv_heads = spec.kv_heads, .head_dim = spec.head_dim, .key_heads = spec.key_heads, .value_heads = spec.value_heads, .key_dim = spec.key_dim, .value_dim = spec.value_dim, .conv = spec.conv, .experts = spec.experts, .moe_width = spec.moe_width, .shared_width = spec.shared_width });
+     try checks.layers(&spec.full_layers, tower, spec.n_layers);
+     spec.mrope = try checks.mrope(rope, rotary);
+-    try checks.defaultRope(tower, rope);
+-    spec.max_position = try checks.maxPosition(tower);
+-    if (spec.max_position > 262144) return error.InvalidConfig; // past the trained window only with scaled rope
++    try @import("rope.zig").resolve(&spec, tower, rope);
+     return spec;
+ }
+ 
+diff --git a/zig/src/families/qwen3_5/hip.zig b/zig/src/families/qwen3_5/hip.zig
+index c828214..e3d6b06 100644
+--- a/zig/src/families/qwen3_5/hip.zig
++++ b/zig/src/families/qwen3_5/hip.zig
+@@ -43,6 +43,7 @@ pub const native_moe = native_engine.Native("qwen3_5_moe");
+ test {
+     _ = config;
+     _ = @import("loop_plan.zig");
++    _ = @import("rope.zig");
+     _ = table;
+     _ = @import("weights/shard.zig");
+     _ = @import("weights/projection.zig");
+diff --git a/zig/src/families/qwen3_5/rope.zig b/zig/src/families/qwen3_5/rope.zig
+new file mode 100644
+index 0000000..a5ee744
+--- /dev/null
++++ b/zig/src/families/qwen3_5/rope.zig
+@@ -0,0 +1,114 @@
++//! A Qwen text tower's rope: plain within its trained window, or the static YaRN its config declares.
++
++const std = @import("std");
++const config = @import("config.zig");
++const checks = config.checks;
++const rope_config = @import("rope_config");
++const rope_yarn = @import("core").rope_yarn;
++
++/// A static YaRN: its factor and trained window, with the table the rope kernels read.
++pub const Yarn = struct {
++    factor: f64,
++    trained: usize,
++    /// The attention factor, then 32 frequencies: what the rope kernels read.
++    table: [33]f32,
++};
++
++/// The tower's rope and window: plain rope stays within the trained 262,144, a yarn block names factor and window.
++pub fn resolve(spec: *config.Spec, tower: std.json.ObjectMap, rope: std.json.ObjectMap) config.Error!void {
++    if (rope_config.scaled(tower, rope) == null) {
++        spec.max_position = try checks.maxPosition(tower);
++        if (spec.max_position > 262144) return error.InvalidConfig; // past the trained window only with scaled rope
++        return;
++    }
++    const from = rope_config.block(tower, rope) catch return error.InvalidRotary;
++    const kind = from.map.get("rope_type") orelse from.map.get("type") orelse return error.InvalidRotary;
++    if (kind != .string or !std.mem.eql(u8, kind.string, "yarn")) return error.InvalidRotary;
++    // transformers' own defaults: anything else in the block changes the table this engine does not compute
++    for ([_][]const u8{ "mscale", "mscale_all_dim", "attention_factor" }) |key| if (from.map.get(key)) |v| if (v != .null) return error.InvalidRotary;
++    for ([_]struct { []const u8, f64 }{ .{ "beta_fast", 32 }, .{ "beta_slow", 1 } }) |b| if (from.map.get(b[0])) |v| {
++        if (v != .null and (try number(v)) != b[1]) return error.InvalidRotary;
++    };
++    if (from.map.get("truncate")) |v| if (v != .null and !(v == .bool and v.bool)) return error.InvalidRotary;
++    const factor = try number(from.map.get("factor") orelse return error.InvalidRotary);
++    if (!std.math.isFinite(factor) or !(factor > 1)) return error.InvalidRotary;
++    const trained = try positive(from.map, "original_max_position_embeddings");
++    const ceiling = try checks.maxPosition(tower);
++    if (@as(f64, @floatFromInt(trained)) * factor != @as(f64, @floatFromInt(ceiling))) return error.InvalidRotary;
++    spec.max_position = ceiling;
++    const y = rope_yarn.yarn(spec.rope_theta, factor, trained);
++    spec.yarn = .{ .factor = factor, .trained = trained, .table = .{y.scale} ++ y.freq };
++}
++
++fn number(v: std.json.Value) config.Error!f64 {
++    return switch (v) {
++        .integer => |i| @floatFromInt(i),
++        .float => |f| f,
++        else => error.InvalidRotary,
++    };
++}
++
++fn positive(o: std.json.ObjectMap, key: []const u8) config.Error!usize {
++    const v = o.get(key) orelse return error.InvalidRotary;
++    if (v != .integer or v.integer < 1 or v.integer > std.math.maxInt(u32)) return error.InvalidRotary;
++    return @intCast(v.integer);
++}
++
++const sensenova =
++    \\{"hidden_size": 4096, "intermediate_size": 12288, "num_hidden_layers": 8,
++    \\ "num_attention_heads": 16, "num_key_value_heads": 4, "head_dim": 256,
++    \\ "linear_num_key_heads": 16, "linear_num_value_heads": 32, "linear_key_head_dim": 128,
++    \\ "linear_value_head_dim": 128, "linear_conv_kernel_dim": 4, "vocab_size": 248320,
++    \\ "rms_norm_eps": 1e-06, "full_attention_interval": 4, "max_position_embeddings": 524288,
++    \\ "rope_parameters": {"rope_type": "yarn", "factor": 2.0, "original_max_position_embeddings": 262144,
++    \\  "rope_theta": 10000000, "partial_rotary_factor": 0.25, "mrope_interleaved": true, "mrope_section": [11, 11, 10]}}
++;
++
++fn specOf(a: std.mem.Allocator, text: []const u8) !config.Spec {
++    const doc = try std.json.parseFromSliceLeaky(std.json.Value, a, text, .{});
++    return try config.geometry(doc.object, 4, 64);
++}
++
++test "a yarn block resolves its factor, its window and transformers' exact table" {
++    var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
++    defer arena.deinit();
++    const a = arena.allocator();
++    const spec = try specOf(a, sensenova);
++    try std.testing.expectEqual(@as(usize, 524288), spec.max_position);
++    const y = spec.yarn.?;
++    try std.testing.expectEqual(@as(f64, 2), y.factor);
++    try std.testing.expectEqual(@as(usize, 262144), y.trained);
++    const table = rope_yarn.yarn(10000000, 2, 262144);
++    try std.testing.expectEqual(table.scale, y.table[0]);
++    try std.testing.expectEqualSlices(f32, &table.freq, y.table[1..]);
++    try std.testing.expectEqual(@as(f32, @floatCast(0.1 * @log(2.0) + 1)), y.table[0]);
++}
++
++test "plain rope keeps its trained window, and a yarn block without its fields is refused" {
++    var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
++    defer arena.deinit();
++    const a = arena.allocator();
++    const plain = try std.mem.replaceOwned(u8, a, sensenova, "\"rope_type\": \"yarn\", \"factor\": 2.0, \"original_max_position_embeddings\": 262144,", "");
++    // plain rope with the window a yarn block would have allowed: past the trained window, refused as before
++    try std.testing.expectError(error.InvalidConfig, specOf(a, plain));
++    const over = try std.mem.replaceOwned(u8, a, plain, "\"max_position_embeddings\": 524288,", "");
++    const within = try specOf(a, over);
++    try std.testing.expect(within.yarn == null);
++    try std.testing.expectEqual(@as(usize, 262144), within.max_position);
++    const cases = [_]struct { []const u8, []const u8, anyerror }{
++        .{ "\"factor\": 2.0", "\"factor\": 1.0", error.InvalidRotary },
++        .{ "\"factor\": 2.0", "\"factor\": 2.5", error.InvalidRotary },
++        .{ "\"original_max_position_embeddings\": 262144", "\"original_max_position_embeddings\": 131072", error.InvalidRotary },
++        .{ "\"rope_type\": \"yarn\", \"factor\": 2.0", "\"rope_type\": \"yarn\", \"attention_factor\": 1.25, \"factor\": 2.0", error.InvalidRotary },
++        .{ "\"rope_type\": \"yarn\", \"factor\": 2.0", "\"rope_type\": \"yarn\", \"beta_fast\": 16, \"factor\": 2.0", error.InvalidRotary },
++        .{ "\"rope_type\": \"yarn\", \"factor\": 2.0", "\"rope_type\": \"yarn\", \"truncate\": false, \"factor\": 2.0", error.InvalidRotary },
++        .{ "\"rope_type\": \"yarn\"", "\"rope_type\": \"longrope\"", error.InvalidRotary },
++    };
++    for (cases) |c| {
++        const bad = try std.mem.replaceOwned(u8, a, sensenova, c[0], c[1]);
++        try std.testing.expectError(c[2], specOf(a, bad));
++    }
++    // the ceiling a yarn block names without the fields that pin it down
++    const bare = try std.mem.replaceOwned(u8, a, sensenova, "\"original_max_position_embeddings\": 262144,", "");
++    try std.testing.expectError(error.InvalidRotary, specOf(a, bare));
++}
+-- 
+2.56.0
+
