@@ -69,25 +69,45 @@ That one command pulls the whole ROCm 7.2.4 stack above (`rocm-llvm` alone is 7.
 TensorFold already lists `gfx1103` with the RDNA3 chips. Do **not** set `HSA_OVERRIDE_GFX_VERSION`; it was never set
 on the tested machine. The engine refuses to start if the GPU it finds differs from the build's `-Dhip-arch`.
 
-### 2. GPU memory: the TTM limit
+### 2. GPU memory: keep GTT below the carve-out
+
+> **Warning: do not raise GTT above the UMA carve-out.** On the Ally X with the 8 GB carve-out, a TTM limit of 16 GiB
+> (`ttm.pages_limit=4194304`) brought GTT up at 15.3 GiB, larger than the carve-out. The engine then budgets from host
+> memory, its buffers land in GTT, and the GPU **hangs under load**: 3 GPU resets (`MES failed to respond to
+> msg=REMOVE_QUEUE`) in 5 minutes on a clean boot. With both TTM values at **1966080** (GTT 7.5 GiB, below the
+> carve-out) the engine stays in the carve-out and **38 requests ran with 0 hangs**.
 
 The 780M has no memory of its own. The BIOS's UMA setting reserves a carve-out the driver reports as VRAM (8 GB here,
-left at that), and the rest of system memory is reachable as GTT, which the kernel's TTM limit caps at about half of
-RAM (7.65 GiB here). The recipe raised the TTM limit to 16 GiB:
+left at that), and the rest of system memory is reachable as GTT, which the kernel's TTM limit caps (7.65 GiB here by
+default). The engine's HIP admission budgets from the carve-out only while GTT is smaller than it; once GTT is larger,
+it budgets from host memory and allocates in GTT. Keep GTT below the carve-out:
 
 ```
-ttm.pages_limit=4194304 ttm.page_pool_size=4194304        # 4194304 pages of 4 KiB = 16 GiB
+ttm.pages_limit=1966080 ttm.page_pool_size=1966080        # 1966080 pages of 4 KiB = 7.5 GiB, below the 8 GB carve-out
 ```
+
+The kernel default (7.65 GiB here) is also below the carve-out, so leaving the TTM limit alone works too. Set the
+values explicitly if your kernel's default could exceed the carve-out.
+
+| TTM limit (both values) | GTT | where the engine allocates | result under load |
+| --- | --- | --- | --- |
+| `4194304` (16 GiB) | 15.3 GiB | GTT (`mem_info_gtt_used` 73 MiB to 5.9 GiB at load, VRAM about 0.57 GiB) | 3 GPU resets in 5 minutes, after 6, then 3, then 0 long prefills |
+| `1966080` (7.5 GiB) | 7.5 GiB | the carve-out (`mem_info_vram_used` 6.3 GiB, GTT idle) | 38 requests, 0 hangs; 23 at prompts of 1.5K tokens or more (12 at 4,395 tokens, 6 at 7,257), no MES lines in the kernel log |
+
+Those runs used the same HIP engine with the stock Qwen3.5-9B 4-bit tree at `--context 8192 --parallel 1
+--prompt-cache-gib 0`. `HSA_ENABLE_SDMA=0` still hung, and so did a smaller prompt step (`TF_POLICY=prefill_step=256`).
+Only this device, ROCm 7.2.4 and kernel `7.2.15` were tested; machines with a minimal carve-out, where the model
+must live in GTT, were not.
 
 **On a Limine + UKI boot (Omarchy), `/etc/kernel/cmdline` is ignored.** `limine-entry-tool` builds the kernel command
 line from `KERNEL_CMDLINE[...]` in `/etc/default/limine` and `/etc/limine-entry-tool.d/*.conf`, and reads
 `/etc/kernel/cmdline` only when `KERNEL_CMDLINE` is unset, which Omarchy's `/etc/default/limine` never leaves it.
-The first attempt appended the values to `/etc/kernel/cmdline` and ran `mkinitcpio -P`; `mkinitcpio` warned that it
+A first attempt appended the values to `/etc/kernel/cmdline` and ran `mkinitcpio -P`; `mkinitcpio` warned that it
 does not update Limine's entries, and the boot entry never carried them. What works is a drop-in and
 `limine-mkinitcpio`:
 
 ```bash
-echo 'KERNEL_CMDLINE[default]+=" ttm.pages_limit=4194304 ttm.page_pool_size=4194304"' |
+echo 'KERNEL_CMDLINE[default]+=" ttm.pages_limit=1966080 ttm.page_pool_size=1966080"' |
   sudo tee /etc/limine-entry-tool.d/ttm.conf
 sudo limine-mkinitcpio
 sudo /usr/lib/limine/limine-entry-tool --get-cmdline | grep -o 'ttm[^ ]*'   # both values, before you reboot
@@ -97,21 +117,19 @@ After a reboot:
 
 ```bash
 grep -o 'ttm[^ ]*' /proc/cmdline
-cat /sys/module/ttm/parameters/pages_limit /sys/module/ttm/parameters/page_pool_size    # 4194304 4194304
-cat /sys/class/drm/card*/device/mem_info_gtt_total
+cat /sys/module/ttm/parameters/pages_limit /sys/module/ttm/parameters/page_pool_size    # 1966080 1966080
+cat /sys/class/drm/card*/device/mem_info_gtt_total /sys/class/drm/card*/device/mem_info_vram_total   # GTT below VRAM
 ```
 
 | setting | state |
 | --- | --- |
-| `ttm.pages_limit=4194304`, `ttm.page_pool_size=4194304` on the boot command line | verified after a reboot |
-| `/sys/module/ttm/parameters/pages_limit` and `page_pool_size` | 4194304 each, verified after a reboot |
-| GTT total | 15,674 MiB after a reboot, not 16 GiB: `amdgpu` caps GTT at the memory Linux sees (15.3 GiB beside the 8 GB carve-out) |
+| `ttm.pages_limit=1966080`, `ttm.page_pool_size=1966080` on the boot command line | verified after a reboot |
+| GTT total | 7.5 GiB, below the 8 GB carve-out, verified after a reboot |
+| the engine's budget | the carve-out branch (`mem_info_vram_used` 6.3 GiB under load, GTT idle) |
 | UMA carve-out | 8 GB, unchanged; no `amdgpu.*` parameters |
 
-**The numbers above did not use GTT.** They were measured before that reboot, with the limit raised at runtime
-(`echo 4194304 | sudo tee /sys/module/ttm/parameters/pages_limit page_pool_size`), and the engine budgeted from the
-8 GB carve-out (the banner's `firmware VRAM carve-out` line). Serving from GTT, and any window past what the carve-out
-holds, has not run.
+**The SenseNova numbers above ran inside the carve-out** (the banner's `firmware VRAM carve-out` line): the limit had
+been raised at runtime that day, but GTT stayed at its boot size (7.65 GiB), below the carve-out, so they stand. SenseNova itself has not yet been served on the 1966080 boot.
 
 ### 3. Zig and the engine
 
@@ -224,9 +242,9 @@ in this series.
 
 ## What is not tested
 
-- **Serving after the reboot, and from GTT.** The TTM limit is live after a reboot, but no GPU job has run on that
-  layout yet (the serve check after the reboot is pending); every number here used the 8 GB carve-out. Windows past
-  8,192 tokens, more than one stream and other carve-out sizes are untested.
+- **Serving from GTT hangs the GPU** ([above](#2-gpu-memory-keep-gtt-below-the-carve-out)); keep GTT below the carve-out.
+  SenseNova has not yet been served on the 1966080 boot (pending). Windows past 8,192 tokens, more than one stream and
+  other carve-out sizes are untested.
 - **Other AMD GPUs.** Only the 780M (`gfx1103`). Other RDNA3 iGPUs (the 760M, the 890M's `gfx1150`) and discrete
   cards need their own `HIP_ARCH` and have not run.
 - **The prompt cache, tool calls, images and drafters.** The prompt cache hung the GPU; tool calls need

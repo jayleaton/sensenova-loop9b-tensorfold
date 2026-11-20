@@ -44,7 +44,7 @@ Each row is a recipe that was built and run end to end. Every build checks the e
 | **16 GB Mac** (M-series) | the same 4-bit tree, 5.07 GB | `metal` | 58 tok/s decode; 2,719 tok/s prefill at 8k; peak 7.60 / 7.82 / 9.13 GiB at 4k / 8k / 32k | same tree as the Studio | measured under a 16 GB working-set cap on the M5 Ultra; 8 GB Macs not supported |
 | **MacBook Pro M4 Pro** (24 GB) | the same 4-bit tree | `metal` | 26.7 tok/s decode; prefill about 230 tok/s (32k prompt: 166 s to first token) | same tree as the Studio | slow prefill on long prompts; quality not separately measured |
 | **RTX 5070 Ti 16 GB** (WSL2) | EXL3 `sn-6.0` (8.29 GB); `sn-4.0` for speed | `rtx`: pin `038e4a278` + `patches/cuda` `0001`-`0022` + `patches/rtx` `0001`-`0002` | `sn-6.0` 44-47 tok/s at 4k, 39-44 at 32k, prefill 2,232 tok/s; copy drafts re-quote 660, code 534 tok/s; host prompt cache restores 109K tokens in 4.5 s (30x) | gate cosine 0.99931, top-1 290/298; 36/36 tool calls; 30-minute soak, 0 failures | no live KV in host RAM (212,992-token fp8 window); native Windows untested |
-| **ROG Ally X** (Ryzen Z1 Extreme, Radeon 780M, 8 GB UMA carve-out) | the Metal 4-bit tree, text only | `hip`: pin `813ff4ccb` + `patches/hip` `0001`-`0018` | decode 10.8 tok/s short, 10.2 / 10.0 / 9.8 at 4.8K / 6.5K / 7.4K prompts; prefill about 200 tok/s | serve_check 11 ok, every exactness check; 3 vacuous fails (no drafter, cache off); mHC kernels pass their FP64 contract | one 8,192-token stream; prompt cache off (it hung the GPU); no tool calls or images; other AMD GPUs untested |
+| **ROG Ally X** (Ryzen Z1 Extreme, Radeon 780M, 8 GB UMA carve-out) | the Metal 4-bit tree, text only | `hip`: pin `813ff4ccb` + `patches/hip` `0001`-`0018` | decode 10.8 tok/s short, 10.2 / 10.0 / 9.8 at 4.8K / 6.5K / 7.4K prompts; prefill about 200 tok/s | serve_check 11 ok, every exactness check; 3 vacuous fails (no drafter, cache off); mHC kernels pass their FP64 contract | one 8,192-token stream; GTT above the carve-out hangs the GPU; prompt cache off (it hung the GPU); no tool calls or images; other AMD GPUs untested |
 
 **DGX Spark** ([CUDA](docs/CUDA.md)), CUDA 13 toolkit and Zig 0.17.0:
 
@@ -79,7 +79,7 @@ scripts/serve.sh rtx engine-rtx sn-6.0                       # --parallel 1 --kv
 **ROG Ally X** ([HIP](docs/HIP.md), the full setup from a fresh Arch install), ROCm 7.2.4 and Zig 0.17.0:
 
 ```bash
-sudo pacman -Sy --needed rocm-hip-sdk rocminfo               # then the TTM limit: docs/HIP.md#2-gpu-memory-the-ttm-limit
+sudo pacman -Sy --needed rocm-hip-sdk rocminfo               # keep GTT below the carve-out: docs/HIP.md#2-gpu-memory-keep-gtt-below-the-carve-out
 scripts/build-engine.sh hip engine-hip                       # -Dhip-arch=gfx1103, Arch's device-lib path
 hf download jayleaton/SenseNova-Loop-9B-MLX-4bit --local-dir loop9b-mlx4
 scripts/serve.sh hip engine-hip loop9b-mlx4                  # --context 8192 --parallel 1 --prompt-cache-gib 0

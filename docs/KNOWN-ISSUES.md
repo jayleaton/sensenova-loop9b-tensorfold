@@ -45,6 +45,12 @@
 
 ## HIP
 
+- **GTT above the carve-out hangs the GPU.** With `ttm.pages_limit=4194304` GTT came up at 15.3 GiB, larger than the
+  8 GB carve-out; the engine then allocates in GTT, and the 780M hung 3 times in 5 minutes under load (`MES failed to
+  respond to msg=REMOVE_QUEUE`, then a MODE2 reset). With `ttm.pages_limit=ttm.page_pool_size=1966080` (GTT 7.5 GiB)
+  the engine stays in the carve-out and 38 requests ran with 0 hangs. `HSA_ENABLE_SDMA=0` and a smaller prompt step
+  did not help. Keep GTT below the carve-out ([HIP](HIP.md#2-gpu-memory-keep-gtt-below-the-carve-out)); the
+  cause inside the driver is not found, and machines with a minimal carve-out were not tested.
 - **GPU hangs with the prompt cache on.** A serve with `--prompt-cache-gib 1.2` hung the 780M on its first long
   prompt (`MES failed to respond to msg=REMOVE_QUEUE`, then a GPU reset), and so did a second full
   `hip-kernel-contract` run a few seconds later. The profile serves with the cache off, which ran without a hang;
@@ -53,8 +59,7 @@
   `tf_fa_wide_bf16` return a finite value for 255 of 49,152 outputs where the FP64 reference gives NaN (the
   `nonfinite` case). Neither is changed by this series. The full contract run stopped before its summary.
 - **One 8K stream.** The 8 GB UMA carve-out holds the 4.71 GiB model and one 8,192-token window with a 0.5 GiB
-  reserve. The TTM limit is raised and live after a reboot (GTT 15,674 MiB), but the engine budgeted from the
-  carve-out in every measured run; serving from GTT, longer windows and more streams are untested.
+  reserve. Longer windows and more streams are untested, and SenseNova has not yet been served on the 1966080 boot.
 - **No fidelity gate against BF16 on HIP.** The mHC kernels pass their FP64 contract and `serve_check` passes its
   exactness checks; no teacher-forced KL or top-1 comparison has run on the 780M.
 - **Text only, no tool-call grammar.** `--vision` is refused on HIP, and `libtfgrammar` was not built, so required and
