@@ -44,7 +44,7 @@ Each row is a recipe that was built and run end to end. Every build checks the e
 | **16 GB Mac** (M-series) | the same 4-bit tree, 5.07 GB | `metal` | 58 tok/s decode; 2,719 tok/s prefill at 8k; peak 7.60 / 7.82 / 9.13 GiB at 4k / 8k / 32k | same tree as the Studio | measured under a 16 GB working-set cap on the M5 Ultra; 8 GB Macs not supported |
 | **MacBook Pro M4 Pro** (24 GB) | the same 4-bit tree | `metal` | 26.7 tok/s decode; prefill about 230 tok/s (32k prompt: 166 s to first token) | same tree as the Studio | slow prefill on long prompts; quality not separately measured |
 | **RTX 5070 Ti 16 GB** (WSL2) | EXL3 `sn-6.0` (8.29 GB); `sn-4.0` for speed | `rtx`: pin `038e4a278` + `patches/cuda` `0001`-`0022` + `patches/rtx` `0001`-`0002` | `sn-6.0` 44-47 tok/s at 4k, 39-44 at 32k, prefill 2,232 tok/s; copy drafts re-quote 660, code 534 tok/s; host prompt cache restores 109K tokens in 4.5 s (30x) | gate cosine 0.99931, top-1 290/298; 36/36 tool calls; 30-minute soak, 0 failures | no live KV in host RAM (212,992-token fp8 window); native Windows untested |
-| **ROG Ally X** (Ryzen Z1 Extreme, Radeon 780M, 8 GB UMA carve-out) | the Metal 4-bit tree, text only | `hip`: pin `813ff4ccb` + `patches/hip` `0001`-`0018` | decode 10.8 tok/s short, 10.2 / 10.0 / 9.8 at 4.8K / 6.5K / 7.4K prompts; prefill about 200 tok/s | serve_check 11 ok, every exactness check; 3 vacuous fails (no drafter, cache off); mHC kernels pass their FP64 contract | one 8,192-token stream; GTT above the carve-out hangs the GPU; prompt cache off (it hung the GPU); no tool calls or images; other AMD GPUs untested |
+| **ROG Ally X** (Ryzen Z1 Extreme, Radeon 780M, 8 GB UMA carve-out) | the Metal 4-bit tree, text only | `hip`: pin `813ff4ccb` + `patches/hip` `0001`-`0020` | decode 10.9 tok/s short, 9.9 at 4.8K, 9.76 at 7.1K; prefill about 190 tok/s; prompt cache: a 5.2K prompt back in 0.6 s (27.7 s cold) | serve_check 12 ok with the cache off and on (every exactness check); mHC kernels pass their FP64 contract | one 8,192-token stream; keep GTT below the carve-out (above it the GPU hangs); no tool calls or images; other AMD GPUs untested |
 
 **DGX Spark** ([CUDA](docs/CUDA.md)), CUDA 13 toolkit and Zig 0.17.0:
 
@@ -82,7 +82,7 @@ scripts/serve.sh rtx engine-rtx sn-6.0                       # --parallel 1 --kv
 sudo pacman -Sy --needed rocm-hip-sdk rocminfo               # keep GTT below the carve-out: docs/HIP.md#2-gpu-memory-keep-gtt-below-the-carve-out
 scripts/build-engine.sh hip engine-hip                       # -Dhip-arch=gfx1103, Arch's device-lib path
 hf download jayleaton/SenseNova-Loop-9B-MLX-4bit --local-dir loop9b-mlx4
-scripts/serve.sh hip engine-hip loop9b-mlx4                  # --context 8192 --parallel 1 --prompt-cache-gib 0
+scripts/serve.sh hip engine-hip loop9b-mlx4                  # --context 8192 --parallel 1 --prompt-cache-gib 1
 ```
 
 Every command above except the Ally X's needs the checkpoint downloaded first ([Quick start](#quick-start)).
@@ -114,7 +114,7 @@ hf download jayleaton/SenseNova-Loop-9B-EXL3-6.0bpw --local-dir sn-6.0          
 | CUDA v6 | `cuda-v6` | `038e4a278` | `cuda` `0001`-`0027` | `9bac6ecbdef1` | 2026-11-19 | **validated, not yet served** | loop-seam fix (mean KL 0.0244 to 0.0186); prefill up to 1.13x; same checks pass |
 | RTX | `rtx` | `038e4a278` | `cuda` `0001`-`0022`, `rtx` `0001`-`0002` | `0f61f4723db8` | 2026-11-19 | tested on an RTX 5070 Ti | `sn-6.0` 44-47 tok/s, 36/36 tools, copy drafts up to 660 tok/s |
 | Metal | `metal` | `6d0a128b0` | `metal` `0001`-`0044` | `d33e2d93ea37` | 2026-11-18 | tested on M5 Ultra and M4 Pro | q4 60 tok/s, task gate code and reasoning 64/64, images |
-| HIP | `hip` | `813ff4ccb` | `hip` `0001`-`0018` | `083d74e21f26` | 2026-11-19 | tested on a ROG Ally X (780M) | q4 10.8 tok/s decode, 9.8 at 7.4K; serve_check exactness pass |
+| HIP | `hip` | `813ff4ccb` | `hip` `0001`-`0020` | `493472234c7d` | 2026-11-20 | tested on a ROG Ally X (780M) | q4 10.9 tok/s decode, 9.76 at 7.1K; prompt cache 0.6 s warm; serve_check 12 ok |
 
 Full tree hashes are in each `config/<config>/tensorfold.tree`. The `tensorfold-native` binaries measured had sha256
 `f2cde8048449c9f743122e1818eff31823fc0173e254724e96ebdba3f12362b5` (v5) and
@@ -130,7 +130,7 @@ differently with another toolchain. Details: [ENGINE](docs/ENGINE.md).
 | Weights served | MLX affine g64, converted with [`tools/sensenova_loop_mlx.py`](docs/CONVERT.md) from the patch series: 8-bit on CUDA, 4-bit on Metal |
 | CUDA | 1x DGX Spark (GB10), TP=1: upstream TensorFold [`038e4a278`](config/cuda/tensorfold.rev) + [`patches/cuda/`](patches/cuda/) `0001`-`0022` (served); `0001`-`0027` validated ([`config/cuda-v6`](config/cuda-v6/)) |
 | RTX | 16 GB RTX cards (tested on an RTX 5070 Ti, WSL2): the CUDA pin and series `0001`-`0022` + [`patches/rtx/`](patches/rtx/) `0001`-`0002`, EXL3 packs |
-| HIP | ROG Ally X, Radeon 780M (`gfx1103`), ROCm 7.2.4: upstream TensorFold [`813ff4ccb`](config/hip/tensorfold.rev) + [`patches/hip/`](patches/hip/) `0001`-`0018`, the Metal 4-bit tree, text only |
+| HIP | ROG Ally X, Radeon 780M (`gfx1103`), ROCm 7.2.4: upstream TensorFold [`813ff4ccb`](config/hip/tensorfold.rev) + [`patches/hip/`](patches/hip/) `0001`-`0020`, the Metal 4-bit tree, text only |
 | Metal | Apple Silicon (measured on M5 Ultra and M4 Pro): upstream TensorFold [`6d0a128b0`](config/metal/tensorfold.rev) + [`patches/metal/`](patches/metal/) `0001`-`0044` |
 | Input | text and images on both ([CUDA](docs/CUDA.md#serve), [METAL](docs/METAL.md#images)) |
 | Drafts | copy drafts on by default on both: drafts from a stream's own context, verified, so tokens are unchanged |
@@ -172,9 +172,10 @@ restores a 109,313-token prefix in 4.48 s against 133.6 s cold. The 4.0-bit pack
 [on Hugging Face](#weights-on-hugging-face), or quantize them yourself.
 
 **ROG Ally X: the 4-bit tree on the Radeon 780M.** HIP on `gfx1103` with ROCm 7.2.4 and `patches/hip/`
-([HIP](docs/HIP.md)): 10.8 tok/s decode on a short prompt and 9.8 at a 7,428-token prompt, one 8K stream inside the 8 GB
-UMA carve-out. `serve_check` passes every exactness check and the mHC kernels pass their FP64 contract on the chip.
-The prompt cache is off: turning it on hung the GPU.
+([HIP](docs/HIP.md)): 10.9 tok/s decode on a short prompt and 9.76 at a 7,075-token prompt, one 8K stream inside the
+8 GB UMA carve-out. The 1 GiB prompt cache brings a 5,246-token prompt back in 0.6 s against 27.7 s cold, with the same
+tokens. `serve_check` passes every exactness check with the cache off and on, and the mHC kernels pass their FP64
+contract on the chip. Keep GTT below the carve-out: above it the GPU hangs under load.
 
 **Tool calls need `libtfgrammar`.** `tool_choice: "required"`, a named function and `response_format` need
 `libtfgrammar` (`.so` on Linux, `.dylib` on macOS) beside the server, built from xgrammar v0.2.8 with

@@ -51,21 +51,23 @@
   the engine stays in the carve-out and 38 requests ran with 0 hangs. `HSA_ENABLE_SDMA=0` and a smaller prompt step
   did not help. Keep GTT below the carve-out ([HIP](HIP.md#2-gpu-memory-keep-gtt-below-the-carve-out)); the
   cause inside the driver is not found, and machines with a minimal carve-out were not tested.
-- **GPU hangs with the prompt cache on.** A serve with `--prompt-cache-gib 1.2` hung the 780M on its first long
-  prompt (`MES failed to respond to msg=REMOVE_QUEUE`, then a GPU reset), and so did a second full
-  `hip-kernel-contract` run a few seconds later. The profile serves with the cache off, which ran without a hang;
-  the cause is not found.
-- **Two upstream prompt-attention kernels fail a contract case on gfx1103.** `tf_fa_paged_bf16` and
-  `tf_fa_wide_bf16` return a finite value for 255 of 49,152 outputs where the FP64 reference gives NaN (the
-  `nonfinite` case). Neither is changed by this series. The full contract run stopped before its summary.
-- **One 8K stream.** The 8 GB UMA carve-out holds the 4.71 GiB model and one 8,192-token window with a 0.5 GiB
-  reserve. Longer windows and more streams are untested, and SenseNova has not yet been served on the 1966080 boot.
+- **The full kernel contract cannot finish on a 24 GB Ally X.** The one-process `hip-kernel-contract` builds every
+  kernel's rig before running any and needs about 28 GiB; systemd-oomd stopped it after 386 passes. The mHC and YaRN
+  kernels' rows are among them and pass.
+- **Three NaN-handling mismatches on gfx1103, untriaged** (compiler drift or a kernel bug; a run on another RDNA chip
+  would tell): the `nonfinite` case of `tf_fa_paged_bf16`, the served prompt tile (255 of 49,152 outputs finite where
+  the FP64 reference gives NaN; finite inputs were not flagged); `tf_fa_wide_bf16`, not used in serving (the same 255
+  of 49,152); and the Qwen vision `leaky_attention`, not used in serving (320 of 6,144 NaN where the reference is
+  finite). None is changed by this series.
+- **One 8K stream.** The 8 GB UMA carve-out holds the 4.71 GiB model, one 8,192-token window and a 1 GiB prompt
+  cache with the default reserve. Longer windows and more streams are untested.
 - **No fidelity gate against BF16 on HIP.** The mHC kernels pass their FP64 contract and `serve_check` passes its
   exactness checks; no teacher-forced KL or top-1 comparison has run on the 780M.
 - **Text only, no tool-call grammar.** `--vision` is refused on HIP, and `libtfgrammar` was not built, so required and
   named tool calls were not tested.
-- **Measured on one Ally X.** The 780M (`gfx1103`) only; other AMD iGPUs and discrete cards, other distributions and
-  other carve-out sizes are untested, as are unattended boot and long soaks.
+- **Measured on one Ally X.** The 780M (`gfx1103`) only; no other RDNA chip has been checked yet. Other AMD iGPUs
+  and discrete cards, other distributions and other carve-out sizes are untested, as are unattended boot and long
+  soaks.
 
 ## Metal
 

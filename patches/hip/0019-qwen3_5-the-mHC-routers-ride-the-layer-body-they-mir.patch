@@ -1,0 +1,155 @@
+From fc01a5f3725ddcad0594dbbd8c28a369bbf2924a Mon Sep 17 00:00:00 2001
+From: Jay Leaton <58495321+jayleaton@users.noreply.github.com>
+Date: Thu, 19 Nov 2026 21:40:46 +0800
+Subject: [PATCH 19/20] qwen3_5: the mHC routers ride the layer body they
+ mirror on the device
+
+tf-qwen35-test's upload walk compares a device layer union field by
+field against the host body it names, so the routers move from the
+host Layer into its Body's linear and full payloads: the twins mirror
+again, and the upload gate now reads back and checks the real
+checkpoint's 96 router buffers with every other one.
+---
+ .../qwen3_5/backend/hip/model/weights.zig     | 21 ++++++++++++-------
+ .../families/qwen3_5/weights/checkpoint.zig   |  6 ++++--
+ .../qwen3_5/weights/checkpoint_test.zig       | 11 ++++++++--
+ zig/src/families/qwen3_5/weights/host.zig     |  4 ++--
+ 4 files changed, 28 insertions(+), 14 deletions(-)
+
+diff --git a/zig/src/families/qwen3_5/backend/hip/model/weights.zig b/zig/src/families/qwen3_5/backend/hip/model/weights.zig
+index 0c7dc88..47d3189 100644
+--- a/zig/src/families/qwen3_5/backend/hip/model/weights.zig
++++ b/zig/src/families/qwen3_5/backend/hip/model/weights.zig
+@@ -125,12 +125,6 @@ const Uploader = struct {
+     }
+ 
+     fn layer(u: Uploader, l: host.Layer) !Layer {
+-        const mhc: ?Mhc = if (l.mhc) |*m| .{
+-            .attn = try u.tensor(m.attn),
+-            .attn_b = try u.tensor(m.attn_b),
+-            .ffn = try u.tensor(m.ffn),
+-            .ffn_b = try u.tensor(m.ffn_b),
+-        } else null;
+         switch (l.body) {
+             .linear => |x| return .{ .linear = .{
+                 .input_norm = try u.tensor(x.input_norm),
+@@ -145,7 +139,7 @@ const Uploader = struct {
+                 .gnorm = try u.tensor(x.gnorm),
+                 .out = try u.projection(x.out),
+                 .mlp = try u.mlp(x.mlp),
+-                .mhc = mhc,
++                .mhc = try mhcView(u, x.mhc),
+             } },
+             .full => |x| return .{ .full = .{
+                 .input_norm = try u.tensor(x.input_norm),
+@@ -157,11 +151,22 @@ const Uploader = struct {
+                 .q_norm = try u.tensor(x.q_norm),
+                 .k_norm = try u.tensor(x.k_norm),
+                 .mlp = try u.mlp(x.mlp),
+-                .mhc = mhc,
++                .mhc = try mhcView(u, x.mhc),
+             } },
+         }
+     }
+ 
++    /// A windowed layer's two mHC routers as their device buffers; null: a layer without hyper-connections.
++    fn mhcView(u: Uploader, m: ?host.Mhc) !?Mhc {
++        const r = m orelse return null;
++        return .{
++            .attn = try u.tensor(r.attn),
++            .attn_b = try u.tensor(r.attn_b),
++            .ffn = try u.tensor(r.ffn),
++            .ffn_b = try u.tensor(r.ffn_b),
++        };
++    }
++
+     fn mtp(u: Uploader, m: host.Mtp) !MtpHead {
+         return .{
+             .fc_e_norm = try u.tensor(m.fc_e_norm),
+diff --git a/zig/src/families/qwen3_5/weights/checkpoint.zig b/zig/src/families/qwen3_5/weights/checkpoint.zig
+index 4f4a5c2..e6f10c2 100644
+--- a/zig/src/families/qwen3_5/weights/checkpoint.zig
++++ b/zig/src/families/qwen3_5/weights/checkpoint.zig
+@@ -141,8 +141,9 @@ pub const Checkpoint = struct {
+                 .q_norm = try subNorm(a, t, attn, "q_norm.weight"),
+                 .k_norm = try subNorm(a, t, attn, "k_norm.weight"),
+                 .mlp = mlp,
++                .mhc = mhc,
+             } };
+-            return .{ .arena = arena, .body = body, .mhc = mhc };
++            return .{ .arena = arena, .body = body };
+         }
+         const lin = projection.join(&scratch, &.{ base, "linear_attn." });
+         // the arena is copied into the result last: allocations made after the copy would be lost
+@@ -159,8 +160,9 @@ pub const Checkpoint = struct {
+             .gnorm = try subFloat(a, t, lin, "norm.weight"),
+             .out = try sub(a, t, lin, "out_proj"),
+             .mlp = mlp,
++            .mhc = mhc,
+         } };
+-        return .{ .arena = arena, .body = body, .mhc = mhc };
++        return .{ .arena = arena, .body = body };
+     }
+ 
+     /// The MTP layer from `mtp*.safetensors` or the model's own shards; null when absent.
+diff --git a/zig/src/families/qwen3_5/weights/checkpoint_test.zig b/zig/src/families/qwen3_5/weights/checkpoint_test.zig
+index e931124..87e7e02 100644
+--- a/zig/src/families/qwen3_5/weights/checkpoint_test.zig
++++ b/zig/src/families/qwen3_5/weights/checkpoint_test.zig
+@@ -302,7 +302,10 @@ test "a looped model's mHC routers load as the window's own fp32 tensors" {
+     for (0..2) |i| {
+         var layer = try ck.layer(i);
+         defer layer.deinit();
+-        const m = layer.mhc.?;
++        const m = switch (layer.body) {
++            .full => |f| f.mhc.?,
++            .linear => |x| x.mhc.?,
++        };
+         try std.testing.expect(m.attn.is(.f32, &.{ 8, 128 }));
+         try std.testing.expect(m.ffn.is(.f32, &.{ 8, 128 }));
+         try std.testing.expect(m.attn_b.is(.f32, &.{8}));
+@@ -334,7 +337,11 @@ test "a windowed layer is refused when one of its routers has a wrong shape" {
+     try std.testing.expectError(error.UnexpectedTensor, ck.layer(0));
+     var good = try ck.layer(1);
+     defer good.deinit();
+-    try std.testing.expect(good.mhc != null); // the other windowed layer's routers keep their shape
++    // the other windowed layer's routers keep their shape
++    try std.testing.expect(switch (good.body) {
++        .full => |f| f.mhc != null,
++        .linear => |x| x.mhc != null,
++    });
+ }
+ 
+ test "a dense model: layers, embedding, tied head and the MTP side file" {
+diff --git a/zig/src/families/qwen3_5/weights/host.zig b/zig/src/families/qwen3_5/weights/host.zig
+index b0005c7..452be80 100644
+--- a/zig/src/families/qwen3_5/weights/host.zig
++++ b/zig/src/families/qwen3_5/weights/host.zig
+@@ -31,6 +31,7 @@ pub const Linear = struct {
+     gnorm: Tensor,
+     out: Projection,
+     mlp: Mlp,
++    mhc: ?Mhc = null,
+ };
+ 
+ pub const Full = struct {
+@@ -43,6 +44,7 @@ pub const Full = struct {
+     q_norm: Tensor,
+     k_norm: Tensor,
+     mlp: Mlp,
++    mhc: ?Mhc = null,
+ };
+ 
+ pub const Body = union(enum) { linear: Linear, full: Full };
+@@ -54,8 +56,6 @@ pub const Mhc = struct { attn: Tensor, attn_b: Tensor, ffn: Tensor, ffn_b: Tenso
+ pub const Layer = struct {
+     arena: std.heap.ArenaAllocator,
+     body: Body,
+-    /// The mHC routers of a layer inside the streams' window (null: a layer without hyper-connections).
+-    mhc: ?Mhc = null,
+ 
+     pub fn deinit(l: *Layer) void {
+         l.arena.deinit();
+-- 
+2.56.0
+

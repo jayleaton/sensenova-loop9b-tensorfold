@@ -1,0 +1,112 @@
+From 87c48b046c57805ffbafa13e8843d2c9897a747a Mon Sep 17 00:00:00 2001
+From: Jay Leaton <58495321+jayleaton@users.noreply.github.com>
+Date: Thu, 19 Nov 2026 21:40:49 +0800
+Subject: [PATCH 20/20] contract: gate-5 records for the mHC image and the YaRN
+ rope pair
+
+Measured from the code objects ROCm 7.2.4 (clang 22) builds for every
+served RDNA chip: the router peaks at 139 VGPRs and 6 KiB of LDS with
+no spills, the three moves stay under 24, and the YaRN pair follows
+the plain rope kernels it was cut from. The mhc file joins the records
+table with its count pinned.
+---
+ zig/src/core/contract/hip_records.zig         |  2 +-
+ .../core/contract/hip_records_families.zig    |  1 +
+ zig/src/core/contract/hip_records_mhc.zig     | 60 +++++++++++++++++++
+ 3 files changed, 62 insertions(+), 1 deletion(-)
+ create mode 100644 zig/src/core/contract/hip_records_mhc.zig
+
+diff --git a/zig/src/core/contract/hip_records.zig b/zig/src/core/contract/hip_records.zig
+index a6e23c8..c7d224f 100644
+--- a/zig/src/core/contract/hip_records.zig
++++ b/zig/src/core/contract/hip_records.zig
+@@ -496,7 +496,7 @@ const own_records = [own_count]Record{
+ } ++ @import("hip_records_pair.zig").records ++ @import("hip_records_prompt.zig").records ++ @import("hip_records_draft.zig").records ++
+     @import("hip_records_score.zig").records ++ @import("hip_records_embed.zig").records ++ @import("hip_records_tail.zig").records ++ @import("hip_records_tap.zig").records ++ @import("hip_records_sparse.zig").records;
+ 
+-pub const records = own_records ++ @import("hip_records_stream.zig").records ++ @import("hip_records_router.zig").records ++
++pub const records = own_records ++ @import("hip_records_mhc.zig").records ++ @import("hip_records_stream.zig").records ++ @import("hip_records_router.zig").records ++
+     @import("hip_records_item.zig").records ++ @import("hip_records_qwen3.zig").records ++ @import("hip_records_columns.zig").records ++
+     @import("hip_records_vision.zig").records ++ @import("hip_records_dense_text.zig").records ++ @import("hip_records_families.zig").all ++ @import("hip_records_skew.zig").records ++ @import("hip_records_gdn.zig").records;
+ 
+diff --git a/zig/src/core/contract/hip_records_families.zig b/zig/src/core/contract/hip_records_families.zig
+index a944ff0..753b647 100644
+--- a/zig/src/core/contract/hip_records_families.zig
++++ b/zig/src/core/contract/hip_records_families.zig
+@@ -27,6 +27,7 @@ test "HIP record counts stay pinned in their owning files" {
+         @import("hip_records_glm_ocr.zig").records.len,
+         @import("hip_records_item.zig").records.len,
+         @import("hip_records_joint.zig").records.len,
++        @import("hip_records_mhc.zig").records.len,
+         @import("hip_records_lighton_ocr.zig").records.len,
+         @import("hip_records_pair.zig").records.len,
+         @import("hip_records_prompt.zig").records.len,
+diff --git a/zig/src/core/contract/hip_records_mhc.zig b/zig/src/core/contract/hip_records_mhc.zig
+new file mode 100644
+index 0000000..d7facb3
+--- /dev/null
++++ b/zig/src/core/contract/hip_records_mhc.zig
+@@ -0,0 +1,60 @@
++//! Gate 5's records of the mHC image (ops/mhc.hip) and the YaRN rope pair (ops/rope.hpp), ROCm 7.2.4's clang 22.
++const limits = @import("limits.zig");
++const Record = @import("hip_records.zig").Record;
++
++pub const records = [_]Record{
++    .{
++        .launch = .{ .name = "mHC router tf_mhc_branch", .symbol = "tf_mhc_branch", .image = "mhc", .threads = 256 },
++        .usage = .{
++            .{ .vgprs = 137, .sgprs = 60, .lds = 6192, .private = 0, .bound = 256, .wave = 32 },
++            .{ .vgprs = 139, .sgprs = 60, .lds = 6192, .private = 0, .bound = 256, .wave = 32 },
++            .{ .vgprs = 139, .sgprs = 60, .lds = 6192, .private = 0, .bound = 256, .wave = 32 },
++            .{ .vgprs = 137, .sgprs = 62, .lds = 6192, .private = 0, .bound = 256, .wave = 32 },
++        },
++    },
++    .{
++        .launch = .{ .name = "mHC merge tf_mhc_merge", .symbol = "tf_mhc_merge", .image = "mhc", .threads = 256 },
++        .usage = .{
++            .{ .vgprs = 23, .sgprs = 30, .lds = 0, .private = 0, .bound = 256, .wave = 32 },
++            .{ .vgprs = 23, .sgprs = 30, .lds = 0, .private = 0, .bound = 256, .wave = 32 },
++            .{ .vgprs = 22, .sgprs = 31, .lds = 0, .private = 0, .bound = 256, .wave = 32 },
++            .{ .vgprs = 21, .sgprs = 33, .lds = 0, .private = 0, .bound = 256, .wave = 32 },
++        },
++    },
++    .{
++        .launch = .{ .name = "mHC enter tf_mhc_enter", .symbol = "tf_mhc_enter", .image = "mhc", .threads = 256 },
++        .usage = .{
++            .{ .vgprs = 17, .sgprs = 34, .lds = 0, .private = 0, .bound = 256, .wave = 32 },
++            .{ .vgprs = 17, .sgprs = 34, .lds = 0, .private = 0, .bound = 256, .wave = 32 },
++            .{ .vgprs = 16, .sgprs = 36, .lds = 0, .private = 0, .bound = 256, .wave = 32 },
++            .{ .vgprs = 15, .sgprs = 38, .lds = 0, .private = 0, .bound = 256, .wave = 32 },
++        },
++    },
++    .{
++        .launch = .{ .name = "mHC leave tf_mhc_leave", .symbol = "tf_mhc_leave", .image = "mhc", .threads = 256 },
++        .usage = .{
++            .{ .vgprs = 17, .sgprs = 27, .lds = 0, .private = 0, .bound = 256, .wave = 32 },
++            .{ .vgprs = 17, .sgprs = 27, .lds = 0, .private = 0, .bound = 256, .wave = 32 },
++            .{ .vgprs = 15, .sgprs = 29, .lds = 0, .private = 0, .bound = 256, .wave = 32 },
++            .{ .vgprs = 14, .sgprs = 33, .lds = 0, .private = 0, .bound = 256, .wave = 32 },
++        },
++    },
++    .{
++        .launch = .{ .name = "YaRN prefill rope tf_yarn_prefill", .symbol = "tf_yarn_prefill", .image = "ops", .threads = 256 },
++        .usage = .{
++            .{ .vgprs = 26, .sgprs = 27, .lds = 0, .private = 0, .bound = 1024, .wave = 32 },
++            .{ .vgprs = 26, .sgprs = 27, .lds = 0, .private = 0, .bound = 1024, .wave = 32 },
++            .{ .vgprs = 26, .sgprs = 27, .lds = 0, .private = 0, .bound = 1024, .wave = 32 },
++            .{ .vgprs = 26, .sgprs = 28, .lds = 0, .private = 0, .bound = 1024, .wave = 32 },
++        },
++    },
++    .{
++        .launch = .{ .name = "YaRN window rope tf_qk_yarn_rope", .symbol = "tf_qk_yarn_rope", .image = "ops", .threads = 256 },
++        .usage = .{
++            .{ .vgprs = 34, .sgprs = 30, .lds = 16384, .private = 0, .bound = 256, .wave = 32 },
++            .{ .vgprs = 33, .sgprs = 30, .lds = 16384, .private = 0, .bound = 256, .wave = 32 },
++            .{ .vgprs = 33, .sgprs = 30, .lds = 16384, .private = 0, .bound = 256, .wave = 32 },
++            .{ .vgprs = 33, .sgprs = 30, .lds = 16384, .private = 0, .bound = 256, .wave = 32 },
++        },
++    },
++};
+-- 
+2.56.0
+

@@ -1,1 +1,1 @@
---context 8192 --parallel 1 --prompt-cache-gib 0
+--context 8192 --parallel 1 --prompt-cache-gib 1

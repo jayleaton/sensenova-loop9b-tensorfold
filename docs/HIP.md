@@ -6,47 +6,45 @@
 
 | | |
 | --- | --- |
-| Engine | upstream TensorFold `813ff4ccbf9d6610e991a96d53fda2b628f56347` (on `main`, 2026-11-19, version 1.2.10) + [`patches/hip/`](../patches/hip/) `0001`-`0018` |
-| Engine tree | `083d74e21f2678630829c59af6ee008a963331fe` ([`config/hip/`](../config/hip/)), the tree the measured binary was built from |
+| Engine | upstream TensorFold `813ff4ccbf9d6610e991a96d53fda2b628f56347` (on `main`, 2026-11-19, version 1.2.10) + [`patches/hip/`](../patches/hip/) `0001`-`0020` |
+| Engine tree | `493472234c7de38a888643d9c1a93713fb12acb2` ([`config/hip/`](../config/hip/)), the tree the 2026-11-20 runs were built from |
 | Device | ROG Ally X (RC72LA, BIOS RC72LA.313): Ryzen Z1 Extreme, Radeon 780M (RDNA3, `gfx1103`, 12 CUs), 8 GB UMA carve-out |
 | OS | Omarchy 4.5.0 (Arch), kernel `7.2.15-1-omarchy`, Mesa 26.2.5, `linux-firmware-amdgpu` 20260916 |
 | ROCm | 7.2.4 from Arch `extra`: `rocm-hip-sdk 7.2.4-1`, `hip-runtime-amd 7.2.4-1`, `rocm-device-libs 2:7.2.4-2`, `comgr 2:7.2.4-2`, `rocm-llvm 2:7.2.4-2` (HIP 7.2.53211, AMD clang 22) |
 | Weights | [`jayleaton/SenseNova-Loop-9B-MLX-4bit`](https://huggingface.co/jayleaton/SenseNova-Loop-9B-MLX-4bit), the Metal 4-bit tree, revision `0afa03c99f858625f4f8c5e3158d6ef6fdfad5bc`; text only on HIP |
-
-The measured binary was `zig-out/native-hip/bin/tensorfold-native`, `tensorfold-native 1.2.10`, sha256
-`5e2a1f7d7a1a081525e26a696b404d9f7bbb376c90ea70a353ecb11ab5faec37`; your build of the same tree may hash differently.
+| Memory | `ttm.pages_limit=ttm.page_pool_size=1966080` (GTT 7.5 GiB, below the carve-out); see [GPU memory](#2-gpu-memory-keep-gtt-below-the-carve-out) |
 
 ## Results on the 780M
 
-One stream, temperature 0, thinking off, prompt cache off, an 8,192-token window. Measured 2026-11-19 on the 8 GB
-carve-out.
+One stream, greedy, an 8,192-token window, the engine inside the 8 GB carve-out. Two runs agree within 3%: 2026-11-19
+on `0001`-`0018` (prompt cache off) and 2026-11-20 on `0001`-`0020` on the 1966080 boot (256-token replies, three runs
+each; no GPU hang on that boot).
 
-| prompt | decode | first token |
-| ---: | ---: | ---: |
-| 14 tokens (raw completion, 256 tokens, 3 runs) | **10.8 tok/s** (10.80 median) | 0.31 s |
-| 31 tokens (chat, 256 tokens, 3 runs) | 10.8 tok/s | 0.58 s |
-| 4,812 tokens | 10.2 tok/s | 23.2 s |
-| 6,479 tokens | 10.0 tok/s | 31.7 s |
-| 7,428 tokens | 9.8 tok/s | 37.2 s |
+| prompt | decode, 2026-11-19 | decode, 2026-11-20 | first token |
+| ---: | ---: | ---: | ---: |
+| short (14 / 21 tokens) | **10.8 tok/s** | **10.9 tok/s** (10.87 without drafts) | 0.31 / 0.44 s |
+| 4.8K (4,812 / 4,774 tokens) | 10.2 tok/s | 9.9 tok/s without drafts | 23.2 / 25.0 s |
+| 6,479 tokens | 10.0 tok/s | | 31.7 s |
+| 7.1K-7.4K (7,428 / 7,075 tokens) | 9.8 tok/s | 9.76 tok/s | 37.2 / 37.7 s |
 
-Prompts read at about 200 tok/s (prompt length over first-token time: 207, 204 and 200 tok/s at the three long
-prompts). The server's first reply ("What is 17 * 23?", four tokens) answered `391`; its 8.1 tok/s is a four-token
-reply and not a decode rate.
+Prompts read at about 190-200 tok/s (prompt length over first-token time: 191 at 4,774 tokens on 2026-11-20; 207, 204
+and 200 at the three long prompts on 2026-11-19). Drafted and plain replies are token-identical in every pair.
+
+**Prompt cache (`--prompt-cache-gib 1`).** A 5,246-token prompt resumes equal to fresh: first token 27.7 / 28.1 s cold,
+**0.61 / 0.59 s** warm, the resumed reply's tokens equal to the cold one's both times. Decode with the cache on is
+10.6 tok/s at a short prompt. Copy drafts with the cache on: a code edit 33.6 tok/s against 10.3 without drafts;
+re-quote 12.5 against 13.0, chat 10.6 against 10.6; every pair token-identical. The cache hung the GPU on 2026-11-19
+only because of the 16 GiB GTT setting ([GPU memory](#2-gpu-memory-keep-gtt-below-the-carve-out)); at 1966080 it is clean.
 
 | check | result |
 | --- | --- |
-| `zig/tests/qwen35/serve_check.py`, 64 tokens | 11 ok, 3 fail. Every exactness check passes, greedy and at t 0.8: solo == together, serial together == serial solo, the same twice, decoders unchanged by a long prompt, a long prompt among decoders == alone. The three failures test nothing at this profile: `drafted == serial` twice (0 drafts accepted, no drafter) and `resumed == fresh` (prompt cache off, 0 tokens resumed) |
-| mHC kernels on gfx1103, `hip-kernel-contract` | `tf_mhc_branch` (both variants), `tf_mhc_merge`, `tf_mhc_enter`, `tf_mhc_leave`: nonfinite, repeat, shapes and sums pass against the FP64 reference, and each planted control is red as planted |
+| `zig/tests/qwen35/serve_check.py` | **12 ok with the prompt cache off, and 12 ok with it on** (2026-11-20). Every exactness check passes, greedy and at t 0.8: solo == together, serial together == serial solo, the same twice, decoders unchanged by a long prompt, a long prompt among decoders == alone. The non-ok lines test nothing here: `drafted == serial` twice (0 drafts accepted, no drafter), and with the cache off `resumed == fresh` (nothing resumed). With the cache on, `resumed == fresh` needs a second cache-off server, which does not fit the carve-out beside the first; the cache check above shows the same property |
+| mHC and YaRN kernels on gfx1103, `hip-kernel-contract` | `tf_mhc_branch` (both variants), `tf_mhc_merge`, `tf_mhc_enter`, `tf_mhc_leave`: nonfinite, repeat, shapes and sums pass against the FP64 reference, and each planted control is red as planted; 28 PASS lines name the mHC and YaRN kernels. The full run cannot finish on this machine ([KNOWN-ISSUES](KNOWN-ISSUES.md#hip)) |
 | engine on the 780M, `tf-qwen35-test check` on stock Qwen3.5-4B (`lmstudio-community/Qwen3.5-4B-MLX-4bit`) | 46 passed, 0 failed, 6 skipped in 222.7 s; graphs replayed 2,859 of 3,055 rounds |
 | the looped tree on the device, `tf-qwen35-test upload` | 32 layers, 1,023 buffers, 4,818 MiB read back equal |
 
-The startup banner, at the flags below:
-
-```
-HIP memory budget from the card's memory (firmware VRAM carve-out): 7.7 of 8.0 GiB free, 0.5 GiB reserve
-HIP gfx1103 device 0, rank 0 of 1: model 4.71 GiB; 1 stream at once, 0.53 GiB each at a 8192-token window, of 2.5 GiB left after a 0.5 GiB reserve
-serving SenseNova-Loop-9B-MLX-4bit at http://127.0.0.1:8090/v1 (... drafts: copies only; context: 8192; loaded in 19.5s)
-```
+At the profile's flags the engine budgets from the carve-out: one stream at 0.53 GiB beside the 4.71 GiB model, the
+default 1.0 GiB reserve, loaded in 21 s.
 
 No teacher-forced fidelity gate against BF16 ran on HIP. The weights are the Metal 4-bit tree, whose quality is
 measured on the Mac ([METAL](METAL.md)); the HIP engine's mHC kernels match the FP64 reference above.
@@ -128,8 +126,9 @@ cat /sys/class/drm/card*/device/mem_info_gtt_total /sys/class/drm/card*/device/m
 | the engine's budget | the carve-out branch (`mem_info_vram_used` 6.3 GiB under load, GTT idle) |
 | UMA carve-out | 8 GB, unchanged; no `amdgpu.*` parameters |
 
-**The SenseNova numbers above ran inside the carve-out** (the banner's `firmware VRAM carve-out` line): the limit had
-been raised at runtime that day, but GTT stayed at its boot size (7.65 GiB), below the carve-out, so they stand. SenseNova itself has not yet been served on the 1966080 boot.
+**The SenseNova numbers above ran inside the carve-out.** On 2026-11-19 the limit had been raised at runtime, but GTT
+stayed at its boot size (7.65 GiB), below the carve-out; the 2026-11-20 runs, the prompt cache included, ran on the
+1966080 boot with no GPU hang.
 
 ### 3. Zig and the engine
 
@@ -147,17 +146,17 @@ Then, in this recipe's checkout:
 scripts/build-engine.sh hip engine-hip
 ```
 
-which fetches the pin, applies `patches/hip/` `0001`-`0018`, checks the tree, and runs:
+which fetches the pin, applies `patches/hip/` `0001`-`0020`, checks the tree, and runs:
 
 ```bash
 zig build -Dhip=true native-hip -Dhip-arch=gfx1103 -Dhipcc=/opt/rocm/bin/hipcc \
   -Dhip-device-lib=/opt/rocm/amdgcn/bitcode
 ```
 
-The binary is `engine-hip/zig-out/native-hip/bin/tensorfold-native`. The measured binary was built in place with
-`nice -n 19 zig build -j4 ...` and the same flags. `scripts/build-engine.sh hip` itself was then run on the Ally X from
-a fresh clone (2026-11-20, under `taskset -c 0-5 nice -n 19` to keep the desktop usable): it reproduced the tree above
-and built in 378 s.
+The binary is `engine-hip/zig-out/native-hip/bin/tensorfold-native`. The measured binaries were built in place with
+`nice -n 19 zig build -j4 ...` and the same flags. `scripts/build-engine.sh hip` itself ran on the Ally X from a fresh
+clone with the series through `0018` (2026-11-20, under `taskset -c 0-5 nice -n 19` to keep the desktop usable): it
+reproduced that tree and built in 378 s.
 
 **The device-library path.** Without `-Dhip-device-lib`, TensorFold passes hipcc
 `--rocm-device-lib-path=/opt/rocm/lib/llvm/amdgcn/bitcode`, which Arch does not have, and the first build failed with
@@ -184,22 +183,23 @@ is not needed.
 scripts/serve.sh hip engine-hip loop9b-mlx4
 ```
 
-which runs, with the profile in [`config/hip/serve.args`](../config/hip/serve.args) and
-[`serve.env`](../config/hip/serve.env):
+which runs, with the profile in [`config/hip/serve.args`](../config/hip/serve.args):
 
 ```bash
-TENSORFOLD_MEMORY_RESERVE_GIB=0.5 engine-hip/zig-out/native-hip/bin/tensorfold-native serve loop9b-mlx4 \
-  --name loop9b --port 8090 --context 8192 --parallel 1 --prompt-cache-gib 0
+engine-hip/zig-out/native-hip/bin/tensorfold-native serve loop9b-mlx4 \
+  --name loop9b --port 8090 --context 8192 --parallel 1 --prompt-cache-gib 1
 ```
 
-The measured serve was that command without `--name` (the model was served under its directory name), under
-`nice -n 19`. Every flag is there for the 8 GB carve-out:
+The measured serves were that command without `--name` (the model was served under its directory name). The flags
+fit the 8 GB carve-out with the default 1.0 GiB reserve:
 
 | flag | why |
 | --- | --- |
-| `TENSORFOLD_MEMORY_RESERVE_GIB=0.5` | the default 1 GiB reserve leaves too little beside the 4.71 GiB model; at 0.5, 2.5 GiB is left for the window |
-| `--context 8192 --parallel 1` | one 8K window takes 0.53 GiB |
-| `--prompt-cache-gib 0` | the prompt cache on (`--prompt-cache-gib 1.2`, the most that fit) ended in a GPU hang; see [KNOWN-ISSUES](KNOWN-ISSUES.md#hip) |
+| `--context 8192 --parallel 1` | one 8K window takes 0.53 GiB beside the 4.71 GiB model |
+| `--prompt-cache-gib 1` | a 1 GiB prompt cache in the carve-out; a 5,246-token prompt comes back in 0.6 s instead of 28 s. `--prompt-cache-gib 0` turns it off |
+
+Keep GTT below the carve-out ([GPU memory](#2-gpu-memory-keep-gtt-below-the-carve-out)): the prompt cache hung the
+GPU on 2026-11-19 under the 16 GiB TTM setting, and runs clean at 1966080.
 
 Copy drafts are on by default (`drafts: copies only`). Thinking is on by the chat template's default; send
 `"chat_template_kwargs": {"enable_thinking": false}` to turn it off. `libtfgrammar` was not built on the Ally X, so
@@ -214,12 +214,13 @@ curl -s http://127.0.0.1:8090/v1/chat/completions -H 'Content-Type: application/
 python3 engine-hip/zig/tests/qwen35/serve_check.py http://127.0.0.1:8090 loop9b 64
 ```
 
-The first answers `391`. `serve_check` should print 11 `ok` lines and the three expected failures above
-(`drafted == serial` twice, `resumed == fresh`); any other `FAIL` is a real difference.
+The first answers `391`. `serve_check` should print 12 `ok` lines and the expected non-ok lines above
+(`drafted == serial` twice, and `resumed == fresh`, which cannot run against one server); any other `FAIL` is a real
+difference.
 
 ## `patches/hip/`
 
-On upstream `813ff4c`. `0001`-`0011` are the CUDA series' backend-neutral patches, applied as recorded; `0012`-`0018`
+On upstream `813ff4c`. `0001`-`0011` are the CUDA series' backend-neutral patches, applied as recorded; `0012`-`0020`
 port the looped model to TensorFold's `qwen3_5` HIP path.
 
 | patch | change | from |
@@ -235,20 +236,19 @@ port the looped model to TensorFold's `qwen3_5` HIP path.
 | `0016` | HIP: the four mHC kernels (`branch`, `merge`, `enter`, `leave`) in their own image, a port of the CUDA kernels, with their kernel contract | new |
 | `0017` | HIP: the looped forward, YaRN rope kernels and the `sensenova_loop` registration (text only) | new |
 | `0018` | the YaRN table builds where the core module lives | new |
+| `0019` | the mHC routers load with the layer body they belong to | new |
+| `0020` | the kernel contract's gate-5 records for the mHC image and the YaRN rope | new |
 
-`0001`-`0018` give back the measured tree exactly. Two later commits on the same work (the mHC routers following
-the layer body, and the contract's gate-5 records for the mHC image) were made after the measured serve and are not
-in this series.
+`0001`-`0020` give back the tree of the 2026-11-20 runs exactly. The 2026-11-19 runs were on `0001`-`0018`
+(tree `083d74e21f2678630829c59af6ee008a963331fe`), and the two runs' decode agrees within 3%.
 
 ## What is not tested
 
 - **Serving from GTT hangs the GPU** ([above](#2-gpu-memory-keep-gtt-below-the-carve-out)); keep GTT below the carve-out.
-  SenseNova has not yet been served on the 1966080 boot (pending). Windows past 8,192 tokens, more than one stream and
-  other carve-out sizes are untested.
-- **Other AMD GPUs.** Only the 780M (`gfx1103`). Other RDNA3 iGPUs (the 760M, the 890M's `gfx1150`) and discrete
-  cards need their own `HIP_ARCH` and have not run.
-- **The prompt cache, tool calls, images and drafters.** The prompt cache hung the GPU; tool calls need
-  `libtfgrammar` and were not run; the HIP port refuses `--vision`; no neural drafter exists for the checkpoint.
-- **A full `hip-kernel-contract` run.** The mHC rows pass; the full registry did not finish
-  ([KNOWN-ISSUES](KNOWN-ISSUES.md#hip)).
+  Windows past 8,192 tokens, more than one stream and other carve-out sizes are untested.
+- **Other AMD GPUs.** Only the 780M (`gfx1103`); no other RDNA chip has been checked. Other iGPUs (the 760M, the
+  890M's `gfx1150`) and discrete cards need their own `HIP_ARCH` and have not run.
+- **Tool calls, images and drafters.** Tool calls need `libtfgrammar` and were not run; the HIP port refuses `--vision`; no neural drafter exists for the checkpoint.
+- **A full `hip-kernel-contract` run.** The mHC and YaRN rows pass; the full registry needs about 28 GiB and cannot
+  finish on the Ally X ([KNOWN-ISSUES](KNOWN-ISSUES.md#hip)).
 - **Unattended boot and long soaks.** No soak test ran, and serving after an unattended boot has not been tried.
